@@ -1,5 +1,5 @@
 # SinGeo
-The official implementation of "SinGeo: Unlock Single Model’s Potential for Robust Cross-View Geo-Localization", accepted at CVPR 2026 as Highlight! You can access the papaer [Here](https://arxiv.org/abs/2603.09377)
+The official implementation of "SinGeo: Unlock Single Model’s Potential for Robust Cross-View Geo-Localization", accepted at CVPR 2026 as Highlight! You can access the paper [Here](https://arxiv.org/abs/2603.09377)
 
 ## Introduction
 
