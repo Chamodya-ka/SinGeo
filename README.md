@@ -5,7 +5,7 @@ The official implementation of "SinGeo: Unlock Single Model’s Potential for Ro
 
 SinGeo tries to deliver a paradigm shift to learning a single model for robust CVGL via effective combination of proposed dual discriminative learning and curriculum-guided progressive training.
 
-![demo image](static/teaser.png)
+![teaser](teaser.png)
 
 ## Environments
 
