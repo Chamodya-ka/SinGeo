@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ```
 
 ## Training:
-We provide codes for training on 4 datases (CVUSA/CVACT/VIGOR/University-1652), and take the CVUSA for example.
+We provide codes for training on 4 datasets (CVUSA/CVACT/VIGOR/University-1652), and take the CVUSA for example.
 
 - Set the path in [dataset](singeo/dataset/cvusa.py), [training](train_singeo_cvusa.py), [distance_calc](calc_distance_cvusa.py).
 - Execute the calc_distance_cvusa script:
