@@ -36,7 +36,7 @@ class Configuration:
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu' 
 
     # fov: float = 0.0
-    fov: float = 360.0 # 0.0 for north-aligned panorama, others for limited FoV with unknown orientation
+    fov: float = 90# 0.0 for north-aligned panorama, others for limited FoV with unknown orientation
     random_fov = False
 
 #-----------------------------------------------------------------------------#

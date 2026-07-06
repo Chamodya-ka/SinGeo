@@ -833,14 +833,17 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
         bar = tqdm(dataloader, total=len(dataloader))
     else:
         bar = dataloader
-    
     # for loop over one epoch
     for query1, query2, reference1, reference2, ids in bar:
         
         if scaler:
             with autocast():
-            
+                	
                 # data (batches) to device   
+                # query1 = [query.to(train_config.device, non_blocking=True) for query in query1]
+                # query2 = [query.to(train_config.device, non_blocking=True) for query in query2]
+                # reference1 = [ref.to(train_config.device, non_blocking=True) for ref in reference1]
+                # reference2 = [ref.to(train_config.device, non_blocking=True) for ref in reference2]
                 query1 = query1.to(train_config.device)
                 query2 = query2.to(train_config.device)
                 reference1 = reference1.to(train_config.device)

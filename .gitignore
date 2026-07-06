@@ -1,3 +1,9 @@
 .vscode
 singeo/__pycache__/
 singeo_cvusa/
+singeo/bin/
+singeo/lib/
+singeo/lib64/
+singeo/include/
+singeo/share/
+

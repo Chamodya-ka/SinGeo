@@ -292,7 +292,7 @@ class Zoomin(ImageOnlyTransform):
 
 class LimitedFoV(ImageOnlyTransform):
     def __init__(self, fov=360.):
-        super(LimitedFoV, self).__init__(fov)
+        super(LimitedFoV, self).__init__()
         self.fov = fov
 
     def apply(self, x, **params):
@@ -687,7 +687,7 @@ def get_transforms_train_singeo(image_size_sat,
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
                                    LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
+                                   LimitedFoVPad(fov=fov),
                                    ])
                 
     return satellite_transforms, satellite_transforms_con, ground_transforms, ground_transforms_con
