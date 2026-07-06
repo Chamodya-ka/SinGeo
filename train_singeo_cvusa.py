@@ -68,7 +68,7 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "./data/CVUSA/"
+    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
@@ -94,7 +94,7 @@ class Configuration:
     
     # make cudnn deterministic
     cudnn_deterministic: bool = False
-    fov: float=180 # eval fov setting (with unknown orientation)
+    fov: float= 90 # eval fov setting (with unknown orientation)
     random_fov: bool=False 
 
 #-----------------------------------------------------------------------------#
@@ -192,7 +192,46 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size
                                       )
+
+    def variable_size_collate(batch):
+        # query_img1, query_img2, reference_img1, reference_img2, label
+        q1, q2, r1, r2, labels = zip(*batch)
+        max_h = max(img.shape[1] for img in q2)
+        max_w = max(img.shape[2] for img in q2)
+
+        padded = torch.zeros(len(q2), q1[0].shape[0], max_h, max_w)
+        masks = torch.zeros(len(q2), max_h, max_w, dtype=torch.bool)
+
+        for i,img in enumerate(q2):
+            padded[i, :, :img.shape[1], :img.shape[2]] = img
+            masks[i, :img.shape[1], :img.shape[2]] = True
+
+        query_image1 = torch.stack(q1)
+        query_image2 = padded
+        reference_image1 = torch.stack(r1)
+        reference_image2 = torch.stack(r2)
+        # query_img, reference_img, label
+        # Return images as a raw list, but turn labels into a standard tensor
+        labels = torch.tensor(labels, dtype=torch.long)
+        return query_image1, query_image2, reference_image1, reference_image2, labels
+
+    def variable_size_collate_test(batch):
+        # query_img1, query_img2, reference_img1, reference_img2, label
+        image, labels = zip(*batch)
+        max_h = max(img.shape[1] for img in image)
+        max_w = max(img.shape[2] for img in image)
+
+        padded = torch.zeros(len(image), image[0].shape[0], max_h, max_w)
+        masks = torch.zeros(len(image), max_h, max_w, dtype=torch.bool)
+
+        for i,img in enumerate(image):
+            padded[i, :, :img.shape[1], :img.shape[2]] = img
+            masks[i, :img.shape[1], :img.shape[2]] = True
+
+        image = padded
     
+        labels = torch.tensor(labels, dtype=torch.long)
+        return image, labels
     
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,

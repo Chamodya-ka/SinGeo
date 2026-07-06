@@ -8,6 +8,7 @@ from torchvision.transforms import Resize
 # pretrained model weights used in SinGeo. You can access them in Huggingface.
 convnxt_overlay={'file' : r"/path/to/.cache/huggingface/hub/models--timm--convnext_base.fb_in22k_ft_in1k_384/pytorch_model.bin"} # enter your convnext weights path here
 vit_overlay = {'file' : r"/path/to/.cache/huggingface/hub/models--timm--vit_base_patch16_224.orig_in21k/pytorch_model.bin"} # enter your vit weights path here
+#convnxt_overlay={'file' : r"/home/71/25021871/data/data/sample4geo/pretrained/cvusa/convnext_base.fb_in22k_ft_in1k_384.pth"} # enter your convnext weights path here
 
 class TimmModel(nn.Module):
 
