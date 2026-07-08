@@ -17,6 +17,7 @@ class CVUSADatasetTrain(Dataset):
                  prob_flip=0.0,
                  prob_rotate=0.0,
                  shuffle_batch_size=128,
+                 many_to_many=False
                  ):
         
         super().__init__()
@@ -43,7 +44,8 @@ class CVUSADatasetTrain(Dataset):
         
         self.idx2pair = dict()
         train_ids_list = list()
-        
+        self.many_to_many = many_to_many
+
         # for shuffle pool
         for pair in self.pairs:
             idx = pair[0]
@@ -303,6 +305,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
                  prob_flip=0.0,
                  prob_rotate=0.0,
                  shuffle_batch_size=128,
+                 many_to_many=False, fovs=[360,270,180,90,70]
                  ):
         
         super().__init__()
@@ -326,7 +329,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.pairs = list(zip(self.df.idx, self.df.sat, self.df.ground))
         self.idx2pair = dict()
         train_ids_list = list()
-        
+        self.many_to_many = many_to_many
         # for shuffle pool
         for pair in self.pairs:
             idx = pair[0]
@@ -358,9 +361,12 @@ class CVUSADatasetTrainSinGeo(Dataset):
         if self.transforms_query1 is not None:
             query_img1 = self.transforms_query1(image=query_img)['image']
 
-        if self.transforms_query2 is not None:
+        if isinstance(self.transforms_query2,list):
+            query_img_con = [fov_transforms(image=query_img) for fov_transforms in self.transforms_query2]
+        elif self.transforms_query2 is not None and not self.many_to_many:
             query_img2 = self.transforms_query2(image=query_img)['image']
-            
+        # if self.transforms_query2 is not None and not self.many_to_many:
+
         if self.transforms_reference1 is not None:
             reference_img1 = self.transforms_reference1(image=reference_img)['image']
 
@@ -379,11 +385,15 @@ class CVUSADatasetTrainSinGeo(Dataset):
             c, h, w = query_img1.shape
             shifts = - w//4 * r
             query_img1 = torch.roll(query_img1, shifts=shifts, dims=2)
-            query_img2 = torch.roll(query_img2, shifts=shifts, dims=2)  
+            if isinstance(self.transforms_query2, list):
+                query_img_con = [torch.roll(query_img2, shifts=shifts, dims=2) for query_img2 in query_img_con]
+            else:
+                query_img2 = torch.roll(query_img2, shifts=shifts, dims=2)  
                    
             
         label = torch.tensor(idx, dtype=torch.long)  
-        
+        if isinstance(self.transforms_query2, list):
+            return query_img1, query_img_con, reference_img1, reference_img2, label
         return query_img1, query_img2, reference_img1, reference_img2, label
     
     def __len__(self):
