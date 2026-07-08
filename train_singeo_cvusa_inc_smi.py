@@ -9,15 +9,15 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from singeo.dataset.cvusa import CVUSADatasetEval, CVUSADatasetTrainSinGeo
+from singeo.dataset.cvusa_multiple_aug import CVUSADatasetEval, CVUSADatasetTrainSinGeo
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov
+from singeo.transforms import get_dynamic_fov, get_n_fovs
 
 from singeo.utils import setup_system, Logger
-from singeo.trainer import train_contrast_singeo
-from singeo.loss import InfoNCE
-from singeo.model import TimmModel_SinGeo
+from singeo.trainer_supcon import train_contrast_singeo
+from singeo.loss import InfoNCE, SupervisedInfoNCE
+from singeo.model import TimmModel_SinGeo_SemiPositives
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 
 
@@ -50,7 +50,7 @@ class Configuration:
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1       # eval every n Epoch
+    eval_every_n_epoch: int = 1        # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -128,7 +128,7 @@ if __name__ == '__main__':
     print("\nModel: {}".format(config.model))
 
     # loading pretrained models.
-    model = TimmModel_SinGeo(config.model,
+    model = TimmModel_SinGeo_SemiPositives(config.model,
                       pretrained=True,
                       img_size=config.img_size,
                       random_fov=config.random_fov)
@@ -232,12 +232,48 @@ if __name__ == '__main__':
     
         labels = torch.tensor(labels, dtype=torch.long)
         return image, labels
-    
+
+    def shuffle_collate_function(batch):
+        query_images, reference_images, ids = zip(*batch)
+
+        query_images = torch.stack(query_images)          # [B, A, C, H, W]
+        reference_images = torch.stack(reference_images)   # [B, A, C, H, W]
+        ids = torch.stack(ids) if torch.is_tensor(ids[0]) else torch.tensor(ids)  # [B]
+
+        B, A = query_images.shape[0], query_images.shape[1]
+
+        # give every augmentation the same id as its parent query/reference
+        query_ids = ids.expand(B, A).reshape(-1)      # [B*A]
+        reference_ids = ids.expand(B, A).reshape(-1)  # [B*A]
+
+        # flatten images: [B*A, C, H, W]
+        query_images = query_images.reshape(-1, *query_images.shape[2:])
+        reference_images = reference_images.reshape(-1, *reference_images.shape[2:])
+
+        # shuffle query and reference independently
+        query_perm = torch.randperm(B * A)
+        reference_perm = torch.randperm(B * A)
+
+        query_images = query_images[query_perm]
+        reference_images = reference_images[reference_perm]
+        query_ids = query_ids[query_perm]
+        reference_ids = reference_ids[reference_perm]
+
+        # target_matrix[i, j] = 1 if query i and reference j came from the same original pair
+        target_matrix = (query_ids.unsqueeze(1) == reference_ids.unsqueeze(0)).float()
+
+        query_target_matrix = (query_ids.unsqueeze(1) == query_ids.unsqueeze(0)).float()          # [B*A, B*A]
+        reference_target_matrix = (reference_ids.unsqueeze(1) == reference_ids.unsqueeze(0)).float()  # [B*A, B*A]
+
+        return query_images, reference_images, target_matrix, query_target_matrix, reference_target_matrix
+
+
+
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
-                                  pin_memory=True)
+                                  pin_memory=True, collate_fn=shuffle_collate_function)
     
     
     # transformations for Eval and Sim sampling.
@@ -335,7 +371,7 @@ if __name__ == '__main__':
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
 
     print("Using InfoNCE Loss")
-    loss_function = InfoNCE(loss_function=loss_fn,
+    loss_function = SupervisedInfoNCE(
                         device=config.device,
                         )
 
@@ -446,13 +482,14 @@ if __name__ == '__main__':
 
         # modulate the fov of the ground branch
         fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
-        # 4 positives 
-        # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
+        # 4 positive FoV crops for epoch
+        fov_ranges = get_n_fovs(epoch, config.epochs, n=3)
+        
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
                                                                 img_size_ground,
                                                                 mean=mean,
                                                                 std=std,
-                                                                fov=fov_dynamic)
+                                                                fov=fov_dynamic, fovs = fov_ranges)
 
         # modulate the Fov of sim-sampling at the same time
         _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
