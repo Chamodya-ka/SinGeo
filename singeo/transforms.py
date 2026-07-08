@@ -42,6 +42,13 @@ def get_dynamic_rotate_prob(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
 def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0):
     return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
 
+def get_n_fovs(epoch, max_epoch, n=5, fov_max=360, fov_min=70, std=2):
+    # return n random fovs, with FoV difference increasing with epoch/max_epoch
+    t = epoch/max_epoch 
+    fov_diff = ((fov_max - fov_min)/n)*(1-math.exp(-12 * t))
+    fov_samples = [fov_max-(i * fov_diff) for i in range(n)]
+    return fov_samples
+
 def get_dynamic_rotate_prob_random(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
     return random.uniform(min_prob, max_prob)
 
@@ -379,6 +386,9 @@ class LimitedFoVPad(ImageOnlyTransform):
         else:
             return x
 
+# class LimitedFoVPadManyToMany(LimitedFoVPad):
+#     def __init__(self, fovs=[360,270,180,90,70]):
+#         super().__init__(fov)
 
 class ShiftFoV(ImageOnlyTransform):
     def __init__(self, shift=0):
@@ -484,8 +494,8 @@ def get_transforms_val(image_size_sat,
                                    A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                   LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
+                                   #LimitedFoV(fov=fov),
+                                   LimitedFoVPad(fov=fov),
                                   ])
             
                
@@ -686,7 +696,7 @@ def get_transforms_train_singeo(image_size_sat,
                                            ], p=0.3),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                   LimitedFoV(fov=fov),
+                                  # LimitedFoV(fov=fov),
                                    LimitedFoVPad(fov=fov),
                                    ])
                 
@@ -697,8 +707,7 @@ def get_transforms_train_singeo_rot(image_size_sat,
                          mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225],
                          ground_cutting=0,
-                         fov=180):
-    
+                         fov=180, fovs=[]):
     
     satellite_transforms = A.Compose([
                                       A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
@@ -767,16 +776,16 @@ def get_transforms_train_singeo_rot(image_size_sat,
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
                                    ])
-
-    ground_transforms_con = A.Compose([Cut(cutting=ground_cutting, p=1.0),
-                                   A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
-                                   A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
-                                   A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15, always_apply=False, p=0.5),
-                                   A.OneOf([
+    if fovs:
+        ground_transforms_con = [A.Compose([Cut(cutting=ground_cutting, p=1.0),
+                                    A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
+                                    A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                    A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15, always_apply=False, p=0.5),
+                                    A.OneOf([
                                             A.AdvancedBlur(p=1.0),
                                             A.Sharpen(p=1.0),
-                                           ], p=0.3),
-                                   A.OneOf([
+                                            ], p=0.3),
+                                    A.OneOf([
                                             A.GridDropout(ratio=0.5, p=1.0),
                                             A.CoarseDropout(max_holes=25,
                                                             max_height=int(0.2*img_size_ground[0]),
@@ -785,12 +794,37 @@ def get_transforms_train_singeo_rot(image_size_sat,
                                                             min_height=int(0.1*img_size_ground[0]),
                                                             min_width=int(0.1*img_size_ground[0]),
                                                             p=1.0),
-                                           ], p=0.3),
-                                   A.Normalize(mean, std),
-                                   ToTensorV2(),
-                                   LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
-                                   ])
+                                            ], p=0.3),
+                                    A.Normalize(mean, std),
+                                    ToTensorV2(),
+                                    #LimitedFoV(fov=fov),
+                                    LimitedFoVPad(fov=fov),
+                                    ]) for fov in fovs]
+
+    else:
+        ground_transforms_con = A.Compose([Cut(cutting=ground_cutting, p=1.0),
+                                    A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
+                                    A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                    A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15, always_apply=False, p=0.5),
+                                    A.OneOf([
+                                            A.AdvancedBlur(p=1.0),
+                                            A.Sharpen(p=1.0),
+                                            ], p=0.3),
+                                    A.OneOf([
+                                            A.GridDropout(ratio=0.5, p=1.0),
+                                            A.CoarseDropout(max_holes=25,
+                                                            max_height=int(0.2*img_size_ground[0]),
+                                                            max_width=int(0.2*img_size_ground[0]),
+                                                            min_holes=10,
+                                                            min_height=int(0.1*img_size_ground[0]),
+                                                            min_width=int(0.1*img_size_ground[0]),
+                                                            p=1.0),
+                                            ], p=0.3),
+                                    A.Normalize(mean, std),
+                                    ToTensorV2(),
+                                    #LimitedFoV(fov=fov),
+                                    LimitedFoVPad(fov=fov),
+                                    ])
                 
     return satellite_transforms, satellite_transforms_con_rot, ground_transforms, ground_transforms_con
 
