@@ -50,7 +50,7 @@ class Configuration:
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1        # eval every n Epoch
+    eval_every_n_epoch: int = 4        # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -501,7 +501,7 @@ if __name__ == '__main__':
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample 
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
         print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}")
-
+        print(f"For Epoch {epoch}: Ground FOV ranges = {fov_ranges}")
         
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
         

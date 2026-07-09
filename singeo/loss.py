@@ -3,6 +3,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed.nn
 
+
+class SupervisedInfoNCE(nn.Module):
+    def __init__(self, device, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.device=device
+
+    @staticmethod
+    def _multi_positive_ce(logits: torch.Tensor, pos_mask: torch.Tensor, eps: float, same_domain: bool = False) -> torch.Tensor:
+        pos_mask = pos_mask.float()
+        # if same_domain is True, we want to ignore the diagonal elements (self-similarity) in the loss computation
+        if same_domain:
+            diag_mask = torch.eye(pos_mask.size(0), device=pos_mask.device).bool()
+            pos_mask = pos_mask.masked_fill(diag_mask, 0.0)
+        pos_counts = pos_mask.sum(dim=1, keepdim=True)  # |P(i)|
+        valid = pos_counts.squeeze(1) > 0
+
+        targets = pos_mask / pos_counts.clamp(min=eps)  # each row sums to 1
+        
+        per_anchor_loss = F.cross_entropy(logits, targets, reduction="none")  # (N,)
+
+        if valid.any():
+            return per_anchor_loss[valid].mean()
+        return per_anchor_loss.sum() * 0.0
+
+    def forward(
+        self,
+        ground_image_features: torch.Tensor,   
+        aerial_image_features: torch.Tensor,   
+        logit_scale: torch.Tensor,             # scalar
+        labels: torch.Tensor, bidirectional = True, same_domain = False                 
+    ) -> torch.Tensor:
+
+        # Normalize onto the unit hypersphere (drop if already normalized upstream).
+        ground_n = F.normalize(ground_image_features, dim=-1)  
+        aerial_n = F.normalize(aerial_image_features, dim=-1)  
+
+        # Shared similarity matrix, ground rows x aerial cols
+        sim_ground_aerial = ground_n @ aerial_n.t()
+
+        # Direction 1: ground (anchor) -> aerial (candidates). Logits
+        logits_g2a = logit_scale * sim_ground_aerial
+        loss_g2a = self._multi_positive_ce(logits_g2a, labels, self.eps, same_domain)
+        if bidirectional:
+            # Direction 2: aerial (anchor) -> ground (candidates). Logits
+            logits_a2g = logit_scale * sim_ground_aerial.t()
+            labels_a2g = labels.t()  # (B, B*4)
+            loss_a2g = self._multi_positive_ce(logits_a2g, labels_a2g, self.eps, same_domain)
+
+            return loss_g2a + loss_a2g
+        else:
+            return loss_g2a
+
 class InfoNCE(nn.Module):
 
     def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu'):
