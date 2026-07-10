@@ -299,11 +299,12 @@ class Zoomin(ImageOnlyTransform):
 
 class LimitedFoV(ImageOnlyTransform):
     def __init__(self, fov=360.):
-        super(LimitedFoV, self).__init__()
+        super(LimitedFoV, self).__init__(p=1.0)
         self.fov = fov
 
     def apply(self, x, **params):
-        #print(x.shape)
+        #print(x.shape)img_size: int = 384 *2
+        print(int(self.fov / 360. * x.shape[2]))
         if self.fov > 0:
             angle = random.randint(0, 359)
             rotate_index = int(angle / 360. * x.shape[2])
@@ -317,8 +318,93 @@ class LimitedFoV(ImageOnlyTransform):
             return img_shift[:,:,:fov_index]
         else:
             return x
-        
 
+class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
+    def __init__(self, fov=360., aerial_fov=70., orientation_shift=0, rotation=None):
+        """
+        orientation_shift: in aerial image if orientation_shift=0, then aerial image is north aligned (center of aerial image is north)
+                            in groung image if orientation_shift=0, then ground image is north aligned (center of ground image panoroma is north)
+        """
+        super(LimitedFoVCropGrdAerPair, self).__init__(p=1.0)
+        self.fov = float(fov)
+        self.orientation_shift = orientation_shift
+        self.rotation = rotation
+        self.aerial_fov = float(aerial_fov if aerial_fov is not None else fov)
+
+    def __call__(self, image1=None, image2=None, force_apply=False, **params):
+        if image1 is not None and image2 is not None:
+            return self.apply(image1, image2)
+        return super().__call__(force_apply=force_apply, image1=image1, image2=image2, **params)
+
+    def apply(self, image1, image2, **params):
+        if image1 is None or image2 is None:
+            print("This is an error - shouldn't see this")
+            return image1, image2
+
+        print("image1.shape:", image1.shape)
+        print("image2.shape:", image2.shape)
+        if self.fov <= 0:
+            return image1, image2
+
+        angle = self.orientation_shift % 360    # self.orientation if self.orientation not in (None, 0) else random.randint(0, 359)
+        W = image1.shape[2]
+        rotate_index = int(round(angle / 360.0 * W))
+        print(f"rotate_index: {rotate_index}, angle: {angle}, image1.shape[2]: {image1.shape[2]}")
+        fov_index = int(round(self.fov / 360.0 * W))
+
+        # rotate_x2 = (image1.shape[2]//2 + rotate_index + fov_index//2)
+        # rotate_x1 = (image1.shape[2]//2 + rotate_index - fov_index//2)
+        # if (rotate_x2 > image1.shape[2]):
+        #     rotate_x2 = rotate_x2 % image1.shape[2]
+        # if (rotate_x1 > 0):
+        #     rotate_x1 = rotate_x1 % image1.shape[2]
+        # print(f"rotate_x1: {rotate_x1}, rotate_x2: {rotate_x2}, fov_index: {fov_index}, image1.shape[2]: {image1.shape[2]}")
+
+        #  = image1[:, :, rotate_x1: rotate_x2]
+        shifted = np.roll(image1, -rotate_index, axis=2)
+        center = W // 2
+        x1 = center - fov_index // 2
+        x2 = x1 + fov_index
+        if x1 < 0 or x2 > W:
+            shifted = np.roll(shifted, -x1, axis=2)
+            x1, x2 = 0, fov_index
+        image1_cropped = shifted[:, :, x1:x2]
+        # keep the original image2 masking logic intact
+
+        c2, h2, w2 = image2.shape
+        center = (w2 // 2, h2 // 2)
+
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        img_np = np.transpose(image2, (1, 2, 0))
+        image2 = cv2.warpAffine(img_np, M, (w2, h2), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        print(f"image2.shape after rotation: {image2.shape}")
+        if self.fov != 360:
+            radius_px = max(w2, h2)
+            mask = np.zeros((h2, w2), dtype=np.uint8)
+            # start_angle = angle - self.fov / 2.0 - 90.0
+            # end_angle = angle + self.fov / 2.0 - 90.0
+            start_angle = -self.fov / 2.0 - 90.0
+            end_angle = self.fov / 2.0 - 90.0
+            # mask = torch.zeros(image2.shape, dtype=torch.uint8)
+            cv2.ellipse(mask, (w2 // 2, h2 // 2), (radius_px, radius_px), 0,
+                    start_angle, end_angle, 255, -1)
+            image2_cropped = cv2.bitwise_and(image2, image2, mask=mask)
+        #     # was_float = image2.dtype.is_floating_point
+        #     img_np = image2
+        #     img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC for cv2
+
+        #     img_uint8 = img_np.astype(np.uint8)
+
+        #     # mask applies to all channels automatically -- single-channel mask, no repeat.
+        #     masked = cv2.bitwise_and(img_uint8, img_uint8, mask=mask)
+        #     image2_cropped = np.transpose(masked, (2, 0, 1))  # HWC -> CHW
+        
+        # # image2_cropped = cv2.bitwise_and(image2, image2, mask=mask)
+
+            return image1_cropped, image2_cropped
+        else:
+            return image1_cropped, image2
 class LimitedFoV_consistency(ImageOnlyTransform):
     def __init__(self, fov=360.):
         super(LimitedFoV_consistency, self).__init__(fov)
@@ -600,7 +686,56 @@ def get_transforms_sampling(image_size_sat,
                
     return satellite_transforms, ground_transforms
 
+def get_transforms_train_singeo_aer_crops(image_size_sat,
+                         img_size_ground,
+                         mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225],
+                         ground_cutting=0,
+                         fov=180):
+    satellite_transforms = A.Compose([
+                                      A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
+                                      A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                      A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15, always_apply=False, p=0.5),
+                                      A.OneOf([
+                                               A.AdvancedBlur(p=1.0),
+                                               A.Sharpen(p=1.0),
+                                              ], p=0.3),
+                                      A.OneOf([
+                                               A.GridDropout(ratio=0.4, p=1.0),
+                                               A.CoarseDropout(max_holes=25,
+                                                               max_height=int(0.2*image_size_sat[0]),
+                                                               max_width=int(0.2*image_size_sat[0]),
+                                                               min_holes=10,
+                                                               min_height=int(0.1*image_size_sat[0]),
+                                                               min_width=int(0.1*image_size_sat[0]),
+                                                               p=1.0),
+                                              ], p=0.3),
+                                      A.Normalize(mean, std),
+                                      ToTensorV2(),
+                                     ])    
+    satellite_transforms_cons = A.Compose([
+        A.ImageCompression(quality_lower=90, quality_upper=100, p=0.5),
+                                      A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                      A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15, always_apply=False, p=0.5),
+                                      A.OneOf([
+                                               A.AdvancedBlur(p=1.0),
+                                               A.Sharpen(p=1.0),
+                                              ], p=0.3),
+                                      A.OneOf([
+                                               A.GridDropout(ratio=0.4, p=1.0),
+                                               A.CoarseDropout(max_holes=25,
+                                                               max_height=int(0.2*image_size_sat[0]),
+                                                               max_width=int(0.2*image_size_sat[0]),
+                                                               min_holes=10,
+                                                               min_height=int(0.1*image_size_sat[0]),
+                                                               min_width=int(0.1*image_size_sat[0]),
+                                                               p=1.0),
+                                              ], p=0.3),
+                                      A.Normalize(mean, std),
 
+                                      ToTensorV2(),
+    ])
+        
 def get_transforms_train_singeo(image_size_sat,
                          img_size_ground,
                          mean=[0.485, 0.456, 0.406],
@@ -696,8 +831,8 @@ def get_transforms_train_singeo(image_size_sat,
                                            ], p=0.3),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                  # LimitedFoV(fov=fov),
-                                   LimitedFoVPad(fov=fov),
+                                   LimitedFoV(fov=fov),
+                                    #LimitedFoVPad(fov=fov),
                                    ])
                 
     return satellite_transforms, satellite_transforms_con, ground_transforms, ground_transforms_con
@@ -822,8 +957,8 @@ def get_transforms_train_singeo_rot(image_size_sat,
                                             ], p=0.3),
                                     A.Normalize(mean, std),
                                     ToTensorV2(),
-                                    #LimitedFoV(fov=fov),
-                                    LimitedFoVPad(fov=fov),
+                                    LimitedFoV(fov=fov),
+                                    #LimitedFoVPad(fov=fov),
                                     ])
                 
     return satellite_transforms, satellite_transforms_con_rot, ground_transforms, ground_transforms_con
