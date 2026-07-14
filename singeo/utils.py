@@ -4,9 +4,55 @@ import random
 import errno
 import time
 import torch
+import math
 import numpy as np
 from datetime import timedelta
 
+
+def _circular_segments(start: float, end: float):
+    """
+    Splits a (possibly wrapping, possibly >360-span) angular interval into
+    1 or 2 non-wrapping [lo, hi) segments within [0, 360).
+    """
+    span = end - start
+    if span >= 360:
+        return [(0.0, 360.0)]  # full circle covered, regardless of offset
+
+    start_mod = start % 360.0
+    end_mod = start_mod + span
+    if end_mod <= 360.0:
+        return [(start_mod, end_mod)]
+    else:
+        # wraps past the 0/360 seam -> two segments
+        return [(start_mod, 360.0), (0.0, end_mod - 360.0)]
+
+
+def _segments_overlap_length(segs_a, segs_b):
+    total = 0.0
+    for sa, ea in segs_a:
+        for sb, eb in segs_b:
+            lo, hi = max(sa, sb), min(ea, eb)
+            if hi > lo:
+                total += hi - lo
+    return total
+
+
+def LabelGenerator(aerial_fov, grd_fov, aerial_orientation_shift, grd_orientation_shift):
+    ground_x1 = grd_orientation_shift - grd_fov / 2.0
+    ground_x2 = grd_orientation_shift + grd_fov / 2.0
+    aerial_x1 = aerial_orientation_shift - aerial_fov / 2.0
+    aerial_x2 = aerial_orientation_shift + aerial_fov / 2.0
+
+    ground_segs = _circular_segments(ground_x1, ground_x2)
+    aerial_segs = _circular_segments(aerial_x1, aerial_x2)
+
+    overlap = _segments_overlap_length(ground_segs, aerial_segs)
+    if overlap <= 0:
+        return 0.0, 0.0
+
+    ground_2_aer_score = min(math.exp(overlap / float(grd_fov))-1,1)
+    aer_2_ground_score = min(math.exp(overlap / float(aerial_fov))-1,1)
+    return ground_2_aer_score, aer_2_ground_score
 class AverageMeter:
     """
     Computes and stores the average and current value

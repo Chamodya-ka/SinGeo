@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed.nn
 
-
 class SupervisedInfoNCE(nn.Module):
     def __init__(self, device, eps: float = 1e-8):
         super().__init__()
