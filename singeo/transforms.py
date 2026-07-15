@@ -581,13 +581,13 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         rotate_index = int(round(g_angle / 360.0 * W))
         fov_index = int(round(fov / 360.0 * W))
 
-        shifted = np.roll(image1, -rotate_index, axis=2)
+        shifted = np.roll(image1, -rotate_index, axis=1)
         center = W // 2
         x1 = center - fov_index // 2
         x2 = x1 + fov_index
-        if x1 < 0 or x2 > W:
-            shifted = np.roll(shifted, -x1, axis=2)
-            x1, x2 = 0, fov_index
+        # if x1 < 0 or x2 > W:
+        #     shifted = np.roll(shifted, -x1, axis=2)
+        #     x1, x2 = 0, fov_index
         image1_cropped = shifted[:, x1:x2, :]
 
         if pad:
@@ -614,11 +614,13 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         if aerial_fov != 360:
             radius_px = max(w2, h2)
             mask = np.zeros((h2, w2), dtype=np.uint8)
+            image2_cropped = np.zeros_like(image2)
+            image2_cropped[:] = pad_mean
             start_angle = -aerial_fov / 2.0 - 90.0
             end_angle = aerial_fov / 2.0 - 90.0
             cv2.ellipse(mask, (w2 // 2, h2 // 2), (radius_px, radius_px), 0,
                     start_angle, end_angle, 255, -1)
-            image2_cropped = cv2.bitwise_and(image2, image2, mask=mask)
+            cv2.bitwise_and(image2, image2, dst = image2_cropped, mask=mask)
             return image1_cropped, image2_cropped
         else:
             return image1_cropped, image2

@@ -33,7 +33,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 20
+    epochs: int = 40
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -512,7 +512,7 @@ if __name__ == '__main__':
         print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=330, min_value=55) #get_dynamic_fov(epoch, config.epochs, fov_start=180, fov_end=70)
+        fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=360, min_value=60) #get_dynamic_fov(epoch, config.epochs, fov_start=180, fov_end=70)
         # 4 positive FoV crops for epoch
         
         # _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
@@ -536,7 +536,7 @@ if __name__ == '__main__':
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
         
 
-        train_loss = train_contrast_singeo(config,
+        train_loss, g2a_loss, a2g_loss, g2g_loss, a2a_loss = train_contrast_singeo(config,
                         model,
                         dataloader=train_dataloader,
                         loss_function=loss_function,
@@ -547,7 +547,7 @@ if __name__ == '__main__':
         print("Epoch: {}, Train Loss = {:.3f}, Lr = {:.6f}".format(epoch,
                                                                    train_loss,
                                                                    optimizer.param_groups[0]['lr']))
-        
+        print("g2a_loss:{}, a2g_loss:{}, g2g_loss:{}, a2a_loss:{}".format(g2a_loss, a2g_loss, g2g_loss, a2a_loss))
         # evaluate
         if (epoch % config.eval_every_n_epoch == 0 and epoch != 0) or epoch == config.epochs:
         

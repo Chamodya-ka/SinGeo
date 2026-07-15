@@ -6,6 +6,8 @@ from singeo.dataset.cvusa_multiple_aug import CVUSADatasetTrainSinGeoUnifiedAugm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import math 
+import cv2
 
 def brute_force_overlap(aerial_fov, grd_fov, aerial_orientation_shift, grd_orientation_shift, n_bins=36000):
     """
@@ -42,9 +44,8 @@ def test_label_generator_matches_brute_force(trial):
 
     g2a_fast, a2g_fast = LabelGenerator(aerial_fov, grd_fov, aerial_orient, grd_orient)
     g2a_brute, a2g_brute = brute_force_overlap(aerial_fov, grd_fov, aerial_orient, grd_orient)
-
-    assert g2a_fast == pytest.approx(g2a_brute, abs=1e-2)
-    assert a2g_fast == pytest.approx(a2g_brute, abs=1e-2)
+    assert g2a_fast == pytest.approx(min(math.exp(g2a_brute)-1,1), abs=1e-2)
+    assert a2g_fast == pytest.approx(min(math.exp(a2g_brute)-1,1), abs=1e-2)
 
 @pytest.mark.parametrize("trial", range(200))
 def test_invariants(trial):
@@ -85,7 +86,7 @@ def test_disjoint_no_wraparound():
 def test_full_containment():
     # ground [ -50, 50] (fov=100, orient=0), aerial [-10,10] (fov=20, orient=0) -> aerial fully inside ground
     g2a, a2g = LabelGenerator(aerial_fov=20, grd_fov=100, aerial_orientation_shift=0, grd_orientation_shift=0)
-    assert g2a == pytest.approx(20 / 100)   # 20% of ground's view is covered
+    assert g2a == pytest.approx(math.exp(20 / 100)-1)   # 20% of ground's view is covered
     assert a2g == pytest.approx(1.0)        # 100% of aerial's view is covered
 
 def test_both_full_circle():
@@ -98,22 +99,71 @@ def test_wraparound_partial_overlap():
     # aerial centered at 20 deg, fov=40 -> [0, 40]
     # true overlap: [0,10] = 10 degrees
     g2a, a2g = LabelGenerator(aerial_fov=40, grd_fov=40, aerial_orientation_shift=20, grd_orientation_shift=350)
-    assert g2a == pytest.approx(10 / 40)
-    assert a2g == pytest.approx(10 / 40)
+    assert g2a == pytest.approx(math.exp(10 / 40)-1)
+    assert a2g == pytest.approx(math.exp(10 / 40)-1)
 
-def make_test_panorama(width=720, height=100):
-    """Synthetic panorama with a distinct colored stripe at each 30-degree mark,
-    so you can visually verify which angular region a crop actually captures."""
-    img = np.zeros((height, width, 3), dtype=np.uint8)
+def make_test_panorama(width=720, height=100, aerial=False):
+    """
+    Synthetic test image with a distinct colored marker at each 30-degree mark,
+    for visually verifying which angular region a crop/mask actually captures.
+
+    aerial=False: (height, width, 3) panorama. Column position maps linearly to
+                  compass bearing (column 0 = 0 deg, increasing rightward),
+                  matching typical raw panorama storage convention.
+
+    aerial=True:  (size, size, 3) square top-down image, radial lines from
+                  center. IMPORTANT: since the panorama's CENTER column
+                  represents the camera's reference/forward direction
+                  (per the established convention: orientation_shift=0 =>
+                  center of panorama), and the aerial's "up" line must
+                  represent that SAME real-world direction, the color used
+                  at "up" is offset by +180 degrees relative to the raw
+                  deg-to-color mapping -- because the panorama's center
+                  (x = width/2) falls at deg=180 in the panorama's own
+                  column->degree mapping (x = deg/360 * width), not deg=0.
+                  This offset re-aligns the two images' colors WITHOUT
+                  touching the actual rotation/direction math (dx, dy),
+                  which still correctly encodes "0=up, clockwise".
+    """
+    if not aerial:
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        for deg in range(0, 360, 30):
+            x = int(deg / 360 * width)
+            color = plt.cm.hsv(deg / 360)[:3]
+            img[:, max(0, x - 2):x + 2, :] = (np.array(color) * 255).astype(np.uint8)
+        return img
+
+    size = width
+    img = np.zeros((size, size, 3), dtype=np.uint8)
+    center = (size // 2, size // 2)
+    radius = size // 2 - 2
+
     for deg in range(0, 360, 30):
-        x = int(deg / 360 * width)
-        color = plt.cm.hsv(deg / 360)[:3]
-        img[:, max(0, x-2):x+2, :] = (np.array(color) * 255).astype(np.uint8)
+        # Color lookup is offset by 180 deg relative to the geometric direction
+        # `deg` used below -- this is a color-labeling fix only, not a rotation
+        # fix. It makes "up" (deg=0, geometrically) render with the panorama's
+        # CENTER color (which is deg=180's color under the panorama's own
+        # x=deg/360*width mapping), so the two test images agree on which
+        # color represents the camera's reference direction.
+        color_deg = (deg + 180) % 360
+        color = tuple(int(c * 255) for c in plt.cm.hsv(color_deg / 360)[:3])
+
+        # Geometric direction math is UNCHANGED -- still 0=up, clockwise,
+        # matching the convention used by rotate_and_crop_aerial elsewhere.
+        theta = np.deg2rad(deg)
+        dx = np.sin(theta)
+        dy = -np.cos(theta)
+
+        end_x = int(center[0] + dx * radius)
+        end_y = int(center[1] + dy * radius)
+
+        cv2.line(img, center, (end_x, end_y), color, thickness=3, lineType=cv2.LINE_AA)
+
     return img
 
 def visualize_label_consistency(fov_g, fov_a, orient_g, orient_a, transform):
-    panorama = make_test_panorama()
-    aerial = make_test_panorama()  # reuse same generator; treat as a top-down "clock face"
+    panorama = make_test_panorama(width=769, height=140)
+    aerial = make_test_panorama(width=384, height=384, aerial=True)  # reuse same generator; treat as a top-down "clock face"
     transformed_grd_img, transformed_aer_img = transform(
         image2=aerial, image1=panorama,
         fov=fov_g, aerial_fov=fov_a, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True, pad_mean=[123.7, 116.3, 103.5])
@@ -174,35 +224,44 @@ if __name__=="__main__":
     transform = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=[123.7, 116.3, 103.5])
     
     # Sweep a few known cases and visually confirm the label matches what you see
+    visualize_label_consistency(360, 360, 0, 0, transform=transform)
     visualize_label_consistency(90, 90, 0, 0, transform=transform)      # expect full overlap, both crops show same stripes
     visualize_label_consistency(90, 90, 0, 180, transform=transform)    # expect ~0 overlap, disjoint stripes
     visualize_label_consistency(360, 90, 0, 45, transform=transform)    # expect g2a=0.25, a2g=1.0
+    visualize_label_consistency(180, 180, 90, 45, transform=transform)
+    visualize_label_consistency(180, 180, 90, 180, transform=transform)
 
+    visualize_label_consistency(360, 360, 90, 90, transform=transform)
+    visualize_label_consistency(360, 360, -90, -90, transform=transform)
+    visualize_label_consistency(360, 180, -90, 90, transform=transform)
+    visualize_label_consistency(180, 360, -90, 90, transform=transform)
+
+    #visualize_label_consistency(180, 180, 90, 180, transform=transform)
 
     img_size_ground = (140, 768)
     image_size_sat = (384, 384)
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225],
-    sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
-                                                                img_size_ground,
-                                                                mean=mean,
-                                                                std=std,
-                                                                )
+    # sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
+    #                                                             img_size_ground,
+    #                                                             mean=mean,
+    #                                                             std=std,
+    #                                                             )
                                                                    
     # unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
     # Train
-    train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
-                                      transforms_query1=ground_transforms_train1,
-                                    #   transforms_query2=ground_transforms_train2,
-                                      transforms_reference1=sat_transforms_train1,
-                                    #   transforms_reference2=sat_transforms_train2,
-                                      unified_aer_grd_transforms=fov_orientation_aug,
-                                      standard_transform_grd=standard_transform_grd,
-                                      standard_transform_aer=standard_transform_aer,
-                                      prob_flip=0.5,
-                                      prob_rotate=0.5,
-                                      shuffle_batch_size=64,
-                                      max_epochs = 80
-                                      )
-    audit_fov_curriculum(train_dataset)
-    test_getitem_label_image_consistency(train_dataset)
+    # train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
+    #                                   transforms_query1=ground_transforms_train1,
+    #                                 #   transforms_query2=ground_transforms_train2,
+    #                                   transforms_reference1=sat_transforms_train1,
+    #                                 #   transforms_reference2=sat_transforms_train2,
+    #                                   unified_aer_grd_transforms=fov_orientation_aug,
+    #                                   standard_transform_grd=standard_transform_grd,
+    #                                   standard_transform_aer=standard_transform_aer,
+    #                                   prob_flip=0.5,
+    #                                   prob_rotate=0.5,
+    #                                   shuffle_batch_size=64,
+    #                                   max_epochs = 80
+    #                                   )
+    # audit_fov_curriculum(train_dataset)
+    # test_getitem_label_image_consistency(train_dataset)

@@ -33,11 +33,11 @@ def composite_contrast_loss(
         loss_g2a = loss_function(features_q1, features_r1, logit_scale, g2a_target, bidirectional=False, same_domain=False)
         
         # contrast query to reference features
-        loss_q2q = loss_function(features_q1, features_q1, logit_scale, g2g_target, bidirectional=False, same_domain=True)
-        loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=True)
+        loss_q2q = loss_function(features_q1, features_q1, logit_scale, g2g_target, bidirectional=False, same_domain=False)
+        loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=False)
 
 
-        return loss_a2g*0.5 + loss_g2a*0.5 + 0.25*loss_q2q + 0.25*loss_r2r
+        return loss_a2g, loss_g2a, loss_q2q, loss_r2r
     loss1 = loss_function(features_q1, features_r1, logit_scale)
     print("This should not happen")
     return loss1 
@@ -859,7 +859,10 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
     model.train()
     
     losses = AverageMeter()
-    
+    a2g_loss =  AverageMeter()
+    g2a_loss =  AverageMeter()
+    a2a_loss =  AverageMeter()
+    g2g_loss =  AverageMeter()
     # wait before starting progress bar
     time.sleep(0.1)
     
@@ -904,7 +907,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 else:
                     logit_scale = model.logit_scale.exp()
 
-                loss = composite_contrast_loss(
+                loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
                     features_query,
                     features_reference,
                     g2a_target,
@@ -915,7 +918,13 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                     logit_scale,
                     train_config.device,
                 )
+                loss = loss_a2g + loss_g2a + loss_q2q + loss_r2r
                 losses.update(loss.item())
+                g2a_loss.update(loss_g2a)
+                a2a_loss.update(loss_r2r)
+                g2g_loss.update(loss_q2q)
+                a2g_loss.update(loss_a2g)
+
                   
             scaler.scale(loss).backward()
             
@@ -949,7 +958,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
             else:
                 logit_scale = model.logit_scale.exp()
 
-            loss = composite_contrast_loss(
+            loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
                 features_q1,
                 features_q2,
                 features_r1,
@@ -958,8 +967,12 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 logit_scale,
                 train_config.device,
             )
+            loss = loss_a2g + loss_g2a + loss_q2q + loss_r2r
             losses.update(loss.item())
-
+            g2a_loss.update(loss_g2a)
+            a2a_loss.update(loss_r2r)
+            g2g_loss.update(loss_q2q)
+            a2g_loss.update(loss_a2g)
             # Calculate gradient using backward pass
             loss.backward()
             
@@ -979,6 +992,10 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
         if train_config.verbose:
             monitor = {"loss": "{:.4f}".format(loss.item()),
                        "loss_avg": "{:.4f}".format(losses.avg),
+                       "g2a_loss": "{:.4f}".format(g2a_loss.avg),
+                       "a2a_loss": "{:.4f}".format(a2a_loss.avg),
+                       "g2g_loss": "{:.4f}".format(g2g_loss.avg),
+                       "a2g_loss": "{:.4f}".format(a2g_loss.avg),
                        "lr" : "{:.6f}".format(optimizer.param_groups[0]['lr'])}
             
             bar.set_postfix(ordered_dict=monitor)
@@ -988,7 +1005,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
     if train_config.verbose:
         bar.close()
 
-    return losses.avg
+    return losses.avg, g2a_loss.avg, a2g_loss.avg, g2g_loss.avg, a2a_loss.avg
 
 
 

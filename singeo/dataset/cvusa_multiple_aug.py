@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=5000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -233,7 +233,7 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=5000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         else:
             self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=5000)
         
@@ -323,7 +323,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query2 = transforms_query2           # ground
         self.transforms_reference1 = transforms_reference1   # satellite
         self.transforms_reference2 = transforms_reference2
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=5000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -541,7 +541,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.transforms_query1 = transforms_query1 
         self.transforms_reference1 = transforms_reference1   
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=5000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         
         self.epoch = epoch
         self.max_epochs = max_epochs
@@ -719,7 +719,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         for i,[fov_g1,orient_g1] in enumerate(zip(fov_gs, orient_gs)):
             for j,[fov_g2,orient_g2] in enumerate(zip(fov_gs, orient_gs)):
                 labels_g2g[i,j] = LabelGenerator(fov_g1, fov_g2, orient_g1, orient_g2)[0]
-        for i,[fov_a1,orient_a1] in enumerate(zip(fov_as, orient_gs)):
+        for i,[fov_a1,orient_a1] in enumerate(zip(fov_as, orient_as)):
             for j,[fov_a2,orient_a2] in enumerate(zip(fov_as, orient_as)):
                 labels_a2a[i,j] = LabelGenerator(fov_a1, fov_a2, orient_a1, orient_a2)[0]
 
