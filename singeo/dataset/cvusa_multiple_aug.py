@@ -528,7 +528,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
                  prob_rotate=0.0,
                  shuffle_batch_size=128,
                 #  many_to_many=False, fovs=[360,270,180,90,70],
-                 max_epochs=80
+                 max_epochs=80,
+                 aerial_cropping=True
                 ):
         
         super().__init__()
@@ -543,6 +544,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         
+        self.aerial_cropping = aerial_cropping
         self.epoch = epoch
         self.max_epochs = max_epochs
         self.fov = 360 # mean, gradually reduce this as dynamic FoV in SinGeo (semi positives should be centered around self.fov)
@@ -590,14 +592,15 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         fov_l: low fov
         return 4 orientation pairs for 4 ground and aerial image pairs
         """
-        heading = random.randint(0,359)
+        heading_l = random.randint(0,359)
+        heading_h = random.randint(0,359)
         orientation_shift_diff_low = self.sample_dynamic_range(t=0.2,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
         orientation_shift_diff_high = self.sample_dynamic_range(t=0.8,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
 
         lor_l= random.choice([1, -1])
         lor_h = random.choice([1, -1])
-        low_diff_orientation = [heading, (heading+(orientation_shift_diff_low * lor_l))%360]
-        high_diff_orientation = [heading, (heading+(orientation_shift_diff_high * lor_h))%360]
+        low_diff_orientation = [heading_l, (heading_l+(orientation_shift_diff_low * lor_l))%360]
+        high_diff_orientation = [heading_h, (heading_h+(orientation_shift_diff_high * lor_h))%360]
 
         return low_diff_orientation, high_diff_orientation
 
@@ -701,7 +704,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         labels_a2a = torch.zeros([4,4])
         samples = self.get_fovs_and_orientations()
         for fov_g, fov_a, orient_g, orient_a in samples:
-            grd_semi, aer_semi = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=fov_g, aerial_fov=fov_a, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True)
+            grd_semi, aer_semi = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=fov_g, aerial_fov=fov_a if self.aerial_cropping else 360, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True)
             grd_semi = self.standard_transform_grd(image=grd_semi)["image"]
             aer_semi = self.standard_transform_aer(image=aer_semi)["image"]
             queries.append(grd_semi)
