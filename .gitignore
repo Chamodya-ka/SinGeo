@@ -6,4 +6,6 @@ singeo/lib/
 singeo/lib64/
 singeo/include/
 singeo/share/
+singeo_venv/
+debug/
 
