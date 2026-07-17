@@ -459,61 +459,67 @@ class CVUSADatasetTrainSinGeo(Dataset):
                 aerial_crop = torch.from_numpy(aerial_crop).permute(2, 0, 1).float() / 255.0
             aerial_crops.append(aerial_crop)
 
-        ground_shifted_full = self._roll_ground(query_img, self.full_ground_rotation_angle)
+        ground_full = self._roll_ground(query_img, self.full_ground_rotation_angle)
         if self.transforms_query_post is not None:
-            ground_shifted_full = self.transforms_query_post(image=ground_shifted_full)['image']
+            ground_full = self.transforms_query_post(image=ground_full)['image']
         else:
-            ground_shifted_full = torch.from_numpy(ground_shifted_full).permute(2, 0, 1).float() / 255.0
+            ground_full = torch.from_numpy(ground_full).permute(2, 0, 1).float() / 255.0
+        ground_crops.append(ground_full)
 
-        aerial_full_rotations = []
-        # for a_full_angle in self.full_aerial_rotation_angles:
         aerial_full = self._rotate_aerial_full(reference_img, self.full_aerial_rotation_angle)
         if self.transforms_reference_post is not None:
             aerial_full = self.transforms_reference_post(image=aerial_full)['image']
         else:
             aerial_full = torch.from_numpy(aerial_full).permute(2, 0, 1).float() / 255.0
-        aerial_full_rotations.append(aerial_full)
+        aerial_crops.append(aerial_full)
 
-        labels_g2a = torch.zeros((self.k, self.k), dtype=torch.float32)
-        labels_a2g = torch.zeros((self.k, self.k), dtype=torch.float32)
-        labels_g2g = torch.zeros((self.k, self.k), dtype=torch.float32)
-        labels_a2a = torch.zeros((self.k, self.k), dtype=torch.float32)
-        for i, g_shift in enumerate(ground_shifts):
-            for j, a_shift in enumerate(aerial_shifts):
+        num_ground = len(ground_crops)
+        num_aerial = len(aerial_crops)
+        ground_fovs = [self.ground_fov] * self.k + [360]
+        aerial_set_fovs = aerial_fovs + [360]
+        ground_orientations = ground_shifts + [self.full_ground_rotation_angle]
+        aerial_orientations = aerial_shifts + [self.full_aerial_rotation_angle]
+
+        labels_g2a = torch.zeros((num_ground, num_aerial), dtype=torch.float32)
+        labels_a2g = torch.zeros((num_aerial, num_ground), dtype=torch.float32)
+        labels_g2g = torch.zeros((num_ground, num_ground), dtype=torch.float32)
+        labels_a2a = torch.zeros((num_aerial, num_aerial), dtype=torch.float32)
+
+        for i, g_shift in enumerate(ground_orientations):
+            for j, a_shift in enumerate(aerial_orientations):
                 g2a_score, a2g_score = LabelGenerator(
-                    aerial_fov=aerial_fovs[j],
-                    grd_fov=self.ground_fov,
+                    aerial_fov=aerial_set_fovs[j],
+                    grd_fov=ground_fovs[i],
                     aerial_orientation_shift=a_shift,
                     grd_orientation_shift=g_shift,
                 )
                 labels_g2a[i, j] = g2a_score
-                labels_a2g[i, j] = a2g_score
-        for i, g_shift_a in enumerate(ground_shifts):
-            for j, g_shift_b in enumerate(ground_shifts):
+                labels_a2g[j, i] = a2g_score
+
+        for i, g_shift_a in enumerate(ground_orientations):
+            for j, g_shift_b in enumerate(ground_orientations):
                 g2g_score, _ = LabelGenerator(
-                    aerial_fov=self.ground_fov,
-                    grd_fov=self.ground_fov,
+                    aerial_fov=ground_fovs[j],
+                    grd_fov=ground_fovs[i],
                     aerial_orientation_shift=g_shift_b,
                     grd_orientation_shift=g_shift_a,
                 )
                 labels_g2g[i, j] = g2g_score
 
-        for i, a_shift_a in enumerate(aerial_shifts):
-            for j, a_shift_b in enumerate(aerial_shifts):
-                _, a2a_score = LabelGenerator(
-                    aerial_fov=aerial_fovs[i],
-                    grd_fov=aerial_fovs[j],
+        for i, a_shift_a in enumerate(aerial_orientations):
+            for j, a_shift_b in enumerate(aerial_orientations):
+                a2a_score, _ = LabelGenerator(
+                    aerial_fov=aerial_set_fovs[j],
+                    grd_fov=aerial_set_fovs[i],
                     aerial_orientation_shift=a_shift_b,
                     grd_orientation_shift=a_shift_a,
                 )
-                labels_a2a[i, j] = g2g_score
-
+                labels_a2a[i, j] = a2a_score
 
         ground_crops = torch.stack(ground_crops)
         aerial_crops = torch.stack(aerial_crops)
-        aerial_full_rotations = torch.stack(aerial_full_rotations)
 
-        return ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels_g2a, labels_a2g, labels_g2g, labels_a2a
+        return ground_crops, aerial_crops, labels_g2a, labels_a2g, labels_g2g, labels_a2a
     
     def __len__(self):
         return len(self.samples)
