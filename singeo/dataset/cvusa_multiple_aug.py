@@ -575,12 +575,16 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-    def get_fovs(self, t):
+    def get_fovs(self, t,ground=False):
         """
         t: epoch/max_epochs
 
         return n FoV samples around 360-210(left skewed) 210-60(right skewed)
         """
+        if ground:
+            fov_h = self.sample_dynamic_range(t, min_value=60, max_value=360)[0]
+            fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
+            return fov_h,fov_l
         t = np.clip(t, 0.0, 1.0)
         fov_h = self.sample_dynamic_range(t, min_value=210, max_value=360)[0]
         fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
@@ -594,7 +598,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         """
         heading_l = random.randint(0,359)
         heading_h = random.randint(0,359)
-        orientation_shift_diff_low = self.sample_dynamic_range(t=0.2,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
+        t = float(self.epoch)/self.max_epochs
+        orientation_shift_diff_low = self.sample_dynamic_range(t=t,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
         orientation_shift_diff_high = self.sample_dynamic_range(t=0.8,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
 
         lor_l= random.choice([1, -1])
@@ -642,7 +647,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             # park this idea: transition from semi positive labels to hard positive labels when IoU > 0.5
         # idea is that the CNN learns not a signature for the image pair but a real object presence in the image pairs
 
-        high_fov_g, low_fov_g = self.get_fovs(self.epoch/self.max_epochs)
+        high_fov_g, low_fov_g = self.get_fovs(self.epoch/self.max_epochs, ground=True)
         high_fov_a, low_fov_a = self.get_fovs(self.epoch/self.max_epochs)
 
 

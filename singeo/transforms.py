@@ -591,18 +591,12 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         image1_cropped = shifted[:, x1:x2, :]
 
         if pad:
-            pad_x = (W - image1_cropped.shape[1])//2
-            if pad_x>0:
+            total_pad = W - image1_cropped.shape[1]
+            if total_pad>0:
+                pad_left = np.random.randint(0, total_pad + 1)
                 padded_image = np.full(image1_shape, pad_mean, dtype=image1_cropped.dtype)
-                padded_image[:, pad_x:pad_x + image1_cropped.shape[1], :] = image1_cropped
+                padded_image[:, pad_left:pad_left + image1_cropped.shape[1], :] = image1_cropped
                 image1_cropped = padded_image
-                # cropped_hwc = np.transpose(image1_cropped, (1, 2, 0))
-                # border_value = tuple(float(v) for v in pad_mean)
-                # padded_hwc = cv2.copyMakeBorder(
-                #     cropped_hwc, 0, 0, pad_x, pad_x,
-                #     cv2.BORDER_CONSTANT, value=border_value
-                # )
-                # image1_cropped = np.transpose(padded_hwc, (2, 0, 1))
         # keep the original image2 masking logic intact
         h2, w2, c = image2.shape
         center = (w2 // 2, h2 // 2)

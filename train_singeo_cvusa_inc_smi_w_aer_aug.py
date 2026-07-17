@@ -194,7 +194,8 @@ if __name__ == '__main__':
                                       prob_flip=config.prob_flip,
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
-                                      max_epochs = config.epochs
+                                      max_epochs = config.epochs,
+                                      aerial_cropping=True
                                       )
 
     def variable_size_collate(batch):
@@ -548,6 +549,7 @@ if __name__ == '__main__':
                                                                    train_loss,
                                                                    optimizer.param_groups[0]['lr']))
         print("g2a_loss:{}, a2g_loss:{}, g2g_loss:{}, a2a_loss:{}".format(g2a_loss, a2g_loss, g2g_loss, a2a_loss))
+
         # evaluate
         if (epoch % config.eval_every_n_epoch == 0 and epoch != 0) or epoch == config.epochs:
         

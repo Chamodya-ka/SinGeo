@@ -33,8 +33,8 @@ def composite_contrast_loss(
         loss_g2a = loss_function(features_q1, features_r1, logit_scale, g2a_target, bidirectional=False, same_domain=False)
         
         # contrast query to reference features
-        loss_q2q = loss_function(features_q1, features_q1, logit_scale, g2g_target, bidirectional=False, same_domain=False)
-        loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=False)
+        loss_q2q = loss_function(features_q1, features_q1, logit_scale, g2g_target, bidirectional=False, same_domain=True)
+        loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=True)
 
 
         return loss_a2g, loss_g2a, loss_q2q, loss_r2r
