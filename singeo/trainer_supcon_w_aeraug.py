@@ -37,7 +37,7 @@ def composite_contrast_loss(
         loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=True)
 
 
-        return loss_a2g, loss_g2a, loss_q2q, loss_r2r
+        return loss_a2g, loss_g2a, 0.5*loss_q2q, 0.5*loss_r2r
     loss1 = loss_function(features_q1, features_r1, logit_scale)
     print("This should not happen")
     return loss1 

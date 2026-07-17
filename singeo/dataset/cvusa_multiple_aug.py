@@ -586,7 +586,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
             return fov_h,fov_l
         t = np.clip(t, 0.0, 1.0)
-        fov_h = self.sample_dynamic_range(t, min_value=210, max_value=360)[0]
+        fov_h = self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
         fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
         return fov_h,fov_l
 
@@ -600,7 +600,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         heading_h = random.randint(0,359)
         t = float(self.epoch)/self.max_epochs
         orientation_shift_diff_low = self.sample_dynamic_range(t=t,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
-        orientation_shift_diff_high = self.sample_dynamic_range(t=0.8,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
+        # flow orientation needed to ensure at least one sample pair is a postive in a batch
+        orientation_shift_diff_high = self.sample_dynamic_range(t=t,min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
 
         lor_l= random.choice([1, -1])
         lor_h = random.choice([1, -1])
