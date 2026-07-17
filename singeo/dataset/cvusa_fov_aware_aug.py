@@ -300,20 +300,20 @@ class CVUSADatasetEval(Dataset):
 class CVUSADatasetTrainSinGeo(Dataset):
     def __init__(self,
                  data_folder,
-                 transforms_query1=None,
-                 transforms_query2=None,
-                 transforms_reference1=None,
-                 transforms_reference2=None,
+                 transforms_query_pre=None,
+                 transforms_query_post=None,
+                 transforms_reference_pre=None,
+                 transforms_reference_post=None,
+                 crop_transform=None,
                  prob_flip=0.0,
                  prob_rotate=0.0,
                  shuffle_batch_size=128,
                  many_to_many=False,
                  k=4,
                  ground_fov=180,
-                 aerial_fov=180,
                  aerial_rotation_angles=None,
-                 full_ground_rotation_angles=None,
-                 full_aerial_rotation_angles=None,
+                 full_ground_rotation_angle=None,
+                 full_aerial_rotation_angle=None,
                  pad=False,
                  pad_mean=(0.485, 0.456, 0.406),
                  fovs=[360,270,180,90,70]
@@ -326,13 +326,12 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.shuffle_batch_size = shuffle_batch_size
         self.k = k
         self.ground_fov = ground_fov
-        self.aerial_fov = aerial_fov
         self.pad = pad
         self.pad_mean = pad_mean
-        self.transforms_query1 = transforms_query1 
-        self.transforms_query2 = transforms_query2           # ground
-        self.transforms_reference1 = transforms_reference1   # satellite
-        self.transforms_reference2 = transforms_reference2
+        self.transforms_query_pre = transforms_query_pre 
+        self.transforms_query_post = transforms_query_post           # ground
+        self.transforms_reference_pre = transforms_reference_pre   # satellite
+        self.transforms_reference_post = transforms_reference_post
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
@@ -360,10 +359,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
         else:
             self.aerial_rotation_angles = self.aerial_rotation_angles[:self.k]
 
-        self.full_ground_rotation_angles = full_ground_rotation_angles if full_ground_rotation_angles is not None else [0]
-        self.full_aerial_rotation_angles = full_aerial_rotation_angles if full_aerial_rotation_angles is not None else [0, 90, 180, 270]
+        self.full_ground_rotation_angle = full_ground_rotation_angle if full_ground_rotation_angle is not None else random.randint(0,360-self.ground_fov)
+        self.full_aerial_rotation_angle = full_aerial_rotation_angle if full_aerial_rotation_angle is not None else random.choice([0, 90, 180, 270])
 
-        self.crop_transform = LimitedFoVCropGrdAerPair(fov=self.ground_fov,
+        self.crop_transform = crop_transform if crop_transform is not None else LimitedFoVCropGrdAerPair(fov=self.ground_fov,
                                                       aerial_fov=self.aerial_fov,
                                                       pad=self.pad,
                                                       pad_mean=self.pad_mean)
@@ -416,76 +415,105 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # build multi-orientation ground crops and aerial crops
         ground_shifts = [(360 // self.k) * i % 360 for i in range(self.k)]
         aerial_shifts = self.aerial_rotation_angles
+        # aerial fovs will be a evenly spaced k items between 360 and ground fov
+        aerial_fovs = [(360 - ((360 - self.ground_fov) // self.k) * i % 360) for i in range(self.k)]
         # ensure one full-positive pairing by aligning the first orientation
         aerial_shifts[0] = ground_shifts[0]
 
         ground_crops = []
         aerial_crops = []
-        for g_shift in ground_shifts:
+        query_img = self.transforms_query_pre(image=query_img)["image"]
+        reference_img = self.transforms_reference_pre(image=qureference_imgery_img)["image"]
+
+        for i,g_shift in enumerate(ground_shifts):
             ground_crop, _ = self.crop_transform(
                 image1=query_img,
                 image2=reference_img,
                 fov=self.ground_fov,
-                aerial_fov=self.aerial_fov,
+                aerial_fov=aerial_fovs[i],
                 grd_orientation_shift=g_shift,
                 aer_orientation_shift=0,
                 pad=self.pad,
                 pad_mean=self.pad_mean,
             )
-            if self.transforms_query1 is not None:
-                ground_crop = self.transforms_query1(image=ground_crop)['image']
+            if self.transforms_query_post is not None:
+                ground_crop = self.transforms_query_post(image=ground_crop)['image']
             else:
                 ground_crop = torch.from_numpy(ground_crop).permute(2, 0, 1).float() / 255.0
             ground_crops.append(ground_crop)
 
-        for a_shift in aerial_shifts:
+        for i,a_shift in enumerate(aerial_shifts):
             _, aerial_crop = self.crop_transform(
                 image1=query_img,
                 image2=reference_img,
                 fov=360,
-                aerial_fov=self.aerial_fov,
+                aerial_fov=aerial_fovs[i],
                 grd_orientation_shift=0,
                 aer_orientation_shift=a_shift,
                 pad=self.pad,
                 pad_mean=self.pad_mean,
             )
-            if self.transforms_reference1 is not None:
-                aerial_crop = self.transforms_reference1(image=aerial_crop)['image']
+            if self.transforms_reference_post is not None:
+                aerial_crop = self.transforms_reference_post(image=aerial_crop)['image']
             else:
                 aerial_crop = torch.from_numpy(aerial_crop).permute(2, 0, 1).float() / 255.0
             aerial_crops.append(aerial_crop)
 
-        ground_shifted_full = self._roll_ground(query_img, self.full_ground_rotation_angles[0])
-        if self.transforms_query2 is not None:
-            ground_shifted_full = self.transforms_query2(image=ground_shifted_full)['image']
+        ground_shifted_full = self._roll_ground(query_img, self.full_ground_rotation_angle)
+        if self.transforms_query_post is not None:
+            ground_shifted_full = self.transforms_query_post(image=ground_shifted_full)['image']
         else:
             ground_shifted_full = torch.from_numpy(ground_shifted_full).permute(2, 0, 1).float() / 255.0
 
         aerial_full_rotations = []
-        for a_full_angle in self.full_aerial_rotation_angles:
-            aerial_full = self._rotate_aerial_full(reference_img, a_full_angle)
-            if self.transforms_reference2 is not None:
-                aerial_full = self.transforms_reference2(image=aerial_full)['image']
-            else:
-                aerial_full = torch.from_numpy(aerial_full).permute(2, 0, 1).float() / 255.0
-            aerial_full_rotations.append(aerial_full)
+        # for a_full_angle in self.full_aerial_rotation_angles:
+        aerial_full = self._rotate_aerial_full(reference_img, self.full_aerial_rotation_angle)
+        if self.transforms_reference_post is not None:
+            aerial_full = self.transforms_reference_post(image=aerial_full)['image']
+        else:
+            aerial_full = torch.from_numpy(aerial_full).permute(2, 0, 1).float() / 255.0
+        aerial_full_rotations.append(aerial_full)
 
-        labels = torch.zeros((self.k, self.k), dtype=torch.float32)
+        labels_g2a = torch.zeros((self.k, self.k), dtype=torch.float32)
+        labels_a2g = torch.zeros((self.k, self.k), dtype=torch.float32)
+        labels_g2g = torch.zeros((self.k, self.k), dtype=torch.float32)
+        labels_a2a = torch.zeros((self.k, self.k), dtype=torch.float32)
         for i, g_shift in enumerate(ground_shifts):
             for j, a_shift in enumerate(aerial_shifts):
                 g2a_score, a2g_score = LabelGenerator(
-                    aerial_fov=self.aerial_fov,
+                    aerial_fov=aerial_fovs[j],
                     grd_fov=self.ground_fov,
                     aerial_orientation_shift=a_shift,
                     grd_orientation_shift=g_shift,
                 )
-                labels[i, j] = 0.5 * (g2a_score + a2g_score)
+                labels_g2a[i, j] = g2a_score
+                labels_a2g[i, j] = a2g_score
+        for i, g_shift_a in enumerate(ground_shifts):
+            for j, g_shift_b in enumerate(ground_shifts):
+                g2g_score, _ = LabelGenerator(
+                    aerial_fov=self.ground_fov,
+                    grd_fov=self.ground_fov,
+                    aerial_orientation_shift=g_shift_b,
+                    grd_orientation_shift=g_shift_a,
+                )
+                labels_g2g[i, j] = g2g_score
+
+        for i, a_shift_a in enumerate(aerial_shifts):
+            for j, a_shift_b in enumerate(aerial_shifts):
+                _, a2a_score = LabelGenerator(
+                    aerial_fov=aerial_fovs[i],
+                    grd_fov=aerial_fovs[j],
+                    aerial_orientation_shift=a_shift_b,
+                    grd_orientation_shift=a_shift_a,
+                )
+                labels_a2a[i, j] = g2g_score
+
 
         ground_crops = torch.stack(ground_crops)
         aerial_crops = torch.stack(aerial_crops)
         aerial_full_rotations = torch.stack(aerial_full_rotations)
 
-        return ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels
+        return ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels_g2a, labels_a2g, labels_g2g, labels_a2a
     
     def __len__(self):
         return len(self.samples)
