@@ -575,7 +575,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-    def get_fovs(self, t,ground=False):
+    def get_fovs(self, t, ground=False):
         """
         t: epoch/max_epochs
 
@@ -586,7 +586,11 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
             return fov_h,fov_l
         t = np.clip(t, 0.0, 1.0)
-        fov_h = self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
+        if ground:
+            fov_h = self.sample_dynamic_range(t, min_value=60, max_value=360)[0]
+            fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
+            return fov_h,fov_l
+        fov_h = self.sample_dynamic_range(t, min_value=210, max_value=360)[0]
         fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
         return fov_h,fov_l
 

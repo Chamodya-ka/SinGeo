@@ -889,7 +889,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                         rdenorm = reference_images[x] * std + mean
                         torchvision.utils.save_image(qdenorm, f"debug/query_image_{x}.png")
                         torchvision.utils.save_image(rdenorm, f"debug/reference_image_{x}.png")
-                        # print(g2a_target[x])
+                        print(g2a_target[x])
                 query_images = query_images.to(train_config.device) # [B*A,C,H,W]
                 reference_images = reference_images.to(train_config.device) # [B*A,C,H,W]
                 g2a_target = g2a_target.to(train_config.device) # [B*A, B*A]
@@ -920,10 +920,10 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 )
                 loss = loss_a2g + loss_g2a + loss_q2q + loss_r2r
                 losses.update(loss.item())
-                g2a_loss.update(loss_g2a)
-                a2a_loss.update(loss_r2r)
-                g2g_loss.update(loss_q2q)
-                a2g_loss.update(loss_a2g)
+                g2a_loss.update(loss_g2a.item())
+                a2a_loss.update(loss_r2r.item())
+                g2g_loss.update(loss_q2q.item())
+                a2g_loss.update(loss_a2g.item())
 
                   
             scaler.scale(loss).backward()

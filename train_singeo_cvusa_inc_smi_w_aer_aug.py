@@ -33,7 +33,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 40
+    epochs: int = 80
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -68,14 +68,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+    data_folder = "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "./singeo_cvusa"
+    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoints/"
     
     # Eval before training
     zero_shot: bool = False
@@ -195,7 +195,7 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
                                       max_epochs = config.epochs,
-                                      aerial_cropping=True
+                                      aerial_cropping=True,
                                       )
 
     def variable_size_collate(batch):
