@@ -908,7 +908,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 loss2 = compute_loss(features_a, features_g, labels_a2g, logit_scale)
                 loss3 = compute_loss(features_g, features_g, labels_g2g, logit_scale, same_domain=True)
                 loss4 = compute_loss(features_a, features_a, labels_a2a, logit_scale, same_domain=True)
-                loss = loss1 + 0.75*loss2 + 0.5*loss3 + 0.5*loss4
+                loss = loss1 + loss2 + 0.5*loss3 + 0.5*loss4
                 losses.update(loss.item())
                 loss1s.update(loss1.item())
                 loss2s.update(loss2.item())
