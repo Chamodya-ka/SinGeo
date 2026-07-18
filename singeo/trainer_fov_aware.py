@@ -821,7 +821,11 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
     model.train()
     
     losses = AverageMeter()
-    
+    loss1s = AverageMeter()
+    loss2s = AverageMeter()
+    loss3s = AverageMeter()
+    loss4s = AverageMeter()
+
     # wait before starting progress bar
     time.sleep(0.1)
     
@@ -835,35 +839,60 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
     else:
         bar = dataloader
     # for loop over one epoch
-    for ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels_g2a, labels_a2g, labels_g2g, labels_a2a in bar:
-        
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1,-1,1,1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1,-1,1,1)
+
+    def compute_loss(features_g, features_a, labels_g2a, logit_scale, same_domain=False):
+        return loss_function(features_g, features_a, logit_scale, labels_g2a, bidirectional=False, same_domain=same_domain)
+    
+    def interleave_full_features(features_crops, features_full):
+            batch_size = features_full.shape[0]
+            if features_crops.shape[0] % batch_size != 0:
+                raise ValueError(
+                    f"Crop features ({features_crops.shape[0]}) not divisible by full batch size ({batch_size})"
+                )
+            crops_per_sample = features_crops.shape[0] // batch_size
+            feature_dim = features_crops.shape[-1]
+            combined = features_crops.new_empty(batch_size * (crops_per_sample + 1), feature_dim)
+            for b in range(batch_size):
+                crop_start = b * crops_per_sample
+                block_start = b * (crops_per_sample + 1)
+                combined[block_start:block_start + crops_per_sample] = features_crops[crop_start:crop_start + crops_per_sample]
+                combined[block_start + crops_per_sample] = features_full[b]
+            return combined
+
+    for ground_crops, ground_full, aerial_crops, aerial_full, labels_g2a, labels_a2g, labels_g2g, labels_a2a in bar:
         if scaler:
-            with autocast():                	
-                # data (batches) to device   
-                # query1 = [query.to(train_config.device, non_blocking=True) for query in query1]
-                # query2 = [query.to(train_config.device, non_blocking=True) for query in query2]
-                # reference1 = [ref.to(train_config.device, non_blocking=True) for ref in reference1]
-                # reference2 = [ref.to(train_config.device, non_blocking=True) for ref in reference2]
+            with autocast():              	
+                if step == 1:
+                    for x in range(len(ground_crops)):
+                        qdenorm = ground_crops[x] * std + mean
+                        rdenorm = aerial_crops[x] * std + mean
+                        torchvision.utils.save_image(qdenorm, f"debug/query_image_{x}.png")
+                        torchvision.utils.save_image(rdenorm, f"debug/reference_image_{x}.png")
+                    for x in range(len(ground_full)):
+                        fqdenorm = ground_full[x] * std + mean
+                        frdenorm = aerial_full[x] * std + mean
+                        torchvision.utils.save_image(fqdenorm, f"debug/query_image_{x}_f.png")
+                        torchvision.utils.save_image(frdenorm, f"debug/reference_image_{x}_f.png")
                 ground_crops = ground_crops.to(train_config.device)
-                ground_shifted_full = ground_shifted_full.to(train_config.device)
+                ground_full = ground_full.to(train_config.device)
                 aerial_crops = aerial_crops.to(train_config.device)
-                aerial_full_rotations = aerial_full_rotations.to(train_config.device)
+                aerial_full = aerial_full.to(train_config.device)
                 labels_g2a = labels_g2a.to(train_config.device)
                 labels_a2g = labels_a2g.to(train_config.device)
                 labels_g2g = labels_g2g.to(train_config.device)
                 labels_a2a = labels_a2a.to(train_config.device)
+
                 # visualize
-                # if step==1:
-                #     for i in range(query1.shape[0]):
-                #         torchvision.utils.save_image(query1[i], f"debug/query1_{step}_{i}.png")
-                #         torchvision.utils.save_image(query2[i], f"debug/query2_{step}_{i}.png")
-                #         torchvision.utils.save_image(reference1[i], f"debug/reference1_{step}_{i}.png")
-                #         torchvision.utils.save_image(reference2[i], f"debug/reference2_{step}_{i}.png")
-                # Forward pass
+                
                 features_crops_g, features_crops_a = model(ground_crops, aerial_crops)
-                features_full_g, feautres_full_a = model(ground_shifted_full,aerial_full_rotations)
+                features_full_g, features_full_a = model(ground_full, aerial_full)
+                features_g = interleave_full_features(features_crops_g, features_full_g)
+                features_a = interleave_full_features(features_crops_a, features_full_a)
                 if torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1: 
                     print("SHOULD NOT SEE THIS")
+                    logit_scale = model.module.logit_scale.exp()
                     # loss1 = loss_function(features_q1, features_r1, model.module.logit_scale.exp()) # original r1 and original q1
                     # loss2 = loss_function(features_q1, features_q2, model.module.logit_scale.exp()) # original q1 and auged q2
                     # loss3 = loss_function(features_r1, features_r2, model.module.logit_scale.exp()) # original r1 and auged&rotted r2
@@ -874,16 +903,18 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                     # # auged r2: rotted&auged satelitte
                     
                 else:
-                    loss_a2g = loss_function(features_crops_g, features_crops_a, model.logit_scale.exp(), labels_a2g, bidirectional=False, same_domain=False)
-                    loss_g2a = loss_function(features_q1, features_r1, model.logit_scale.exp(), labels_g2a, bidirectional=False, same_domain=False)
-                    
-                    # contrast query to reference features
-                    loss_q2q = loss_function(features_crops_g, features_crops_g, model.logit_scale.exp(), g2g_target, bidirectional=False, same_domain=False)
-                    loss_r2r = loss_function(features_r1, features_r1, model.logit_scale.exp(), a2a_target, bidirectional=False, same_domain=False)
-
-                loss = loss1+0.5*loss2+0.5*loss3+0.25*loss4+0.25*loss5+0.25*loss6
+                    logit_scale = model.logit_scale.exp()
+                loss1 = compute_loss(features_g, features_a, labels_g2a, logit_scale)
+                loss2 = compute_loss(features_a, features_g, labels_a2g, logit_scale)
+                loss3 = compute_loss(features_g, features_g, labels_g2g, logit_scale, same_domain=True)
+                loss4 = compute_loss(features_a, features_a, labels_a2a, logit_scale, same_domain=True)
+                loss = loss1 + 0.75*loss2 + 0.5*loss3 + 0.5*loss4
                 losses.update(loss.item())
-                  
+                loss1s.update(loss1.item())
+                loss2s.update(loss2.item())
+                loss3s.update(loss3.item())
+                loss4s.update(loss4.item())
+
             scaler.scale(loss).backward()
             
             # Gradient clipping 
@@ -904,6 +935,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
    
         else:
             # data (batches) to device   
+            "SHOULD NOT SEE THIS TOO"
             query1 = query1.to(train_config.device)
             query2 = query2.to(train_config.device)
             reference1 = reference1.to(train_config.device)
@@ -948,15 +980,17 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 scheduler.step()
         
         if train_config.verbose:
-            monitor = {"loss": "{:.4f}".format(loss.item()),
-                       "loss1": "{:.4f}".format(loss1.item()),
-                       "loss2": "{:.4f}".format(loss2.item()),
-                       "loss3": "{:.4f}".format(loss3.item()),
-                       "loss4": "{:.4f}".format(loss4.item()),
-                       "loss5": "{:.4f}".format(loss5.item()),
-                       "loss6": "{:.4f}".format(loss6.item()),
-                       "loss_avg": "{:.4f}".format(losses.avg),
-                       "lr" : "{:.6f}".format(optimizer.param_groups[0]['lr'])}
+            monitor = {
+                "loss": "{:.4f}".format(loss.item()),
+                "loss_avg": "{:.4f}".format(losses.avg),
+                "lr": "{:.6f}".format(optimizer.param_groups[0]['lr']),
+                "loss1": "{:.4f}".format(loss1s.avg),
+                "loss2": "{:.4f}".format(loss2s.avg),
+                "loss3": "{:.4f}".format(loss3s.avg),
+                "loss4": "{:.4f}".format(loss4s.avg),
+
+
+            }
             
             bar.set_postfix(ordered_dict=monitor)
         

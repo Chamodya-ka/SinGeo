@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -230,9 +230,9 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         else:
-            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)
+            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None, nrows=5000)
         
         self.df = self.df.rename(columns={0:"sat", 1:"ground", 2:"ground_anno"})
         
@@ -309,7 +309,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
                  prob_rotate=0.0,
                  shuffle_batch_size=128,
                  many_to_many=False,
-                 k=4,
+                 k=3,
                  ground_fov=180,
                  aerial_rotation_angles=None,
                  full_ground_rotation_angle=None,
@@ -332,7 +332,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query_post = transforms_query_post           # ground
         self.transforms_reference_pre = transforms_reference_pre   # satellite
         self.transforms_reference_post = transforms_reference_post
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -410,7 +410,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
             r = np.random.choice([1, 2, 3])
             reference_img = np.rot90(reference_img, k=r, axes=(0, 1)).copy()
             shifts = - query_img.shape[1] // 4 * r
-            query_img = np.roll(query_img, shifts=shifts, axis=1)
+            query_img = np.roll(query_img, shifts, axis=1)
 
         # build multi-orientation ground crops and aerial crops
         ground_shifts = [(360 // self.k) * i % 360 for i in range(self.k)]
@@ -423,7 +423,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         ground_crops = []
         aerial_crops = []
         query_img = self.transforms_query_pre(image=query_img)["image"]
-        reference_img = self.transforms_reference_pre(image=qureference_imgery_img)["image"]
+        reference_img = self.transforms_reference_pre(image=reference_img)["image"]
 
         for i,g_shift in enumerate(ground_shifts):
             ground_crop, _ = self.crop_transform(
@@ -464,17 +464,17 @@ class CVUSADatasetTrainSinGeo(Dataset):
             ground_full = self.transforms_query_post(image=ground_full)['image']
         else:
             ground_full = torch.from_numpy(ground_full).permute(2, 0, 1).float() / 255.0
-        ground_crops.append(ground_full)
+        # ground_crops.append(ground_full)
 
         aerial_full = self._rotate_aerial_full(reference_img, self.full_aerial_rotation_angle)
         if self.transforms_reference_post is not None:
             aerial_full = self.transforms_reference_post(image=aerial_full)['image']
         else:
             aerial_full = torch.from_numpy(aerial_full).permute(2, 0, 1).float() / 255.0
-        aerial_crops.append(aerial_full)
+        # aerial_crops.append(aerial_full)
 
-        num_ground = len(ground_crops)
-        num_aerial = len(aerial_crops)
+        num_ground = len(ground_crops) + 1
+        num_aerial = len(aerial_crops) + 1
         ground_fovs = [self.ground_fov] * self.k + [360]
         aerial_set_fovs = aerial_fovs + [360]
         ground_orientations = ground_shifts + [self.full_ground_rotation_angle]
@@ -519,8 +519,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         ground_crops = torch.stack(ground_crops)
         aerial_crops = torch.stack(aerial_crops)
 
-        return ground_crops, aerial_crops, labels_g2a, labels_a2g, labels_g2g, labels_a2a
-    
+        return ground_crops, aerial_crops, ground_full, aerial_full, labels_g2a, labels_a2g, labels_g2g, labels_a2a
     def __len__(self):
         return len(self.samples)
         

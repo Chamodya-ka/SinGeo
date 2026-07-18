@@ -10,13 +10,13 @@ from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from singeo.dataset.cvusa_fov_aware_aug import CVUSADatasetEval, CVUSADatasetTrainSinGeo
-from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
-from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov
+from singeo.transforms_fov_aware import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
+from singeo.transforms_fov_aware import get_dynamic_rotate_prob, build_satellite_dynamic_transforms, get_transforms_train_singeo_unified
+from singeo.transforms_fov_aware import get_dynamic_fov
 
 from singeo.utils import setup_system, Logger
-from singeo.trainer import train_contrast_singeo
-from singeo.loss import InfoNCE
+from singeo.trainer_fov_aware import train_contrast_singeo
+from singeo.loss import SupervisedInfoNCE
 from singeo.model import TimmModel_SinGeo_SemiPositives
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 
@@ -33,8 +33,8 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 80
-    batch_size: int = 4        # keep in mind real_batch_size = 2 * batch_size
+    epochs: int = 20
+    batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
     
@@ -181,66 +181,56 @@ if __name__ == '__main__':
                                                                 std=std,
                                                                 )
 
-    def combine_and_permute(batch):
-        # ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels_g2a, labels_a2g, labels_g2g, labels_a2a
-        ground_crops, ground_shifted_full, aerial_crops, aerial_full_rotations, labels_g2a, labels_a2g, labels_g2g, labels_a2a = zip(*batch)
-                                                                   
     train_dataset = CVUSADatasetTrainSinGeo(data_folder=config.data_folder ,
-                                      transforms_query_pre=ground_transforms_train1,
-                                      transforms_query_post=ground_transforms_train2,
-                                      transforms_reference_pre=sat_transforms_train1,
-                                      transforms_reference_post=sat_transforms_train2,
-                                      crop_transform = crop_orientation
+                                      transforms_query_pre=pre_ground_transforms,
+                                      transforms_query_post=post_standard_transform_grd,
+                                      transforms_reference_pre=pre_satellite_transforms,
+                                      transforms_reference_post=post_standard_transform_aer,
+                                      crop_transform = crop_orientation,
                                       prob_flip=config.prob_flip,
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size
                                       )
+    def combine_and_permute(batch):
+        # Each item contains: ground_crops, aerial_crops, ground_full, aerial_full,
+        # labels_g2a, labels_a2g, labels_g2g, labels_a2a
+        ground_crops, aerial_crops, ground_full, aerial_full, labels_g2a, labels_a2g, labels_g2g, labels_a2a = zip(*batch)
 
-    def variable_size_collate(batch):
-        # query_img1, query_img2, reference_img1, reference_img2, label
-        q1, q2, r1, r2, labels = zip(*batch)
-        max_h = max(img.shape[1] for img in q2)
-        max_w = max(img.shape[2] for img in q2)
+        batch_size = len(batch)
+        num_ground_crops = ground_crops[0].shape[0]
+        num_aerial_crops = aerial_crops[0].shape[0]
+        num_ground_total = num_ground_crops + 1
+        num_aerial_total = num_aerial_crops + 1
 
-        padded = torch.zeros(len(q2), q1[0].shape[0], max_h, max_w)
-        masks = torch.zeros(len(q2), max_h, max_w, dtype=torch.bool)
+        ground_crops = torch.stack(ground_crops).view(batch_size * num_ground_crops, *ground_crops[0].shape[1:])
+        aerial_crops = torch.stack(aerial_crops).view(batch_size * num_aerial_crops, *aerial_crops[0].shape[1:])
+        ground_full = torch.stack(ground_full)
+        aerial_full = torch.stack(aerial_full)
 
-        for i,img in enumerate(q2):
-            padded[i, :, :img.shape[1], :img.shape[2]] = img
-            masks[i, :img.shape[1], :img.shape[2]] = True
+        labels_g2a_combined = torch.zeros(batch_size * num_ground_total, batch_size * num_aerial_total, dtype=torch.float32)
+        labels_a2g_combined = torch.zeros(batch_size * num_aerial_total, batch_size * num_ground_total, dtype=torch.float32)
+        labels_g2g_combined = torch.zeros(batch_size * num_ground_total, batch_size * num_ground_total, dtype=torch.float32)
+        labels_a2a_combined = torch.zeros(batch_size * num_aerial_total, batch_size * num_aerial_total, dtype=torch.float32)
 
-        query_image1 = torch.stack(q1)
-        query_image2 = padded
-        reference_image1 = torch.stack(r1)
-        reference_image2 = torch.stack(r2)
-        # query_img, reference_img, label
-        # Return images as a raw list, but turn labels into a standard tensor
-        labels = torch.tensor(labels, dtype=torch.long)
-        return query_image1, query_image2, reference_image1, reference_image2, labels
+        for b in range(batch_size):
+            g_start = b * num_ground_total
+            g_end = g_start + num_ground_total
+            a_start = b * num_aerial_total
+            a_end = a_start + num_aerial_total
 
-    def variable_size_collate_test(batch):
-        # query_img1, query_img2, reference_img1, reference_img2, label
-        image, labels = zip(*batch)
-        max_h = max(img.shape[1] for img in image)
-        max_w = max(img.shape[2] for img in image)
+            labels_g2a_combined[g_start:g_end, a_start:a_end] = labels_g2a[b]
+            labels_a2g_combined[a_start:a_end, g_start:g_end] = labels_a2g[b]
+            labels_g2g_combined[g_start:g_end, g_start:g_end] = labels_g2g[b]
+            labels_a2a_combined[a_start:a_end, a_start:a_end] = labels_a2a[b]
 
-        padded = torch.zeros(len(image), image[0].shape[0], max_h, max_w)
-        masks = torch.zeros(len(image), max_h, max_w, dtype=torch.bool)
-
-        for i,img in enumerate(image):
-            padded[i, :, :img.shape[1], :img.shape[2]] = img
-            masks[i, :img.shape[1], :img.shape[2]] = True
-
-        image = padded
-    
-        labels = torch.tensor(labels, dtype=torch.long)
-        return image, labels
+        # Do not merge full images with cropped tensors here; keep them separate for the model.
+        return ground_crops, ground_full, aerial_crops, aerial_full, labels_g2a_combined, labels_a2g_combined, labels_g2g_combined, labels_a2a_combined
     
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
-                                  pin_memory=True)
+                                  pin_memory=True, collate_fn=combine_and_permute)
     
     
     # transformations for Eval and Sim sampling.
@@ -338,7 +328,7 @@ if __name__ == '__main__':
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
 
     print("Using InfoNCE Loss")
-    loss_function = InfoNCE(loss_function=loss_fn,
+    loss_function = SupervisedInfoNCE(#loss_function=loss_fn,
                         device=config.device,
                         )
 
@@ -448,7 +438,7 @@ if __name__ == '__main__':
         # print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=90, fov_end=70)
         # 4 positives 
         # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
