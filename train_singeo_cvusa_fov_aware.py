@@ -33,7 +33,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 20
+    epochs: int = 40
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -68,14 +68,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+    data_folder = "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "./singeo_cvusa"
+    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoints"
     
     # Eval before training
     zero_shot: bool = False
@@ -438,7 +438,7 @@ if __name__ == '__main__':
         # print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=90, fov_end=70)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
         # 4 positives 
         # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
