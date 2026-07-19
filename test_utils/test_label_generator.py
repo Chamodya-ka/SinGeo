@@ -236,32 +236,32 @@ if __name__=="__main__":
     visualize_label_consistency(360, 180, -90, 90, transform=transform)
     visualize_label_consistency(180, 360, -90, 90, transform=transform)
 
-    #visualize_label_consistency(180, 180, 90, 180, transform=transform)
+    visualize_label_consistency(180, 180, 90, 180, transform=transform)
 
     img_size_ground = (140, 768)
     image_size_sat = (384, 384)
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225],
-    # sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
-    #                                                             img_size_ground,
-    #                                                             mean=mean,
-    #                                                             std=std,
-    #                                                             )
+    sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
+                                                                img_size_ground,
+                                                                mean=mean,
+                                                                std=std,
+                                                                )
                                                                    
-    # unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
+    unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
     # Train
-    # train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
-    #                                   transforms_query1=ground_transforms_train1,
-    #                                 #   transforms_query2=ground_transforms_train2,
-    #                                   transforms_reference1=sat_transforms_train1,
-    #                                 #   transforms_reference2=sat_transforms_train2,
-    #                                   unified_aer_grd_transforms=fov_orientation_aug,
-    #                                   standard_transform_grd=standard_transform_grd,
-    #                                   standard_transform_aer=standard_transform_aer,
-    #                                   prob_flip=0.5,
-    #                                   prob_rotate=0.5,
-    #                                   shuffle_batch_size=64,
-    #                                   max_epochs = 80
-    #                                   )
-    # audit_fov_curriculum(train_dataset)
+    train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
+                                      transforms_query1=ground_transforms_train1,
+                                    #   transforms_query2=ground_transforms_train2,
+                                      transforms_reference1=sat_transforms_train1,
+                                    #   transforms_reference2=sat_transforms_train2,
+                                      unified_aer_grd_transforms=fov_orientation_aug,
+                                      standard_transform_grd=standard_transform_grd,
+                                      standard_transform_aer=standard_transform_aer,
+                                      prob_flip=0.5,
+                                      prob_rotate=0.5,
+                                      shuffle_batch_size=64,
+                                      max_epochs = 80
+                                      )
+    audit_fov_curriculum(train_dataset)
     # test_getitem_label_image_consistency(train_dataset)

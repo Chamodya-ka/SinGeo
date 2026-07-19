@@ -623,6 +623,74 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
             return image1_cropped, image2_cropped
         else:
             return image1_cropped, image2
+        
+class LimitedFoVGroundCrop(ImageOnlyTransform):
+    def __init__(self, fov=360., grd_orientation_shift=0, pad=None, pad_mean=(0.485, 0.456, 0.406)):
+        """
+        orientation_shift: in aerial image if orientation_shift=0, then aerial image is north aligned (center of aerial image is north)
+                            in ground image if orientation_shift=0, then ground image is north aligned (center of ground image panorama is north)
+
+        These values are only used as *defaults*. They can be overridden on a
+        per-call basis by passing fov / aerial_fov / grd_orientation_shift /
+        aer_orientation_shift to __call__ or apply().
+        """
+        super(LimitedFoVGroundCrop, self).__init__(p=1.0)
+        self.fov = float(fov)
+        self.grd_orientation_shift = grd_orientation_shift
+        self.pad = pad
+        self.pad_mean = pad_mean
+
+    # def __call__(self, image, force_apply=False,
+    #              fov=None, grd_orientation_shift=0.0, pad=None, pad_mean=None,
+    #              **params):
+    #     if image is not None:
+    #         return self.apply(
+    #             image,
+    #             fov=fov,
+    #             grd_orientation_shift=grd_orientation_shift,
+    #             pad=pad, pad_mean=pad_mean,
+    #         )
+    #     return super().__call__(
+    #         force_apply=force_apply, image=image,
+    #         grd_orientation_shift=grd_orientation_shift,
+    #         pad=pad, pad_mean=pad_mean,
+    #         **params,
+    #     )
+
+    def apply(self, image,
+              fov=None, grd_orientation_shift=None, pad=None, pad_mean=None,
+              **params):
+        if image is None:
+            print("This is an error - shouldn't see this")
+            return image
+        pad_mean = self.pad_mean if pad_mean is None else pad_mean
+        # Resolve per-call overrides, falling back to instance defaults.
+        fov = self.fov if fov is None else float(fov)
+        grd_orientation_shift = self.grd_orientation_shift if grd_orientation_shift is None else grd_orientation_shift
+
+        image_shape = image.shape
+
+        if fov <= 0:
+            return image
+
+        g_angle = grd_orientation_shift % 360
+        W = image_shape[1]
+        rotate_index = int(round(g_angle / 360.0 * W))
+        fov_index = int(round(fov / 360.0 * W))
+
+        shifted = np.roll(image, -rotate_index, axis=1)
+        center = W // 2
+        x1 = center - fov_index // 2
+        x2 = x1 + fov_index
+        image1_cropped = shifted[:, x1:x2, :]
+
+        if pad:
+            pad_x = (W - image1_cropped.shape[1])//2
+            if pad_x>0:
+                padded_image = np.full(image_shape, pad_mean, dtype=image1_cropped.dtype)
+                padded_image[:, pad_x:pad_x + image1_cropped.shape[1], :] = image1_cropped
+                image1_cropped = padded_image
+        return image1_cropped
 
 class LimitedFoVMaskAerial(ImageOnlyTransform):
     def __init__(self, fov=360., aer_orientation_shift=None, pad=None, pad_mean=(0.485, 0.456, 0.406)):
@@ -640,26 +708,26 @@ class LimitedFoVMaskAerial(ImageOnlyTransform):
         self.pad = pad
         self.pad_mean = pad_mean
 
-    def __call__(self, image=None, force_apply=False,
-                 fov=None, aer_orientation_shift=None, pad=None, pad_mean=None,
-                 **params):
-        if image is not None:
-            return self.apply(
-                image,
-                fov=fov,
-                aer_orientation_shift=aer_orientation_shift,
-                pad=pad, pad_mean=pad_mean,
-            )
-        return super().__call__(
-            force_apply=force_apply, image1=image,
-            fov=fov,
-            aer_orientation_shift=aer_orientation_shift,
-            pad=pad, pad_mean=pad_mean,
-            **params,
-        )
+    # def __call__(self, image=None, force_apply=False,
+    #              fov=None, aer_orientation_shift=0.0, pad=None, pad_mean=None,
+    #              **params):
+    #     if image is not None:
+    #         return self.apply(
+    #             image,
+    #             fov=fov,
+    #             aer_orientation_shift=aer_orientation_shift,
+    #             pad=pad, pad_mean=pad_mean,
+    #         )
+    #     return super().__call__(
+    #         force_apply=force_apply, image=image,
+    #         fov=fov,
+    #         aer_orientation_shift=aer_orientation_shift,
+    #         pad=pad, pad_mean=pad_mean,
+    #         **params,
+    #     )
 
     def apply(self, image,
-              fov=None, aer_orientation_shift=0, pad=None, pad_mean=None,
+              fov=None, aer_orientation_shift=None, pad=None, pad_mean=None,
               **params):
         if image is None:
             print("This is an error - shouldn't see this")
@@ -667,16 +735,17 @@ class LimitedFoVMaskAerial(ImageOnlyTransform):
         pad_mean = self.pad_mean if pad_mean is None else pad_mean
         # Resolve per-call overrides, falling back to instance defaults.
         fov = fov if fov is not None else self.fov
-        aer_orientation_shift = aer_orientation_shift
+        aer_orientation_shift = aer_orientation_shift if aer_orientation_shift is not None else self.aer_orientation_shift
         image_shape = image.shape
 
         if fov <= 0:
             return image
         image2 = image
+        h2, w2, c = image_shape
+
         if aer_orientation_shift !=0:
             a_angle = aer_orientation_shift % 360
             # keep the original image2 masking logic intact
-            h2, w2, c = image_shape
             center = (w2 // 2, h2 // 2)
             M = cv2.getRotationMatrix2D(center, a_angle, 1.0)
             # img_np = np.transpose(image2, (1, 2, 0))
@@ -875,10 +944,33 @@ def get_transforms_val(image_size_sat,
                                    LimitedFoV(fov=fov),
                                    #LimitedFoVPad(fov=fov),
                                   ])
-    aerial_cropping = LimitedFoVMaskAerial(pad=False)
-               
-    return satellite_transforms, ground_transforms, aerial_cropping
 
+    return satellite_transforms, ground_transforms
+
+def get_transforms_val_sim_sample(image_size_sat,
+                       img_size_ground,
+                       mean=[0.485, 0.456, 0.406],
+                       std=[0.229, 0.224, 0.225],
+                       ground_cutting=0,
+                       fov=0.0,
+                       orientation=0.0,
+                       mask_ratio=0.0):
+    
+    
+    
+    satellite_transforms = A.Compose([A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                      LimitedFoVMaskAerial(fov=fov, aer_orientation_shift=orientation, pad=False, pad_mean=(0.485, 0.456, 0.406)),
+                                      A.Normalize(mean, std),
+                                      ToTensorV2()
+                                     ])
+
+    ground_transforms = A.Compose([Cut(cutting=ground_cutting, p=1.0),
+                                   A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
+                                   LimitedFoVGroundCrop(fov=fov, grd_orientation_shift=orientation, pad=False, pad_mean=(0.485, 0.456, 0.406)),
+                                   A.Normalize(mean, std),
+                                   ToTensorV2()
+                                  ])
+    return satellite_transforms, ground_transforms
 
 
 def get_transforms_val_consistency(image_size_sat,

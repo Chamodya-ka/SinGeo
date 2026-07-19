@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import shutil
 import sys
@@ -10,7 +11,7 @@ from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from singeo.dataset.cvusa_fov_aware_aug import CVUSADatasetEval, CVUSADatasetTrainSinGeo
-from singeo.transforms_fov_aware import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
+from singeo.transforms_fov_aware import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val, get_transforms_val_sim_sample
 from singeo.transforms_fov_aware import get_dynamic_rotate_prob, build_satellite_dynamic_transforms, get_transforms_train_singeo_unified
 from singeo.transforms_fov_aware import get_dynamic_fov
 
@@ -33,7 +34,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 20
+    epochs: int = 60
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -50,7 +51,7 @@ class Configuration:
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1       # eval every n Epoch
+    eval_every_n_epoch: int = 2       # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -62,7 +63,7 @@ class Configuration:
     label_smoothing: float = 0.1
     
     # Learning Rate
-    lr: float = 0.0001
+    lr: float = 0.0004
     scheduler: str = "cosine"          # "polynomial" | "cosine" | "constant" | None
     warmup_epochs: int = 1
     lr_end: float = 0.0001             #  only for "polynomial"
@@ -240,7 +241,6 @@ if __name__ == '__main__':
                                                                std=std,
                                                                fov=fov,
                                                                )
-
 
     # Reference Satellite Images
     reference_dataset_test = CVUSADatasetEval(data_folder=config.data_folder ,
@@ -438,7 +438,7 @@ if __name__ == '__main__':
         # print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=90, fov_end=70)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
         # 4 positives 
         # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
@@ -448,13 +448,21 @@ if __name__ == '__main__':
                                                                 fov=fov_dynamic)
 
         # modulate the Fov of sim-sampling at the same time
-        _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
-                                                        img_size_ground,
-                                                        mean=mean,
-                                                        std=std,
-                                                        fov=fov_dynamic,
-                                                        )
-        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample 
+        # _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
+        #                                                 img_size_ground,
+        #                                                 mean=mean,
+        #                                                 std=std,
+        #                                                 fov=fov_dynamic,
+        #                                                 )
+        sat_transforms_sim_sample, ground_transforms_sim_sample = get_transforms_val_sim_sample(image_size_sat,
+                                                            img_size_ground,
+                                                            mean=mean,
+                                                            std=std,
+                                                            fov=fov_dynamic,
+                                                            orientation=random.randint(0,359)
+                                                            )
+        query_dataloader_train.dataset.transforms = ground_transforms_sim_sample 
+        reference_dataloader_train.dataset.transforms = sat_transforms_sim_sample
         # train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
         train_dataloader.dataset.ground_fov=fov_dynamic
         print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}")

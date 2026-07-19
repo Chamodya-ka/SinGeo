@@ -3,7 +3,7 @@ import cv2
 from singeo.utils import LabelGenerator
 
 
-transform = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=[123.7, 116.3, 103.5])
+transform = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=(123.7, 116.3, 103.5))
 # test transform on aerial and ground image pair
 aer_img = cv2.imread("test_utils/0024271_a.jpg")
 grd_img = cv2.imread("test_utils/0024271_g.jpg")
