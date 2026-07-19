@@ -33,7 +33,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 40
+    epochs: int = 60
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -50,7 +50,7 @@ class Configuration:
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1       # eval every n Epoch
+    eval_every_n_epoch: int = 2       # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -62,7 +62,7 @@ class Configuration:
     label_smoothing: float = 0.1
     
     # Learning Rate
-    lr: float = 0.0001
+    lr: float = 0.0004
     scheduler: str = "cosine"          # "polynomial" | "cosine" | "constant" | None
     warmup_epochs: int = 1
     lr_end: float = 0.0001             #  only for "polynomial"
@@ -234,7 +234,7 @@ if __name__ == '__main__':
     
     
     # transformations for Eval and Sim sampling.
-    sat_transforms_val, ground_transforms_val = get_transforms_val(image_size_sat,
+    sat_transforms_val, ground_transforms_val, _ = get_transforms_val(image_size_sat,
                                                                img_size_ground,
                                                                mean=mean,
                                                                std=std,
@@ -438,7 +438,7 @@ if __name__ == '__main__':
         # print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=180, fov_end=70)
         # 4 positives 
         # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
@@ -448,7 +448,7 @@ if __name__ == '__main__':
                                                                 fov=fov_dynamic)
 
         # modulate the Fov of sim-sampling at the same time
-        _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
+        _, ground_transforms_dynamic_for_simsample, _ = get_transforms_val(image_size_sat,
                                                         img_size_ground,
                                                         mean=mean,
                                                         std=std,
