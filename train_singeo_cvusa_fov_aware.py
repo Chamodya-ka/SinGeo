@@ -438,7 +438,7 @@ if __name__ == '__main__':
         # print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=180, fov_end=70)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
         # 4 positives 
         # fov_ranges = get_n_fovs(epoch, config.epochs, n=4)
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
