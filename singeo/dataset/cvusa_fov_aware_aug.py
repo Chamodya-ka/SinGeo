@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -230,9 +230,9 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         else:
-            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None, nrows=5000)
+            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=5000)
         
         self.df = self.df.rename(columns={0:"sat", 1:"ground", 2:"ground_anno"})
         
@@ -332,7 +332,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query_post = transforms_query_post           # ground
         self.transforms_reference_pre = transforms_reference_pre   # satellite
         self.transforms_reference_post = transforms_reference_post
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
