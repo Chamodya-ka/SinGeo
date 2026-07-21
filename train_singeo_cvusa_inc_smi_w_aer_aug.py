@@ -59,7 +59,7 @@ class Configuration:
     grad_checkpointing: bool = False   # Gradient Checkpointing
     
     # Loss
-    label_smoothing: float = 0.1
+    label_smoothing: float = 0.0
     
     # Learning Rate
     lr: float = 0.0001
@@ -68,14 +68,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
+    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoints/"
+    model_path: str = "./singeo_cvusa"
     
     # Eval before training
     zero_shot: bool = False
@@ -84,7 +84,7 @@ class Configuration:
     checkpoint_start = None   
   
     # set num_workers to 0 if on Windows
-    num_workers: int = 0 if os.name == 'nt' else 4 
+    num_workers: int = 0 if os.name == 'nt' else 8 
     
     # train on GPU if available
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu' 
@@ -179,6 +179,7 @@ if __name__ == '__main__':
                                                                 img_size_ground,
                                                                 mean=mean,
                                                                 std=std,
+                                                                discretize_aer_orient=True
                                                                 )
                                                                    
     # unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
@@ -239,7 +240,7 @@ if __name__ == '__main__':
         return image, labels
 
     def shuffle_collate_function(batch, permute_views: bool = True):
-        """"
+        """
         batch: queries,references, label, labels
         queries - ground level images
         references - aerial view iamges
@@ -252,50 +253,34 @@ if __name__ == '__main__':
 
         query_images = torch.stack(query_images)          # [B, A, C, H, W]
         reference_images = torch.stack(reference_images)   # [B, A, C, H, W]
-        # ids_g = torch.stack(ids).repeat_interleave(4) 
-        # ids_a = torch.stack(ids).repeat_interleave(4) 
-        # g2g_target = (ids_g.unsqueeze(1) == ids_g.unsqueeze(0)).float()
-        # a2a_target = (ids_a.unsqueeze(1) == ids_a.unsqueeze(0)).float()
-        # combine B,4,4 matrix into 4B,4B matrix
-        processed_grd, processed_aerial = [], []
-        processed_g2a, processed_a2g = [], []
-        processed_g2g, processed_a2a = [], []
-        
-        for grd, aerial, g2a, a2g, g2g, a2a in zip(query_images, reference_images, labels_g2a, labels_a2g, labels_g2g, labels_a2a):
-            g2a = g2a if isinstance(g2a, torch.Tensor) else torch.as_tensor(g2a)
-            a2g = a2g if isinstance(a2g, torch.Tensor) else torch.as_tensor(a2g)
 
-            if permute_views:
-                # Independent permutations per sample -- ground and aerial augmentation
-                # order have no relationship to each other, so no need to tie them together.
-                perm_g = torch.randperm(grd.shape[0])
-                perm_a = torch.randperm(aerial.shape[0])
+        B, A = query_images.shape[0], query_images.shape[1]
+        query_images = query_images.reshape(B * A, *query_images.shape[2:])
+        reference_images = reference_images.reshape(B * A, *reference_images.shape[2:])
 
-                grd = grd[perm_g]
-                aerial = aerial[perm_a]
+        labels_g2a = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_g2a]
+        labels_a2g = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_a2g]
+        labels_g2g = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_g2g]
+        labels_a2a = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_a2a]
 
-                # g2a rows = ground axis -> perm_g; columns = aerial axis -> perm_a.
-                g2a = g2a[perm_g][:, perm_a]
-                # a2g rows = aerial axis -> perm_a; columns = ground axis -> perm_g.
-                a2g = a2g[perm_a][:, perm_g]
+        label_g2a_batch = torch.block_diag(*labels_g2a)  # (4B, 4B)
+        label_a2g_batch = torch.block_diag(*labels_a2g)  # (4B, 4B)
+        label_g2g_batch = torch.block_diag(*labels_g2g)
+        label_a2a_batch = torch.block_diag(*labels_a2a)
 
-                g2g = g2g[perm_g][:, perm_g]
-                a2a = a2a[perm_a][:, perm_a]
-            processed_grd.append(grd)
-            processed_aerial.append(aerial)
-            processed_g2a.append(g2a)
-            processed_a2g.append(a2g)
-            processed_g2g.append(g2g)
-            processed_a2a.append(a2a)
-            grd_batch = torch.stack(processed_grd, dim=0).flatten(0, 1)       # (4B, C, H, W)
+        if permute_views:
+            perm_q = torch.randperm(B * A)
+            perm_r = torch.randperm(B * A)
 
-        aerial_batch = torch.stack(processed_aerial, dim=0).flatten(0, 1)  # (4B, C, H, W)
+            query_images = query_images[perm_q]
+            reference_images = reference_images[perm_r]
 
-        label_g2a_batch = torch.block_diag(*processed_g2a)  # (4B, 4B)
-        label_a2g_batch = torch.block_diag(*processed_a2g)  # (4B, 4B)
-        label_g2g_batch = torch.block_diag(*processed_g2g)
-        label_a2a_batch = torch.block_diag(*processed_a2a)
-        return grd_batch, aerial_batch, label_g2a_batch, label_a2g_batch, label_g2g_batch, label_a2a_batch
+            label_g2a_batch = label_g2a_batch[perm_q][:, perm_r]
+            label_a2g_batch = label_a2g_batch[perm_r][:, perm_q]
+            label_g2g_batch = label_g2g_batch[perm_q][:, perm_q]
+            label_a2a_batch = label_a2a_batch[perm_r][:, perm_r]
+
+        return query_images, reference_images, label_g2a_batch, label_a2g_batch, label_g2g_batch, label_a2a_batch
 
         # return query_images, reference_images, target_matrix, query_target_matrix, reference_target_matrix
 
@@ -513,7 +498,8 @@ if __name__ == '__main__':
         print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=360, min_value=60) #get_dynamic_fov(epoch, config.epochs, fov_start=180, fov_end=70)
+        # fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=360, min_value=60)
+        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
         # 4 positive FoV crops for epoch
         
         # _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,

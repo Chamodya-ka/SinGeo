@@ -14,7 +14,9 @@ class SupervisedInfoNCE(nn.Module):
         pos_mask = pos_mask.float()
         # if same_domain is True, we want to ignore the diagonal elements (self-similarity) in the loss computation
         if same_domain:
-            diag_mask = torch.eye(pos_mask.size(0), device=pos_mask.device).bool()
+            diag_mask = torch.eye(pos_mask.size(0), device=pos_mask.device, dtype=torch.bool)
+            assert logits.size(0) == logits.size(1), "same_domain requires a square similarity matrix"
+            logits = logits.masked_fill(diag_mask, torch.finfo(logits.dtype).min)
             pos_mask = pos_mask.masked_fill(diag_mask, 0.0)
         pos_counts = pos_mask.sum(dim=1, keepdim=True)  # |P(i)|
         valid = pos_counts.squeeze(1) > 0
@@ -25,6 +27,7 @@ class SupervisedInfoNCE(nn.Module):
 
         if valid.any():
             return per_anchor_loss[valid].mean()
+        print("Should not see! Loss error")
         return per_anchor_loss.sum() * 0.0
 
     def forward(

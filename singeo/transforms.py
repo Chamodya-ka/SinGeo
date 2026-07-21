@@ -516,7 +516,7 @@ class LimitedFoV(ImageOnlyTransform):
 #             return image1_cropped, image2
 
 class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
-    def __init__(self, fov=360., aerial_fov=70., grd_orientation_shift=0, aer_orientation_shift=None, pad=None, pad_mean=(0.485, 0.456, 0.406)):
+    def __init__(self, fov=360., aerial_fov=70., grd_orientation_shift=0, aer_orientation_shift=None, pad=None, pad_mean=(123.675, 116.28, 103.53), discretize_aer_orient= False):
         """
         orientation_shift: in aerial image if orientation_shift=0, then aerial image is north aligned (center of aerial image is north)
                             in ground image if orientation_shift=0, then ground image is north aligned (center of ground image panorama is north)
@@ -532,6 +532,7 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         self.aerial_fov = float(aerial_fov if aerial_fov is not None else fov)
         self.pad = pad
         self.pad_mean = pad_mean
+        self.discretize_aer_orient = discretize_aer_orient
 
     def __call__(self, image1=None, image2=None, force_apply=False,
                  fov=None, aerial_fov=None, grd_orientation_shift=None, aer_orientation_shift=None, pad=None, pad_mean=None,
@@ -560,6 +561,9 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         if image1 is None or image2 is None:
             print("This is an error - shouldn't see this")
             return image1, image2
+        image1= image1#.astype(np.float32)
+        image2= image2#.astype(np.float32)
+
         pad_mean = self.pad_mean if pad_mean is None else pad_mean
         # Resolve per-call overrides, falling back to instance defaults.
         fov = self.fov if fov is None else float(fov)
@@ -577,6 +581,7 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
 
         g_angle = grd_orientation_shift % 360
         a_angle = aer_orientation_shift % 360
+
         W = image1.shape[1]
         rotate_index = int(round(g_angle / 360.0 * W))
         fov_index = int(round(fov / 360.0 * W))
@@ -602,18 +607,22 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         center = (w2 // 2, h2 // 2)
         M = cv2.getRotationMatrix2D(center, a_angle, 1.0)
         # img_np = np.transpose(image2, (1, 2, 0))
-        image2 = cv2.warpAffine(image2, M, (w2, h2), flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=pad_mean)
+        if self.discretize_aer_orient:
+            r = a_angle // 90
+            image2 = np.rot90(image2, k=r, axes=(0, 1))
+        else:    
+            image2 = cv2.warpAffine(image2, M, (w2, h2), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=pad_mean)
         
         if aerial_fov != 360:
             radius_px = max(w2, h2)
             mask = np.zeros((h2, w2), dtype=np.uint8)
-            image2_cropped = np.zeros_like(image2)
+            image2_cropped = np.zeros_like(image2).copy()
             image2_cropped[:] = pad_mean
             start_angle = -aerial_fov / 2.0 - 90.0
             end_angle = aerial_fov / 2.0 - 90.0
             cv2.ellipse(mask, (w2 // 2, h2 // 2), (radius_px, radius_px), 0,
-                    start_angle, end_angle, 255, -1)
+                    start_angle, end_angle, 1, -1)
             cv2.bitwise_and(image2, image2, dst = image2_cropped, mask=mask)
             return image1_cropped, image2_cropped
         else:
@@ -1057,7 +1066,7 @@ def get_transforms_train_singeo_unified(image_size_sat,
                          mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225],
                          ground_cutting=0,
-                         fov=180, rotate_prob=0.5):
+                         fov=180, rotate_prob=0.5, discretize_aer_orient=False):
     
     class DynamicRandomRotate(ImageOnlyTransform):
         def __init__(self, always_apply=False, p=1.0, keep_prob=rotate_prob):
@@ -1130,7 +1139,7 @@ def get_transforms_train_singeo_unified(image_size_sat,
         A.Normalize(mean, std),
         ToTensorV2()
     ])
-    crop_orientation = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=mean)
+    crop_orientation = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=[x*255 for x in mean], discretize_aer_orient=discretize_aer_orient)
                 
     return satellite_transforms, ground_transforms, crop_orientation, standard_transform_grd, standard_transform_aer
 

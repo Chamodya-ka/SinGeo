@@ -582,16 +582,12 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         return n FoV samples around 360-210(left skewed) 210-60(right skewed)
         """
         if ground:
-            fov_h = self.sample_dynamic_range(t, min_value=60, max_value=360)[0]
-            fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
+            fov_h = self.sample_dynamic_range(t, min_value=50, max_value=360)[0]
+            fov_l = self.sample_dynamic_range(t, min_value=55, max_value=210)[0]
             return fov_h,fov_l
         t = np.clip(t, 0.0, 1.0)
-        if ground:
-            fov_h = self.sample_dynamic_range(t, min_value=60, max_value=360)[0]
-            fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
-            return fov_h,fov_l
-        fov_h = self.sample_dynamic_range(t, min_value=210, max_value=360)[0]
-        fov_l = self.sample_dynamic_range(t, min_value=60, max_value=210)[0]
+        fov_h = 360 #self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
+        fov_l = self.sample_dynamic_range(t, min_value=135, max_value=270)[0]
         return fov_h,fov_l
 
     def get_orientation(self, fov_g, fov_a):
@@ -609,8 +605,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
 
         lor_l= random.choice([1, -1])
         lor_h = random.choice([1, -1])
-        low_diff_orientation = [heading_l, (heading_l+(orientation_shift_diff_low * lor_l))%360]
-        high_diff_orientation = [heading_h, (heading_h+(orientation_shift_diff_high * lor_h))%360]
+        low_diff_orientation = [(heading_l+(orientation_shift_diff_low * lor_l))%360, heading_l]
+        high_diff_orientation = [(heading_h+(orientation_shift_diff_high * lor_h))%360, heading_h]
 
         return low_diff_orientation, high_diff_orientation
 

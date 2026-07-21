@@ -889,14 +889,17 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                         rdenorm = reference_images[x] * std + mean
                         torchvision.utils.save_image(qdenorm, f"debug/query_image_{x}.png")
                         torchvision.utils.save_image(rdenorm, f"debug/reference_image_{x}.png")
-                        print(g2a_target[x])
+                        # print(g2a_target[x])
                 query_images = query_images.to(train_config.device) # [B*A,C,H,W]
                 reference_images = reference_images.to(train_config.device) # [B*A,C,H,W]
                 g2a_target = g2a_target.to(train_config.device) # [B*A, B*A]
                 a2g_target = a2g_target.to(train_config.device)
                 g2g_target = g2g_target.to(train_config.device)
                 a2a_target = a2a_target.to(train_config.device)
-
+                assert not torch.isnan(a2a_target).any(), "NaN already present in a2a_target before it reaches the loss"
+                assert not torch.isinf(a2a_target).any(), "Inf already present in a2a_target before it reaches the loss"
+                assert not torch.isnan(g2g_target).any(), "NaN already present in g2g_target before it reaches the loss"
+                assert not torch.isinf(g2g_target).any(), "Inf already present in g2g_target before it reaches the loss"
                 # ids [B*A,]
                 # debug - save the first 2 images of the first batch to check if they are loaded correctly
 
@@ -906,7 +909,8 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                     logit_scale = model.module.logit_scale.exp()
                 else:
                     logit_scale = model.logit_scale.exp()
-
+                if step % 250 == 0:
+                    print("logit scale:", logit_scale)
                 loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
                     features_query,
                     features_reference,
