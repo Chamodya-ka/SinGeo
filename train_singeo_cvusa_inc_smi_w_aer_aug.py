@@ -50,7 +50,7 @@ class Configuration:
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1        # eval every n Epoch
+    eval_every_n_epoch: int = 4        # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -59,7 +59,7 @@ class Configuration:
     grad_checkpointing: bool = False   # Gradient Checkpointing
     
     # Loss
-    label_smoothing: float = 0.0
+    label_smoothing: float = 0.05
     
     # Learning Rate
     lr: float = 0.0001
@@ -68,14 +68,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+    data_folder = "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "./singeo_cvusa"
+    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoint"
     
     # Eval before training
     zero_shot: bool = False
@@ -196,7 +196,7 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
                                       max_epochs = config.epochs,
-                                      aerial_cropping=True,
+                                      aerial_cropping=True, discretize_aer_orient=True
                                       )
 
     def variable_size_collate(batch):

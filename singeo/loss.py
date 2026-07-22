@@ -23,7 +23,7 @@ class SupervisedInfoNCE(nn.Module):
 
         targets = pos_mask / pos_counts.clamp(min=eps)  # each row sums to 1
         
-        per_anchor_loss = F.cross_entropy(logits, targets, reduction="none")  # (N,)
+        per_anchor_loss = F.cross_entropy(logits.float(), targets.float(), reduction="none")  # (N,)
 
         if valid.any():
             return per_anchor_loss[valid].mean()

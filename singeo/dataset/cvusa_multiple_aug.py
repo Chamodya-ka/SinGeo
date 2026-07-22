@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 import time
 
-from ..utils import LabelGenerator
+from ..utils import AverageMeter, LabelGenerator
 class CVUSADatasetTrain(Dataset):
     
     def __init__(self,
@@ -529,8 +529,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
                  shuffle_batch_size=128,
                 #  many_to_many=False, fovs=[360,270,180,90,70],
                  max_epochs=80,
-                 aerial_cropping=True
-                ):
+                 aerial_cropping=True,
+                 discretize_aer_orient=True):
         
         super().__init__()
         self.data_folder = data_folder
@@ -543,7 +543,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.transforms_reference1 = transforms_reference1   
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
-        
+        self.discretize_aer_orient = discretize_aer_orient
         self.aerial_cropping = aerial_cropping
         self.epoch = epoch
         self.max_epochs = max_epochs
@@ -571,6 +571,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.train_ids = train_ids_list
         self.samples = copy.deepcopy(self.train_ids)
 
+        self.fovl_mean = AverageMeter()
+        self.fovh_mean = AverageMeter()
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -596,8 +598,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         fov_l: low fov
         return 4 orientation pairs for 4 ground and aerial image pairs
         """
-        heading_l = random.randint(0,359)
-        heading_h = random.randint(0,359)
+        heading_l = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
+        heading_h = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
         t = float(self.epoch)/self.max_epochs
         orientation_shift_diff_low = self.sample_dynamic_range(t=t,min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
         # flow orientation needed to ensure at least one sample pair is a postive in a batch
@@ -709,6 +711,9 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         labels_g2g = torch.zeros([4,4])
         labels_a2a = torch.zeros([4,4])
         samples = self.get_fovs_and_orientations()
+        self.fovh_mean.update(samples[0][0])
+        self.fovl_mean.update(samples[3][0])
+
         for fov_g, fov_a, orient_g, orient_a in samples:
             grd_semi, aer_semi = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=fov_g, aerial_fov=fov_a if self.aerial_cropping else 360, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True)
             grd_semi = self.standard_transform_grd(image=grd_semi)["image"]
@@ -849,3 +854,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             print("Break Counter:", break_counter)
             print("Pairs left out of last batch to avoid creating noise:", len(self.train_ids) - len(self.samples))
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
+            print("Grounf FoV H mean", self.fovh_mean.avg)
+            print("Grounf FoV L mean", self.fovl_mean.avg)
+
+            self.fovh_mean.reset()
+            self.fovl_mean.reset()
