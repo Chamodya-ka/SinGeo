@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import math 
 import cv2
+import torchvision
 
 def brute_force_overlap(aerial_fov, grd_fov, aerial_orientation_shift, grd_orientation_shift, n_bins=36000):
     """
@@ -224,44 +225,62 @@ if __name__=="__main__":
     transform = LimitedFoVCropGrdAerPair(fov=90, aerial_fov=90, grd_orientation_shift=0, aer_orientation_shift=0, pad=True, pad_mean=[123.7, 116.3, 103.5])
     
     # Sweep a few known cases and visually confirm the label matches what you see
-    visualize_label_consistency(360, 360, 0, 0, transform=transform)
-    visualize_label_consistency(90, 90, 0, 0, transform=transform)      # expect full overlap, both crops show same stripes
-    visualize_label_consistency(90, 90, 0, 180, transform=transform)    # expect ~0 overlap, disjoint stripes
-    visualize_label_consistency(360, 90, 0, 45, transform=transform)    # expect g2a=0.25, a2g=1.0
-    visualize_label_consistency(180, 180, 90, 45, transform=transform)
-    visualize_label_consistency(180, 180, 90, 180, transform=transform)
+    # visualize_label_consistency(360, 360, 0, 0, transform=transform)
+    # visualize_label_consistency(90, 90, 0, 0, transform=transform)      # expect full overlap, both crops show same stripes
+    # visualize_label_consistency(90, 90, 0, 180, transform=transform)    # expect ~0 overlap, disjoint stripes
+    # visualize_label_consistency(360, 90, 0, 45, transform=transform)    # expect g2a=0.25, a2g=1.0
+    # visualize_label_consistency(180, 180, 90, 45, transform=transform)
+    # visualize_label_consistency(180, 180, 90, 180, transform=transform)
 
-    visualize_label_consistency(360, 360, 90, 90, transform=transform)
-    visualize_label_consistency(360, 360, -90, -90, transform=transform)
-    visualize_label_consistency(360, 180, -90, 90, transform=transform)
-    visualize_label_consistency(180, 360, -90, 90, transform=transform)
+    # visualize_label_consistency(360, 360, 90, 90, transform=transform)
+    # visualize_label_consistency(360, 360, -90, -90, transform=transform)
+    # visualize_label_consistency(360, 180, -90, 90, transform=transform)
+    # visualize_label_consistency(180, 360, -90, 90, transform=transform)
 
     #visualize_label_consistency(180, 180, 90, 180, transform=transform)
 
-    img_size_ground = (140, 768)
+    img_size_ground = (round((224 / 1232) * 384 * 2), 2 * 384)
     image_size_sat = (384, 384)
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225],
-    # sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
-    #                                                             img_size_ground,
-    #                                                             mean=mean,
-    #                                                             std=std,
-    #                                                             )
+    mean=[0.485, 0.456, 0.406]
+    std=[0.229, 0.224, 0.225]
+    sat_transforms_train1, ground_transforms_train1, fov_orientation_aug, standard_transform_grd, standard_transform_aer = get_transforms_train_singeo_unified(image_size_sat,
+                                                                img_size_ground,
+                                                                mean=mean,
+                                                                std=std,
+                                                                )
                                                                    
     # unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
     # Train
-    # train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
-    #                                   transforms_query1=ground_transforms_train1,
-    #                                 #   transforms_query2=ground_transforms_train2,
-    #                                   transforms_reference1=sat_transforms_train1,
-    #                                 #   transforms_reference2=sat_transforms_train2,
-    #                                   unified_aer_grd_transforms=fov_orientation_aug,
-    #                                   standard_transform_grd=standard_transform_grd,
-    #                                   standard_transform_aer=standard_transform_aer,
-    #                                   prob_flip=0.5,
-    #                                   prob_rotate=0.5,
-    #                                   shuffle_batch_size=64,
-    #                                   max_epochs = 80
-    #                                   )
+    train_dataset = CVUSADatasetTrainSinGeoUnifiedAugmentation(data_folder="/home/71/25021871/data/data/cvusa/CVPR_subset",
+                                      transforms_query1=ground_transforms_train1,
+                                    #   transforms_query2=ground_transforms_train2,
+                                      transforms_reference1=sat_transforms_train1,
+                                    #   transforms_reference2=sat_transforms_train2,
+                                      unified_aer_grd_transforms=fov_orientation_aug,
+                                      standard_transform_grd=standard_transform_grd,
+                                      standard_transform_aer=standard_transform_aer,
+                                      prob_flip=0.5,
+                                      prob_rotate=0.5,
+                                      shuffle_batch_size=64,
+                                      max_epochs = 80
+                                      )
     # audit_fov_curriculum(train_dataset)
     # test_getitem_label_image_consistency(train_dataset)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1,-1,1,1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1,-1,1,1)
+
+
+
+    for epoch in [1,20,40,60,80]:                        
+        train_dataset.set_epoch(epoch)
+        queries,references, ids, labels_g2a, labels_a2g, labels_g2g, labels_a2a = train_dataset.__getitem__(55)
+
+        for i in range(queries.shape[0]):
+            # de normalize images
+            print(labels_g2a[i])
+            qdenorm = queries[i] * std + mean
+            rdenorm = references[i] * std + mean
+            torchvision.utils.save_image(qdenorm, f"test_utils/{epoch}/query_image_{i}_{labels_g2a[i].tolist()}.png")
+            torchvision.utils.save_image(rdenorm, f"test_utils/{epoch}/reference_image_{i}_{labels_g2a[i].tolist()}.png")
+                                    
+        
