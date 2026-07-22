@@ -39,8 +39,8 @@ class SupervisedInfoNCE(nn.Module):
     ) -> torch.Tensor:
 
         # Normalize onto the unit hypersphere (drop if already normalized upstream).
-        ground_n = F.normalize(ground_image_features, dim=-1)  
-        aerial_n = F.normalize(aerial_image_features, dim=-1)  
+        ground_n = F.normalize(ground_image_features, dim=-1)
+        aerial_n = F.normalize(aerial_image_features, dim=-1)
 
         # Shared similarity matrix, ground rows x aerial cols
         sim_ground_aerial = ground_n @ aerial_n.t()
