@@ -314,7 +314,6 @@ class LimitedFoV(ImageOnlyTransform):
 
     def apply(self, x, **params):
         #print(x.shape)img_size: int = 384 *2
-        print(int(self.fov / 360. * x.shape[2]))
         if self.fov > 0:
             angle = random.randint(0, 359)
             rotate_index = int(angle / 360. * x.shape[2])
@@ -568,10 +567,7 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         # Resolve per-call overrides, falling back to instance defaults.
         fov = self.fov if fov is None else float(fov)
         grd_orientation_shift = self.grd_orientation_shift if grd_orientation_shift is None else grd_orientation_shift
-        aer_orientation_shift = (
-            grd_orientation_shift if aer_orientation_shift is None and self.aer_orientation_shift is None
-            else (self.aer_orientation_shift if aer_orientation_shift is None else aer_orientation_shift)
-        )
+        aer_orientation_shift = self.aer_orientation_shift if aer_orientation_shift is None else aer_orientation_shift
         aerial_fov = self.aerial_fov if aerial_fov is None else float(aerial_fov if aerial_fov is not None else fov)
 
         image1_shape = image1.shape
@@ -605,12 +601,12 @@ class LimitedFoVCropGrdAerPair(ImageOnlyTransform):
         # keep the original image2 masking logic intact
         h2, w2, c = image2.shape
         center = (w2 // 2, h2 // 2)
-        M = cv2.getRotationMatrix2D(center, a_angle, 1.0)
         # img_np = np.transpose(image2, (1, 2, 0))
         if self.discretize_aer_orient:
             r = a_angle // 90
             image2 = np.rot90(image2, k=r, axes=(0, 1))
         else:    
+            M = cv2.getRotationMatrix2D(center, a_angle, 1.0)
             image2 = cv2.warpAffine(image2, M, (w2, h2), flags=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=pad_mean)
         
@@ -1128,14 +1124,14 @@ def get_transforms_train_singeo_unified(image_size_sat,
         A.OneOf([
                 A.GridDropout(ratio=0.2, p=1.0),
                 A.CoarseDropout(max_holes=25,
-                                max_height=int(0.2*image_size_sat[0]),
+                                max_height=int(0.15*image_size_sat[0]),
                                 max_width=int(0.1*image_size_sat[0]),
                                 min_holes=10,
                                 min_height=int(0.1*image_size_sat[0]),
                                 min_width=int(0.1*image_size_sat[0]),
                                 p=1.0),
                 ], p=0.4),
-        DynamicRandomRotate(p=0.8,keep_prob=0.2),
+        DynamicRandomRotate(p=0.8,keep_prob=0.25),
         A.Normalize(mean, std),
         ToTensorV2()
     ])

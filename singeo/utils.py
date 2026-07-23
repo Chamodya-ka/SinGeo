@@ -50,8 +50,10 @@ def LabelGenerator(aerial_fov, grd_fov, aerial_orientation_shift, grd_orientatio
     if overlap <= 0:
         return 0.0, 0.0
 
-    ground_2_aer_score = min(math.exp(overlap / float(grd_fov))-1,1)
-    aer_2_ground_score = min(math.exp(overlap / float(aerial_fov))-1,1)
+    ground_2_aer_score = math.exp(overlap / (float(grd_fov+aerial_fov)/2))-1
+    aer_2_ground_score = math.exp(overlap / (float(grd_fov+aerial_fov)/2))-1
+    # ground_2_aer_score = min(overlap / float(grd_fov+aerial_fov)/2,1)
+    # aer_2_ground_score = min(overlap / float(grd_fov+aerial_fov)/2,1)
     return ground_2_aer_score, aer_2_ground_score
 class AverageMeter:
     """

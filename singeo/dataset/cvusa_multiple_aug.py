@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -233,7 +233,7 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         else:
             self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=5000)
         
@@ -323,7 +323,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query2 = transforms_query2           # ground
         self.transforms_reference1 = transforms_reference1   # satellite
         self.transforms_reference2 = transforms_reference2
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -542,7 +542,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.transforms_query1 = transforms_query1 
         self.transforms_reference1 = transforms_reference1   
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         self.discretize_aer_orient = discretize_aer_orient
         self.aerial_cropping = aerial_cropping
         self.epoch = epoch
@@ -589,7 +589,8 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             return fov_h,fov_l
         t = np.clip(t, 0.0, 1.0)
         fov_h = 360 #self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
-        fov_l = self.sample_dynamic_range(t, min_value=135, max_value=270)[0]
+        # lets reverse aerial FoV?
+        fov_l = self.sample_dynamic_range((1-t), min_value=135, max_value=360)[0]
         return fov_h,fov_l
 
     def get_orientation(self, fov_g, fov_a):
@@ -678,10 +679,12 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         reference_img = cv2.imread(f'{self.data_folder}/{sat}')
         reference_img = cv2.cvtColor(reference_img, cv2.COLOR_BGR2RGB)
 
+        # Flipping is a major issue with semi positives!
         # Flip simultaneously query and reference
-        if np.random.random() < self.prob_flip:
-            query_img = cv2.flip(query_img, 1)
-            reference_img = cv2.flip(reference_img, 1) 
+        # if np.random.random() < self.prob_flip:
+        #     print("horizontal flipped!")
+        #     query_img = cv2.flip(query_img, 1)
+        #     reference_img = cv2.flip(reference_img, 1) 
 
         # image transforms
         if self.transforms_query1 is not None:
