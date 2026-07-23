@@ -16,7 +16,7 @@ from singeo.transforms import get_dynamic_fov
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo
-from singeo.loss import InfoNCE
+from singeo.loss import InfoNCE, SupervisedInfoNCE
 from singeo.model import TimmModel_SinGeo
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 
@@ -45,7 +45,7 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    gps_dict_path: str = "./data/CVUSA/gps_dict.pkl"   # path to pre-computed distances
+    gps_dict_path: str = "gps_dict.pkl"   # path to pre-computed distances
     
     
     # Eval
@@ -68,14 +68,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "./data/CVUSA/"
+    data_folder =  "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "./singeo_cvusa"
+    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoint-only-loss-fn-change"
     
     # Eval before training
     zero_shot: bool = False
@@ -296,8 +296,8 @@ if __name__ == '__main__':
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
 
     print("Using InfoNCE Loss")
-    loss_function = InfoNCE(loss_function=loss_fn,
-                        device=config.device,
+    loss_function = SupervisedInfoNCE(
+                        device=config.device, singeo_replicate=True
                         )
 
     if config.mixed_precision:
