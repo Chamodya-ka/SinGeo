@@ -1,3 +1,4 @@
+import os
 import pytest
 from singeo.utils import LabelGenerator
 import numpy as np
@@ -35,6 +36,24 @@ def brute_force_overlap(aerial_fov, grd_fov, aerial_orientation_shift, grd_orien
     return g2a, a2g
 
 
+SHARPNESS = 3.0  # must match LabelGenerator's defaults; pinned explicitly here
+FLOOR = 0.15     # so these tests don't silently drift if the defaults change.
+
+def sharpen(coverage, sharpness=SHARPNESS):
+    """Reference implementation of LabelGenerator's pure exponential curve (no floor)."""
+    return (math.exp(sharpness * coverage) - 1) / (math.exp(sharpness) - 1)
+
+def score_from_coverage(coverage, sharpness=SHARPNESS, floor=FLOOR):
+    """
+    Reference implementation of LabelGenerator's full per-side score. Mirrors
+    the zero-overlap special case too: coverage=0 (disjoint) must stay exactly
+    0, not floor - the floor only applies to pairs with real nonzero overlap.
+    """
+    if coverage <= 0:
+        return 0.0
+    return floor + (1 - floor) * sharpen(coverage, sharpness)
+
+
 @pytest.mark.parametrize("trial", range(200))
 def test_label_generator_matches_brute_force(trial):
     rng = np.random.default_rng(trial)
@@ -43,10 +62,10 @@ def test_label_generator_matches_brute_force(trial):
     aerial_orient = rng.uniform(0, 360)
     grd_orient = rng.uniform(0, 360)
 
-    g2a_fast, a2g_fast = LabelGenerator(aerial_fov, grd_fov, aerial_orient, grd_orient)
+    g2a_fast, a2g_fast = LabelGenerator(aerial_fov, grd_fov, aerial_orient, grd_orient, sharpness=SHARPNESS, floor=FLOOR)
     g2a_brute, a2g_brute = brute_force_overlap(aerial_fov, grd_fov, aerial_orient, grd_orient)
-    assert g2a_fast == pytest.approx(min(math.exp(g2a_brute)-1,1), abs=1e-2)
-    assert a2g_fast == pytest.approx(min(math.exp(a2g_brute)-1,1), abs=1e-2)
+    assert g2a_fast == pytest.approx(score_from_coverage(g2a_brute), abs=1e-2)
+    assert a2g_fast == pytest.approx(score_from_coverage(a2g_brute), abs=1e-2)
 
 @pytest.mark.parametrize("trial", range(200))
 def test_invariants(trial):
@@ -86,9 +105,9 @@ def test_disjoint_no_wraparound():
 
 def test_full_containment():
     # ground [ -50, 50] (fov=100, orient=0), aerial [-10,10] (fov=20, orient=0) -> aerial fully inside ground
-    g2a, a2g = LabelGenerator(aerial_fov=20, grd_fov=100, aerial_orientation_shift=0, grd_orientation_shift=0)
-    assert g2a == pytest.approx(math.exp(20 / 100)-1)   # 20% of ground's view is covered
-    assert a2g == pytest.approx(1.0)        # 100% of aerial's view is covered
+    g2a, a2g = LabelGenerator(aerial_fov=20, grd_fov=100, aerial_orientation_shift=0, grd_orientation_shift=0, sharpness=SHARPNESS, floor=FLOOR)
+    assert g2a == pytest.approx(score_from_coverage(20 / 100))   # 20% of ground's view is covered
+    assert a2g == pytest.approx(1.0)                             # 100% of aerial's view is covered
 
 def test_both_full_circle():
     g2a, a2g = LabelGenerator(aerial_fov=360, grd_fov=360, aerial_orientation_shift=180, grd_orientation_shift=0)
@@ -99,9 +118,103 @@ def test_wraparound_partial_overlap():
     # ground centered at 350 deg, fov=40 -> [330, 10] (wraps past 360/0 seam)
     # aerial centered at 20 deg, fov=40 -> [0, 40]
     # true overlap: [0,10] = 10 degrees
-    g2a, a2g = LabelGenerator(aerial_fov=40, grd_fov=40, aerial_orientation_shift=20, grd_orientation_shift=350)
-    assert g2a == pytest.approx(math.exp(10 / 40)-1)
-    assert a2g == pytest.approx(math.exp(10 / 40)-1)
+    g2a, a2g = LabelGenerator(aerial_fov=40, grd_fov=40, aerial_orientation_shift=20, grd_orientation_shift=350, sharpness=SHARPNESS, floor=FLOOR)
+    assert g2a == pytest.approx(score_from_coverage(10 / 40))
+    assert a2g == pytest.approx(score_from_coverage(10 / 40))
+
+def test_floor_lifts_low_but_nonzero_coverage():
+    # narrow ground (10 deg) fully engulfed by a huge aerial (350 deg) -> a2g
+    # coverage = 10/350 =~ 0.0286, tiny. Without a floor this would sharpen
+    # down to a near-zero score, indistinguishable from a true negative.
+    g2a, a2g = LabelGenerator(aerial_fov=350, grd_fov=10, aerial_orientation_shift=0, grd_orientation_shift=0, sharpness=SHARPNESS, floor=FLOOR)
+    assert g2a == pytest.approx(1.0)            # ground fully engulfed -> still maxed
+    assert a2g >= FLOOR                          # a2g must never drop below the floor...
+    assert a2g == pytest.approx(score_from_coverage(10 / 350))  # ...and matches the floored curve exactly
+    assert a2g > sharpen(10 / 350)               # ...which is strictly above the un-floored raw curve
+
+def test_floor_does_not_apply_to_disjoint():
+    # exactly touching (zero overlap) must stay exactly 0, never the floor -
+    # the floor is only for pairs with real (if small) geometric overlap.
+    g2a, a2g = LabelGenerator(aerial_fov=30, grd_fov=30, aerial_orientation_shift=0, grd_orientation_shift=30, sharpness=SHARPNESS, floor=FLOOR)
+    assert g2a == pytest.approx(0.0)
+    assert a2g == pytest.approx(0.0)
+    # a hair of overlap, on the other hand, immediately jumps up to the floor
+    g2a_eps, a2g_eps = LabelGenerator(aerial_fov=30, grd_fov=30, aerial_orientation_shift=0, grd_orientation_shift=29.999, sharpness=SHARPNESS, floor=FLOOR)
+    assert g2a_eps == pytest.approx(FLOOR, abs=1e-3)
+    assert a2g_eps == pytest.approx(FLOOR, abs=1e-3)
+
+@pytest.mark.parametrize("trial", range(200))
+def test_symmetric_mode_averages_the_two_directions(trial):
+    # symmetric=True is used for SAME-DOMAIN (g2g/a2a) targets, whose similarity
+    # matrix is inherently symmetric. It averages the two directional scores and
+    # returns (avg, avg) -> both scores identical, and invariant under swapping
+    # the two views (so the resulting matrix is symmetric).
+    rng = np.random.default_rng(trial + 5000)
+    fa = rng.uniform(1, 360); fg = rng.uniform(1, 360)
+    oa = rng.uniform(0, 360); og = rng.uniform(0, 360)
+
+    g2a, a2g = LabelGenerator(fa, fg, oa, og, sharpness=SHARPNESS, floor=FLOOR)              # asymmetric
+    s0, s1 = LabelGenerator(fa, fg, oa, og, sharpness=SHARPNESS, floor=FLOOR, symmetric=True)
+    assert s0 == pytest.approx(s1)                       # both scores identical
+    assert s0 == pytest.approx(0.5 * (g2a + a2g))        # == average of the two directional scores
+    # swapping the two views must give the same score -> symmetric matrix
+    t0, _ = LabelGenerator(fg, fa, og, oa, sharpness=SHARPNESS, floor=FLOOR, symmetric=True)
+    assert s0 == pytest.approx(t0)
+
+def test_symmetric_mode_endpoints():
+    # identical views -> both directional coverages 1.0 -> avg 1.0
+    s0, s1 = LabelGenerator(aerial_fov=90, grd_fov=90, aerial_orientation_shift=45, grd_orientation_shift=45, sharpness=SHARPNESS, floor=FLOOR, symmetric=True)
+    assert s0 == pytest.approx(1.0) and s1 == pytest.approx(1.0)
+    # engulfment (narrow 20 inside wide 100, aligned): one direction 1.0, the
+    # other score_from_coverage(20/100) -> the symmetric label is their average.
+    s0, s1 = LabelGenerator(aerial_fov=100, grd_fov=20, aerial_orientation_shift=0, grd_orientation_shift=0, sharpness=SHARPNESS, floor=FLOOR, symmetric=True)
+    assert s0 == pytest.approx(0.5 * (1.0 + score_from_coverage(20 / 100)))
+    # disjoint still exactly 0 even in symmetric mode
+    s0, s1 = LabelGenerator(aerial_fov=30, grd_fov=30, aerial_orientation_shift=0, grd_orientation_shift=90, sharpness=SHARPNESS, floor=FLOOR, symmetric=True)
+    assert s0 == pytest.approx(0.0) and s1 == pytest.approx(0.0)
+
+def build_same_domain_matrix(fovs, orients, symmetric):
+    """
+    Replicates the dataset's g2g/a2a construction loop (see
+    CVUSADatasetTrainSinGeoUnifiedAugmentation.__getitem__): for N crops of one
+    location, M[i,j] = LabelGenerator(fov_i, fov_j, orient_i, orient_j,
+    symmetric=...)[0 if symmetric else 1]. Returned as an (N,N) numpy array.
+    """
+    n = len(fovs)
+    idx = 0 if symmetric else 1
+    M = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            M[i, j] = LabelGenerator(fovs[i], fovs[j], orients[i], orients[j],
+                                     sharpness=SHARPNESS, floor=FLOOR, symmetric=symmetric)[idx]
+    return M
+
+@pytest.mark.parametrize("trial", range(200))
+def test_same_domain_labels_are_symmetric(trial):
+    # g2g and a2a share this exact construction. With symmetric=True the matrix
+    # MUST equal its transpose (same-domain similarity feats@feats.t is itself
+    # symmetric, so an asymmetric target would be unrealizable). Also check the
+    # diagonal is 1 (self-similarity) and every entry is a valid [0,1] score.
+    rng = np.random.default_rng(trial + 9000)
+    fovs = rng.uniform(50, 360, size=4)
+    orients = rng.uniform(0, 360, size=4)
+
+    M = build_same_domain_matrix(fovs, orients, symmetric=True)
+    assert np.allclose(M, M.T, atol=1e-9), "same-domain (symmetric) label matrix must equal its transpose"
+    assert np.allclose(np.diag(M), 1.0)
+    assert (M >= 0).all() and (M <= 1).all()
+
+def test_asymmetric_same_domain_is_actually_asymmetric():
+    # Guard that the symmetric flag genuinely changes the labels: with distinct
+    # FoVs and real overlap, the asymmetric (symmetric=False) matrix must differ
+    # from its transpose - otherwise the symmetric fix would be a no-op.
+    fovs = [300.0, 90.0, 180.0, 60.0]     # distinct FoVs
+    orients = [0.0, 10.0, 350.0, 40.0]    # overlapping (near-aligned)
+    M_asym = build_same_domain_matrix(fovs, orients, symmetric=False)
+    assert not np.allclose(M_asym, M_asym.T, atol=1e-6), "asymmetric variant should NOT be symmetric here"
+    # and the symmetric variant of the same geometry IS symmetric
+    M_sym = build_same_domain_matrix(fovs, orients, symmetric=True)
+    assert np.allclose(M_sym, M_sym.T, atol=1e-9)
 
 def make_test_panorama(width=720, height=100, aerial=False):
     """
@@ -199,6 +312,76 @@ def audit_fov_curriculum(dataset, n_samples=500):
     df = pd.DataFrame(results)
     print(df.groupby("epoch_frac")[["high_fov", "low_fov"]].agg(["mean", "std", "min", "max"]))
    
+def inspect_sample_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.8), out_dir="test_utils/eyeball"):
+    """
+    Fetches a single dataset item (by plain index, same convention as
+    dataset.__getitem__) at several curriculum progress points (fraction of
+    dataset.max_epochs) and dumps the 4 ground/aerial crops plus their
+    g2a/a2g/g2g/a2a label rows - for eyeballing whether LabelGenerator's
+    output matches what the crops actually look like on real curriculum
+    FoV/orientation combinations, not just synthetic test cases.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
+    torch.set_printoptions(precision=3, sci_mode=False)
+
+    for frac in progress_fractions:
+        epoch = max(1, round(frac * dataset.max_epochs))
+        dataset.set_epoch(epoch)
+        queries, references, ids, g2a, a2g, g2g, a2a = dataset[item_id]
+
+        frac_dir = f"{out_dir}/progress_{frac}"
+        os.makedirs(frac_dir, exist_ok=True)
+
+        print(f"\n{'='*20} item {item_id}, progress {frac:.0%} (epoch {epoch}/{dataset.max_epochs}) {'='*20}")
+        print("labels_g2a (row=ground anchor, col=aerial candidate):\n", g2a)
+        print("labels_a2g (row=aerial anchor, col=ground candidate):\n", a2g)
+        print("labels_g2g (row=ground anchor, col=ground candidate):\n", g2g)
+        print("labels_a2a (row=aerial anchor, col=aerial candidate):\n", a2a)
+
+        for i in range(queries.shape[0]):
+            qdenorm = queries[i] * std + mean
+            rdenorm = references[i] * std + mean
+            g2a_row = [round(v, 3) for v in g2a[i].tolist()]
+            a2g_row = [round(v, 3) for v in a2g[i].tolist()]
+            torchvision.utils.save_image(qdenorm, f"{frac_dir}/query_{i}_g2a={g2a_row}.png")
+            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_a2g={a2g_row}.png")
+
+
+def inspect_same_domain_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.8), out_dir="test_utils/eyeball_same_domain"):
+    """
+    Same idea as inspect_sample_by_id, but surfaces the SAME-DOMAIN labels
+    (g2g: ground crop vs ground crop, a2a: aerial crop vs aerial crop) instead
+    of the cross-domain ones. With symmetric_same_domain=True (default) these
+    matrices are symmetric: the two directional coverage scores are averaged,
+    so a narrow crop engulfed by a wide crop of the same view reads as a
+    moderate positive (mean of full and partial coverage), the same both ways.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
+    torch.set_printoptions(precision=3, sci_mode=False)
+
+    for frac in progress_fractions:
+        epoch = max(1, round(frac * dataset.max_epochs))
+        dataset.set_epoch(epoch)
+        queries, references, ids, g2a, a2g, g2g, a2a = dataset[item_id]
+
+        frac_dir = f"{out_dir}/progress_{frac}"
+        os.makedirs(frac_dir, exist_ok=True)
+
+        print(f"\n{'='*20} item {item_id}, progress {frac:.0%} (epoch {epoch}/{dataset.max_epochs}) {'='*20}")
+        print("labels_g2g (row=ground anchor, col=ground candidate):\n", g2g)
+        print("labels_a2a (row=aerial anchor, col=aerial candidate):\n", a2a)
+
+        for i in range(queries.shape[0]):
+            qdenorm = queries[i] * std + mean
+            rdenorm = references[i] * std + mean
+            g2g_row = [round(v, 3) for v in g2g[i].tolist()]
+            a2a_row = [round(v, 3) for v in a2a[i].tolist()]
+            torchvision.utils.save_image(qdenorm, f"{frac_dir}/ground_{i}_g2g={g2g_row}.png")
+            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_a2a={a2a_row}.png")
+
+
 def test_getitem_label_image_consistency(dataset, index=0):
     queries, references, label, g2a, a2g, g2g, a2a = dataset[index]
     # basic shape/bounds sanity
@@ -208,9 +391,40 @@ def test_getitem_label_image_consistency(dataset, index=0):
     # g2g and a2a diagonals should be self-similarity == 1 (same fov/orientation vs itself)
     assert torch.allclose(torch.diagonal(g2g), torch.ones(4), atol=1e-3)
     assert torch.allclose(torch.diagonal(a2a), torch.ones(4), atol=1e-3)
-    # g2g/a2a should be symmetric (view i vs j == view j vs i)
-    assert torch.allclose(g2g, g2g.T, atol=1e-3)
-    assert torch.allclose(a2a, a2a.T, atol=1e-3)
+    assert torch.all(g2g >= 0) and torch.all(g2g <= 1)
+    assert torch.all(a2a >= 0) and torch.all(a2a <= 1)
+    # With symmetric_same_domain=True (the default), same-domain targets MUST be
+    # symmetric: their similarity matrix feats@feats.t is symmetric, so an
+    # asymmetric target stalls the loss. (Cross-domain g2a/a2g stay asymmetric.)
+    if getattr(dataset, "symmetric_same_domain", True):
+        assert torch.allclose(g2g, g2g.T, atol=1e-3)
+        assert torch.allclose(a2a, a2a.T, atol=1e-3)
+
+def check_same_domain_symmetry_on_dataset(dataset, n_items=8, atol=1e-5):
+    """
+    End-to-end guard on the REAL pipeline: pulls actual g2g/a2a label matrices
+    from the dataset across several epochs/items and asserts they are symmetric
+    (when symmetric_same_domain is on), while cross-domain g2a is NOT. Raises on
+    the first violation; prints a summary otherwise. Requires the data folder,
+    so it's invoked from __main__ rather than collected as a pytest test.
+    """
+    assert getattr(dataset, "symmetric_same_domain", False), \
+        "dataset.symmetric_same_domain must be True for this check"
+    n = min(n_items, len(dataset))
+    checked = 0
+    cross_asym_seen = False
+    for epoch in [1, max(1, dataset.max_epochs // 2), dataset.max_epochs]:
+        dataset.set_epoch(epoch)
+        for idx in range(n):
+            _, _, _, g2a, a2g, g2g, a2a = dataset[idx]
+            assert torch.allclose(g2g, g2g.T, atol=atol), f"g2g not symmetric @ epoch {epoch}, item {idx}:\n{g2g}"
+            assert torch.allclose(a2a, a2a.T, atol=atol), f"a2a not symmetric @ epoch {epoch}, item {idx}:\n{a2a}"
+            if not torch.allclose(g2a, g2a.T, atol=1e-2):
+                cross_asym_seen = True
+            checked += 1
+    print(f"check_same_domain_symmetry_on_dataset: g2g & a2a symmetric on all "
+          f"{checked} sampled items (3 epochs x {n} items). "
+          f"cross-domain g2a asymmetric seen: {cross_asym_seen}")
 
 if __name__=="__main__":
     # test_full_overlap_identical_views()
@@ -281,7 +495,13 @@ if __name__=="__main__":
             # de normalize images
             qdenorm = queries[i] * std + mean
             rdenorm = references[i] * std + mean
-            torchvision.utils.save_image(qdenorm, f"test_utils/{epoch}/query_image_{i}_{labels_g2a[i].tolist()}.png")
+            torchvision.utils.save_image(qdenorm, f"test_utils/{epoch}/query_image_{i}_{[labels_g2a[i].tolist()]}.png")
             torchvision.utils.save_image(rdenorm, f"test_utils/{epoch}/reference_image_{i}_{labels_g2a[i].tolist()}.png")
-        print("-"*10)                            
-        
+        print("-"*10)
+
+    inspect_sample_by_id(train_dataset, item_id=3, progress_fractions=(0.2, 0.5, 0.8))
+    inspect_same_domain_by_id(train_dataset, item_id=3, progress_fractions=(0.2, 0.5, 0.8))
+
+    # ensure the real g2g/a2a labels coming out of the pipeline are symmetric
+    check_same_domain_symmetry_on_dataset(train_dataset, n_items=8)
+

@@ -4,13 +4,14 @@ import torch.nn.functional as F
 import torch.distributed.nn
 
 class SupervisedInfoNCE(nn.Module):
-    def __init__(self, device, eps: float = 1e-8):
+    def __init__(self, device, eps: float = 1e-8, label_smoothing: float = 0.0):
         super().__init__()
         self.eps = eps
         self.device=device
+        self.label_smoothing = label_smoothing
 
     @staticmethod
-    def _multi_positive_ce(logits: torch.Tensor, pos_mask: torch.Tensor, eps: float, same_domain: bool = False) -> torch.Tensor:
+    def _multi_positive_ce(logits: torch.Tensor, pos_mask: torch.Tensor, eps: float, same_domain: bool = False, label_smoothing: float = 0.0) -> torch.Tensor:
         pos_mask = pos_mask.float()
         # if same_domain is True, we want to ignore the diagonal elements (self-similarity) in the loss computation
         if same_domain:
@@ -22,8 +23,8 @@ class SupervisedInfoNCE(nn.Module):
         valid = pos_counts.squeeze(1) > 0
 
         targets = pos_mask / pos_counts.clamp(min=eps)  # each row sums to 1
-        
-        per_anchor_loss = F.cross_entropy(logits.float(), targets.float(), reduction="none")  # (N,)
+
+        per_anchor_loss = F.cross_entropy(logits.float(), targets.float(), reduction="none", label_smoothing=label_smoothing)  # (N,)
 
         if valid.any():
             return per_anchor_loss[valid].mean()
@@ -32,10 +33,10 @@ class SupervisedInfoNCE(nn.Module):
 
     def forward(
         self,
-        ground_image_features: torch.Tensor,   
-        aerial_image_features: torch.Tensor,   
+        ground_image_features: torch.Tensor,
+        aerial_image_features: torch.Tensor,
         logit_scale: torch.Tensor,             # scalar
-        labels: torch.Tensor, bidirectional = True, same_domain = False                 
+        labels: torch.Tensor, bidirectional = True, same_domain = False
     ) -> torch.Tensor:
 
         # Normalize onto the unit hypersphere (drop if already normalized upstream).
@@ -47,12 +48,12 @@ class SupervisedInfoNCE(nn.Module):
 
         # Direction 1: ground (anchor) -> aerial (candidates). Logits
         logits_g2a = logit_scale * sim_ground_aerial
-        loss_g2a = self._multi_positive_ce(logits_g2a, labels, self.eps, same_domain)
+        loss_g2a = self._multi_positive_ce(logits_g2a, labels, self.eps, same_domain, self.label_smoothing)
         if bidirectional:
             # Direction 2: aerial (anchor) -> ground (candidates). Logits
             logits_a2g = logit_scale * sim_ground_aerial.t()
             labels_a2g = labels.t()  # (B, B*4)
-            loss_a2g = self._multi_positive_ce(logits_a2g, labels_a2g, self.eps, same_domain)
+            loss_a2g = self._multi_positive_ce(logits_a2g, labels_a2g, self.eps, same_domain, self.label_smoothing)
 
             return loss_g2a + loss_a2g
         else:

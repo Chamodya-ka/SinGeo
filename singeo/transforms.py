@@ -42,6 +42,17 @@ def get_dynamic_rotate_prob(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
 def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0):
     return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
 
+def get_dynamic_a2g_weight(epoch, max_epoch, w_start=1.0, w_end=0.3):
+    """
+    Linearly anneals the loss_a2g weight down over training. As the aerial
+    FoV curriculum widens toward 360deg, g2a saturates (near-zero gradient,
+    "satisfied") while a2g's coverage-based target stays geometrically capped
+    low even for a correct match - so a2g becomes the dominant, unopposed
+    force pulling that shared similarity value down. Shrinking its weight
+    reduces that unopposed pull specifically in the regime where it appears.
+    """
+    return w_start - (w_start - w_end) * (epoch / max_epoch)
+
 def get_beta_distribution_mean(epoch,max_epoch,max_peak = 5, min_value=60, max_value=360):
     t = epoch/float(max_epoch)
     alpha = 1.0 + (max_peak - 1.0) * (1.0 - t)

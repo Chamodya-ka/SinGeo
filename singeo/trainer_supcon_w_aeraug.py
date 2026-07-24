@@ -1,3 +1,4 @@
+import os
 import time
 import torch
 import torchvision
@@ -853,7 +854,7 @@ def train_contrast_congeo_vit(train_config, model, dataloader, loss_function, op
 
 
 
-def train_contrast_singeo(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None):
+def train_contrast_singeo(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None, a2g_weight=1.0):
 
     # set model train mode
     model.train()
@@ -884,6 +885,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 std = torch.tensor([0.229, 0.224, 0.225]).view(1,-1,1,1)
 
                 if step == 1:
+                    os.makedirs("debug", exist_ok=True)
                     for x in range(len(query_images)):
                         qdenorm = query_images[x] * std + mean
                         rdenorm = reference_images[x] * std + mean
@@ -922,7 +924,10 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                     logit_scale,
                     train_config.device,
                 )
-                loss = loss_a2g + loss_g2a + loss_q2q + loss_r2r
+                # a2g_weight is applied only to the backpropagated total, not to
+                # the tracked a2g_loss meter below - so the printed a2g_loss stays
+                # an honest, unweighted diagnostic of the raw term's magnitude.
+                loss = a2g_weight * loss_a2g + loss_g2a + loss_q2q + loss_r2r
                 losses.update(loss.item())
                 g2a_loss.update(loss_g2a.item())
                 a2a_loss.update(loss_r2r.item())
@@ -949,34 +954,38 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 scheduler.step()
    
         else:
-            # data (batches) to device   
-            query1 = query1.to(train_config.device)
-            query2 = query2.to(train_config.device)
-            reference1 = reference1.to(train_config.device)
-            reference2 = reference2.to(train_config.device)
-            
+            # data (batches) to device
+            query_images = query_images.to(train_config.device)
+            reference_images = reference_images.to(train_config.device)
+            g2a_target = g2a_target.to(train_config.device)
+            a2g_target = a2g_target.to(train_config.device)
+            g2g_target = g2g_target.to(train_config.device)
+            a2a_target = a2a_target.to(train_config.device)
+
             # Forward pass
-            features_q1, features_q2, features_r1, features_r2 = model(query1, query2, reference1, reference2)
+            features_query, features_reference = model(query_images, reference_images)
             if torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1:
                 logit_scale = model.module.logit_scale.exp()
             else:
                 logit_scale = model.logit_scale.exp()
 
             loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
-                features_q1,
-                features_q2,
-                features_r1,
-                features_r2,
+                features_query,
+                features_reference,
+                g2a_target,
+                a2g_target,
+                g2g_target,
+                a2a_target,
                 loss_function,
                 logit_scale,
                 train_config.device,
             )
-            loss = loss_a2g + loss_g2a + loss_q2q + loss_r2r
+            loss = a2g_weight * loss_a2g + loss_g2a + loss_q2q + loss_r2r
             losses.update(loss.item())
-            g2a_loss.update(loss_g2a)
-            a2a_loss.update(loss_r2r)
-            g2g_loss.update(loss_q2q)
-            a2g_loss.update(loss_a2g)
+            g2a_loss.update(loss_g2a.item())
+            a2a_loss.update(loss_r2r.item())
+            g2g_loss.update(loss_q2q.item())
+            a2g_loss.update(loss_a2g.item())
             # Calculate gradient using backward pass
             loss.backward()
             

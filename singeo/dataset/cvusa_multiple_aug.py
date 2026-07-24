@@ -530,8 +530,9 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
                 #  many_to_many=False, fovs=[360,270,180,90,70],
                  max_epochs=80,
                  aerial_cropping=True,
-                 discretize_aer_orient=True):
-        
+                 discretize_aer_orient=True,
+                 symmetric_same_domain=True):
+
         super().__init__()
         self.data_folder = data_folder
         self.prob_flip = prob_flip
@@ -539,9 +540,14 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.shuffle_batch_size = shuffle_batch_size
         self.standard_transform_grd = standard_transform_grd
         self.standard_transform_aer = standard_transform_aer
-        self.transforms_query1 = transforms_query1 
-        self.transforms_reference1 = transforms_reference1   
+        self.transforms_query1 = transforms_query1
+        self.transforms_reference1 = transforms_reference1
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
+        # same-domain (g2g/a2a) targets: True -> LabelGenerator averages the two
+        # directional scores -> symmetric matrix (same-domain sim is symmetric).
+        # False -> asymmetric directional labels (for A/B). Cross-domain g2a/a2g
+        # stay asymmetric regardless.
+        self.symmetric_same_domain = symmetric_same_domain
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         self.discretize_aer_orient = discretize_aer_orient
         self.aerial_cropping = aerial_cropping
@@ -683,12 +689,17 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         reference_img = cv2.imread(f'{self.data_folder}/{sat}')
         reference_img = cv2.cvtColor(reference_img, cv2.COLOR_BGR2RGB)
 
-        # Flipping is a major issue with semi positives!
-        # Flip simultaneously query and reference
-        # if np.random.random() < self.prob_flip:
-        #     print("horizontal flipped!")
-        #     query_img = cv2.flip(query_img, 1)
-        #     reference_img = cv2.flip(reference_img, 1) 
+        # Flip query and reference with a single shared draw. Flipping is a
+        # reflection of azimuth (theta -> -theta) in both domains; since both
+        # images share the same draw, the negation is identical on both sides
+        # and cancels out in LabelGenerator's overlap computation (verified
+        # numerically: scores match to float precision under a shared flip,
+        # but diverge substantially if ground/aerial are flipped independently).
+        # Never flip query_img and reference_img independently - that produces
+        # a genuinely non-corresponding pair, not just a mislabeled one.
+        if np.random.random() < self.prob_flip:
+            query_img = cv2.flip(query_img, 1)
+            reference_img = cv2.flip(reference_img, 1)
 
         # image transforms
         if self.transforms_query1 is not None:
@@ -748,12 +759,19 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
                 g2a_score, a2g_score =  LabelGenerator(fov_a, fov_g, orient_a, orient_g)
                 labels_g2a[i,j] = g2a_score
                 labels_a2g[j,i] = a2g_score
+        # same-domain targets. symmetric=True -> both returned scores equal
+        # (average of the two directions) -> symmetric matrix, which the loss's
+        # symmetric same-domain similarity can realize. symmetric=False keeps
+        # the asymmetric variant; index [1] is the coverage of anchor i's own
+        # FoV, which is what belongs at [i,j].
+        sym = self.symmetric_same_domain
+        same_idx = 0 if sym else 1
         for i,[fov_g1,orient_g1] in enumerate(zip(fov_gs, orient_gs)):
             for j,[fov_g2,orient_g2] in enumerate(zip(fov_gs, orient_gs)):
-                labels_g2g[i,j] = LabelGenerator(fov_g1, fov_g2, orient_g1, orient_g2)[0]
+                labels_g2g[i,j] = LabelGenerator(fov_g1, fov_g2, orient_g1, orient_g2, symmetric=sym)[same_idx]
         for i,[fov_a1,orient_a1] in enumerate(zip(fov_as, orient_as)):
             for j,[fov_a2,orient_a2] in enumerate(zip(fov_as, orient_as)):
-                labels_a2a[i,j] = LabelGenerator(fov_a1, fov_a2, orient_a1, orient_a2)[0]
+                labels_a2a[i,j] = LabelGenerator(fov_a1, fov_a2, orient_a1, orient_a2, symmetric=sym)[same_idx]
 
 
         label = torch.tensor(idx, dtype=torch.long)

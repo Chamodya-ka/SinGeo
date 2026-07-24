@@ -11,8 +11,7 @@ from transformers import get_constant_schedule_with_warmup, get_polynomial_decay
 
 from singeo.dataset.cvusa_multiple_aug import CVUSADatasetEval, CVUSADatasetTrainSinGeo, CVUSADatasetTrainSinGeoUnifiedAugmentation
 from singeo.transforms import LimitedFoVCropGrdAerPair, get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val, get_transforms_train_singeo_unified
-from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov, get_n_fovs, get_beta_distribution_mean
+from singeo.transforms import get_dynamic_fov, get_n_fovs, get_beta_distribution_mean, get_dynamic_a2g_weight
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer_supcon_w_aeraug import train_contrast_singeo
@@ -33,7 +32,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 80
+    epochs: int = 20
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -45,12 +44,12 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    gps_dict_path: str = "./data/CVUSA/gps_dict.pkl"   # path to pre-computed distances
+    gps_dict_path: str = "./data/CVUSA/gps_dict_10k.pkl"   # path to pre-computed distances
     
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 4        # eval every n Epoch
+    eval_every_n_epoch: int = 1        # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
@@ -60,6 +59,14 @@ class Configuration:
     
     # Loss
     label_smoothing: float = 0.0
+    a2g_weight_start: float = 1.0      # loss_a2g weight at epoch 0
+    a2g_weight_end: float = 0.3        # loss_a2g weight at the final epoch - annealed down as
+                                        # aerial FoV curriculum widens and g2a saturates, so a2g's
+                                        # geometrically-capped target doesn't dominate the shared
+                                        # ground<->aerial similarity gradient unopposed
+    symmetric_same_domain: bool = True  # g2g/a2a targets symmetric (required - same-domain sim is
+                                        # symmetric; asymmetric targets stall the loss). False = old
+                                        # asymmetric variant, for A/B only.
     
     # Learning Rate
     lr: float = 0.0001
@@ -68,14 +75,14 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/nesi/nobackup/massey04734/CVUSA/CVPR_subset"
+    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "/nesi/nobackup/massey04734/SinGeo/checkpoint"
+    model_path: str = "./singeo_cvusa"
     
     # Eval before training
     zero_shot: bool = False
@@ -196,7 +203,8 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
                                       max_epochs = config.epochs,
-                                      aerial_cropping=True, discretize_aer_orient=True
+                                      aerial_cropping=True, discretize_aer_orient=True,
+                                      symmetric_same_domain=config.symmetric_same_domain
                                       )
 
     def variable_size_collate(batch):
@@ -385,11 +393,10 @@ if __name__ == '__main__':
     # Loss                                                                        #
     #-----------------------------------------------------------------------------#
 
-    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
-
     print("Using InfoNCE Loss")
     loss_function = SupervisedInfoNCE(
                         device=config.device,
+                        label_smoothing=config.label_smoothing,
                         )
 
     if config.mixed_precision:
@@ -521,9 +528,15 @@ if __name__ == '__main__':
         print(f"For Epoch {epoch}: Sim-sampling ground FOV = {fov_dynamic:.4f} "
               f"(hard-neighbour mining only; NOT the training-crop FoV -- the actual "
               f"training curriculum means are printed under 'Shuffle Dataset')")
-        
+
+        # anneal loss_a2g's weight down as the aerial FoV curriculum widens
+        a2g_weight = get_dynamic_a2g_weight(epoch, config.epochs,
+                                            w_start=config.a2g_weight_start,
+                                            w_end=config.a2g_weight_end)
+        print(f"For Epoch {epoch}: a2g loss weight = {a2g_weight:.4f}")
+
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
-        
+
 
         train_loss, g2a_loss, a2g_loss, g2g_loss, a2a_loss = train_contrast_singeo(config,
                         model,
@@ -531,7 +544,8 @@ if __name__ == '__main__':
                         loss_function=loss_function,
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        scaler=scaler)
+                        scaler=scaler,
+                        a2g_weight=a2g_weight)
         
         print("Epoch: {}, Train Loss = {:.3f}, Lr = {:.6f}".format(epoch,
                                                                    train_loss,
