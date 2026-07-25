@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#)#, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -97,7 +97,7 @@ class CVUSADatasetTrain(Dataset):
                 # use roll for ground view if rotate sat view
                 c, h, w = query_img.shape
                 shifts = - w//4 * r
-                query_img = torch.roll(query_img, shifts=shifts, dims=2)  
+                query_img = torch.roll(query_img, shifts=shifts, dims=1)  
                     
             
         label = torch.tensor(idx, dtype=torch.long)  
@@ -233,7 +233,7 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         else:
             self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=5000)
         
@@ -323,7 +323,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query2 = transforms_query2           # ground
         self.transforms_reference1 = transforms_reference1   # satellite
         self.transforms_reference2 = transforms_reference2
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -548,7 +548,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         # False -> asymmetric directional labels (for A/B). Cross-domain g2a/a2g
         # stay asymmetric regardless.
         self.symmetric_same_domain = symmetric_same_domain
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
         self.discretize_aer_orient = discretize_aer_orient
         self.aerial_cropping = aerial_cropping
         self.epoch = epoch
