@@ -573,6 +573,10 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
 
         self.fovl_mean = AverageMeter()
         self.fovh_mean = AverageMeter()
+        self.fovl_aer_mean = AverageMeter()
+        self.fovh_aer_mean = AverageMeter()
+        self.orient_low_mean = AverageMeter()
+        self.orient_high_mean = AverageMeter()
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -602,9 +606,9 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         heading_l = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
         heading_h = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
         t = float(self.epoch)/self.max_epochs
-        orientation_shift_diff_low = self.sample_dynamic_range(t=t,min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
+        orientation_shift_diff_low = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
         # flow orientation needed to ensure at least one sample pair is a postive in a batch
-        orientation_shift_diff_high = self.sample_dynamic_range(t=t,min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
+        orientation_shift_diff_high = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
 
         lor_l= random.choice([1, -1])
         lor_h = random.choice([1, -1])
@@ -704,7 +708,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             # use roll for ground view if rotate sat view
             h, w, c = query_img1.shape
             shifts = - w//4 * r
-            query_img1 = torch.roll(torch.tensor(query_img1), shifts=shifts, dims=2).numpy()
+            query_img1 = torch.roll(torch.tensor(query_img1), shifts=shifts, dims=1).numpy()
         
         # do fov and orientation synchronized augmentation
         queries = []
@@ -714,8 +718,19 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         labels_g2g = torch.zeros([4,4])
         labels_a2a = torch.zeros([4,4])
         samples = self.get_fovs_and_orientations()
-        self.fovh_mean.update(samples[0][0])
-        self.fovl_mean.update(samples[3][0])
+
+        # Instrumentation: track the ACTUAL sampled curriculum values so the log
+        # reflects what the network trains on (not the cosmetic schedules printed
+        # in the train script). samples[i] = [fov_g, fov_a, orient_g, orient_a].
+        def _circ_off(a, b):
+            d = abs(float(a) - float(b)) % 360.0
+            return min(d, 360.0 - d)
+        self.fovh_mean.update(samples[0][0])       # ground high FoV
+        self.fovl_mean.update(samples[3][0])       # ground low FoV
+        self.fovh_aer_mean.update(samples[0][1])   # aerial high FoV
+        self.fovl_aer_mean.update(samples[3][1])   # aerial low FoV
+        self.orient_low_mean.update(_circ_off(samples[2][2], samples[2][3]))    # low-diff offset
+        self.orient_high_mean.update(_circ_off(samples[3][2], samples[3][3]))   # high-diff offset
 
         for fov_g, fov_a, orient_g, orient_a in samples:
             grd_semi, aer_semi = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=fov_g, aerial_fov=fov_a if self.aerial_cropping else 360, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True)
@@ -857,8 +872,14 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             print("Break Counter:", break_counter)
             print("Pairs left out of last batch to avoid creating noise:", len(self.train_ids) - len(self.samples))
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
-            print("Grounf FoV H mean", self.fovh_mean.avg)
-            print("Grounf FoV L mean", self.fovl_mean.avg)
+            print("Curriculum (epoch {} means from actual training samples):".format(self.epoch))
+            print("  Ground FoV  high/low: {:.1f} / {:.1f}".format(self.fovh_mean.avg, self.fovl_mean.avg))
+            print("  Aerial FoV  high/low: {:.1f} / {:.1f}".format(self.fovh_aer_mean.avg, self.fovl_aer_mean.avg))
+            print("  Orient off  low/high: {:.1f} / {:.1f}".format(self.orient_low_mean.avg, self.orient_high_mean.avg))
 
             self.fovh_mean.reset()
             self.fovl_mean.reset()
+            self.fovh_aer_mean.reset()
+            self.fovl_aer_mean.reset()
+            self.orient_low_mean.reset()
+            self.orient_high_mean.reset()

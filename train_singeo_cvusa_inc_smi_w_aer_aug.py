@@ -59,7 +59,7 @@ class Configuration:
     grad_checkpointing: bool = False   # Gradient Checkpointing
     
     # Loss
-    label_smoothing: float = 0.05
+    label_smoothing: float = 0.0
     
     # Learning Rate
     lr: float = 0.0001
@@ -491,11 +491,11 @@ if __name__ == '__main__':
 
     for epoch in range(1, config.epochs+1):
         
-        # modulate the ratation prob of the satellite branch
-        rotate_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25) # the prob not to rotate
-        # sat_transforms_dynamic = build_satellite_dynamic_transforms(image_size_sat, mean, std, rotate_prob)
-        # train_dataloader.dataset.transforms_reference2 = sat_transforms_dynamic
-        print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
+        # NOTE: aerial/satellite rotation is applied on a FIXED schedule inside
+        # standard_transform_aer (DynamicRandomRotate keep_prob=0.25) and is NOT
+        # modulated per epoch. The previous per-epoch keep_prob computation/print
+        # was dead code (the transform assignment below it is commented out), so it
+        # is removed to avoid implying a schedule that never runs.
 
         # modulate the fov of the ground branch
         # fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=360, min_value=60)
@@ -518,7 +518,9 @@ if __name__ == '__main__':
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample 
         # train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
         train_dataloader.dataset.set_epoch(epoch)
-        print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}")
+        print(f"For Epoch {epoch}: Sim-sampling ground FOV = {fov_dynamic:.4f} "
+              f"(hard-neighbour mining only; NOT the training-crop FoV -- the actual "
+              f"training curriculum means are printed under 'Shuffle Dataset')")
         
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
         
