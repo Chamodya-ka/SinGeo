@@ -2,8 +2,10 @@ import os
 import time
 import shutil
 import sys
+import random
 import torch
 import pickle
+import numpy as np
 from dataclasses import dataclass
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
@@ -32,7 +34,7 @@ class Configuration:
     # Training 
     mixed_precision: bool = True
     seed = 42
-    epochs: int = 20
+    epochs: int = 40
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
     gpu_ids: tuple = (0,)   # GPU ids for training
@@ -44,13 +46,14 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    gps_dict_path: str = "./data/CVUSA/gps_dict_10k.pkl"   # path to pre-computed distances
+    gps_dict_path: str = "./data/CVUSA/gps_dict.pkl"   # path to pre-computed distances
     
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 1        # eval every n Epoch
+    eval_every_n_epoch: int = 4        # eval every n Epoch
     normalize_features: bool = True
+    eval_fov_180: bool = True          # if True, also evaluate at 180 FoV alongside the primary (90) FoV
 
     # Optimizer 
     clip_grad = 100.                   # None | float
@@ -78,7 +81,7 @@ class Configuration:
     data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
     
     # Augment Images
-    prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
+    prob_rotate: float = 0.5          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
@@ -87,8 +90,16 @@ class Configuration:
     # Eval before training
     zero_shot: bool = False
     
-    # Checkpoint to start from
-    checkpoint_start = None   
+    # Checkpoint to start from (weights only, fresh schedule/optimizer/epoch)
+    checkpoint_start = None
+
+    # Full-state checkpoint to RESUME from (model + optimizer + scheduler +
+    # scaler + epoch + best_score + sim_dict + RNG). Continues the curriculum,
+    # LR schedule and optimizer state from where the run stopped, up to
+    # config.epochs. Point this at a previous run's "last.pth". Leave None for
+    # a fresh run. Use the SAME config.epochs and dataset as the original run
+    # (the cosine schedule and curriculum are functions of epoch/total-epochs).
+    resume_from = None
   
     # set num_workers to 0 if on Windows
     num_workers: int = 0 if os.name == 'nt' else 8 
@@ -337,8 +348,28 @@ if __name__ == '__main__':
                                        num_workers=config.num_workers,
                                        shuffle=False,
                                        pin_memory=True)
-    
-    
+
+    # Optional second eval at 180 FoV (same test references, only the query FoV
+    # crop differs). Kept separate so the 90 FoV metric stays the primary score.
+    query_dataloader_test_180 = None
+    if config.eval_fov_180:
+        _, ground_transforms_val_180 = get_transforms_val(image_size_sat,
+                                                          img_size_ground,
+                                                          mean=mean,
+                                                          std=std,
+                                                          fov=180,
+                                                          )
+        query_dataset_test_180 = CVUSADatasetEval(data_folder=config.data_folder,
+                                                  split="test",
+                                                  img_type="query",
+                                                  transforms=ground_transforms_val_180,
+                                                  )
+        query_dataloader_test_180 = DataLoader(query_dataset_test_180,
+                                               batch_size=config.batch_size_eval,
+                                               num_workers=config.num_workers,
+                                               shuffle=False,
+                                               pin_memory=True)
+
     print("Reference Images Test:", len(reference_dataset_test))
     print("Query Images Test:", len(query_dataset_test))
     
@@ -457,23 +488,71 @@ if __name__ == '__main__':
         
     print("Warmup Epochs: {} - Warmup Steps: {}".format(str(config.warmup_epochs).ljust(2), warmup_steps))
     print("Train Epochs:  {} - Train Steps:  {}".format(config.epochs, train_steps))
-        
-        
+
+
+    #-----------------------------------------------------------------------------#
+    # Resume from full-state checkpoint                                           #
+    #-----------------------------------------------------------------------------#
+    is_data_parallel = torch.cuda.device_count() > 1 and len(config.gpu_ids) > 1
+    start_epoch = 1
+    best_score = 0
+
+    if config.resume_from is not None:
+        print("\nResuming from:", config.resume_from)
+        ckpt = torch.load(config.resume_from, map_location=config.device)
+        if ckpt.get("config_epochs") not in (None, config.epochs):
+            print("  WARNING: checkpoint saved with epochs={} but config.epochs={} - "
+                  "the cosine LR schedule and FoV curriculum are functions of the epoch "
+                  "count and will NOT line up.".format(ckpt.get("config_epochs"), config.epochs))
+        (model.module if is_data_parallel else model).load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        if scheduler is not None and ckpt.get("scheduler") is not None:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if scaler is not None and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        best_score = ckpt.get("best_score", 0)
+        if ckpt.get("sim_dict") is not None:
+            sim_dict = ckpt["sim_dict"]   # continue with the learned-similarity pool, not the GPS one
+        # restore RNG streams (augmentation + sampling) - moved to CPU since the
+        # checkpoint was mapped onto the training device.
+        rng = ckpt.get("rng", {})
+        if rng.get("torch") is not None:
+            torch.set_rng_state(rng["torch"].cpu())
+        if torch.cuda.is_available() and rng.get("cuda") is not None:
+            torch.cuda.set_rng_state_all([t.cpu() for t in rng["cuda"]])
+        if rng.get("numpy") is not None:
+            np.random.set_state(rng["numpy"])
+        if rng.get("python") is not None:
+            random.setstate(rng["python"])
+        start_epoch = ckpt["epoch"] + 1
+        print("Resumed: next epoch = {} / {}, best_score so far = {:.4f}".format(
+            start_epoch, config.epochs, best_score))
+
     #-----------------------------------------------------------------------------#
     # Zero Shot                                                                   #
     #-----------------------------------------------------------------------------#
-    if config.zero_shot:
-        print("\n{}[{}]{}".format(30*"-", "Zero Shot", 30*"-"))  
+    if config.zero_shot and config.resume_from is None:
+        print("\n{}[{}]{}".format(30*"-", "Zero Shot", 30*"-"))
 
-      
+        print("Eval FoV = {}:".format(config.fov))
         r1_test = evaluate(config=config,
                            model=model,
                            reference_dataloader=reference_dataloader_test,
-                           query_dataloader=query_dataloader_test, 
+                           query_dataloader=query_dataloader_test,
                            ranks=[1, 5, 10],
                            step_size=1000,
                            cleanup=True)
-        
+
+        # if config.eval_fov_180:
+        #     print("Eval FoV = 180:")
+        #     r1_test_180 = evaluate(config=config,
+        #                            model=model,
+        #                            reference_dataloader=reference_dataloader_test,
+        #                            query_dataloader=query_dataloader_test_180,
+        #                            ranks=[1, 5, 10],
+        #                            step_size=1000,
+        #                            cleanup=True)
+
         if config.sim_sample:
             r1_train, sim_dict = calc_sim(config=config,
                                           model=model,
@@ -494,9 +573,9 @@ if __name__ == '__main__':
     #-----------------------------------------------------------------------------#
     # Train                                                                       #
     #-----------------------------------------------------------------------------#
-    best_score = 0
+    # best_score / start_epoch are initialized above (and restored on resume).
 
-    for epoch in range(1, config.epochs+1):
+    for epoch in range(start_epoch, config.epochs+1):
         
         # NOTE: aerial/satellite rotation is applied on a FIXED schedule inside
         # standard_transform_aer (DynamicRandomRotate keep_prob=0.25) and is NOT
@@ -505,8 +584,8 @@ if __name__ == '__main__':
         # is removed to avoid implying a schedule that never runs.
 
         # modulate the fov of the ground branch
-        # fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=360, min_value=60)
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
+        fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=270, min_value=50)
+        # fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
         # 4 positive FoV crops for epoch
         
         # _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
@@ -556,15 +635,26 @@ if __name__ == '__main__':
         if (epoch % config.eval_every_n_epoch == 0 and epoch != 0) or epoch == config.epochs:
         
             print("\n{}[{}]{}".format(30*"-", "Evaluate", 30*"-"))
-        
+
+            print("Eval FoV = {}:".format(config.fov))
             r1_test = evaluate(config=config,
                                model=model,
                                reference_dataloader=reference_dataloader_test,
-                               query_dataloader=query_dataloader_test, 
+                               query_dataloader=query_dataloader_test,
                                ranks=[1, 5, 10],
                                step_size=1000,
                                cleanup=True)
-            
+
+            if config.eval_fov_180:
+                print("Eval FoV = 180:")
+                r1_test_180 = evaluate(config=config,
+                                       model=model,
+                                       reference_dataloader=reference_dataloader_test,
+                                       query_dataloader=query_dataloader_test_180,
+                                       ranks=[1, 5, 10],
+                                       step_size=1000,
+                                       cleanup=True)
+
             # after we evaluate, we update the similiarity sampling dictionary for training the dataset.
             if config.sim_sample:
                 r1_train, sim_dict = calc_sim(config=config, # Update the sim_dict when training with dynamic_fov
@@ -589,8 +679,32 @@ if __name__ == '__main__':
             train_dataloader.dataset.shuffle(sim_dict,
                                              neighbour_select=config.neighbour_select,
                                              neighbour_range=config.neighbour_range)
-                
+
+        # Full-state checkpoint for resuming. Overwrites last.pth every epoch so a
+        # pause (Ctrl-C) loses at most the in-progress epoch. Written after the
+        # end-of-epoch shuffle so sim_dict is the latest. Saved atomically (tmp +
+        # rename) so a kill mid-write can't corrupt the resume file.
+        ckpt = {
+            "epoch": epoch,
+            "model": (model.module if is_data_parallel else model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "best_score": best_score,
+            "sim_dict": sim_dict,
+            "config_epochs": config.epochs,
+            "rng": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            },
+        }
+        tmp_path = "{}/last.pth.tmp".format(model_path)
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, "{}/last.pth".format(model_path))
+
     if torch.cuda.device_count() > 1 and len(config.gpu_ids) > 1:
         torch.save(model.module.state_dict(), '{}/weights_end.pth'.format(model_path))
     else:
-        torch.save(model.state_dict(), '{}/weights_end.pth'.format(model_path))            
+        torch.save(model.state_dict(), '{}/weights_end.pth'.format(model_path))

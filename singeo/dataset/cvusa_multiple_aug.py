@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 import pandas as pd
 import random
 import copy
@@ -8,9 +8,9 @@ import torch
 from tqdm import tqdm
 import time
 
-from ..utils import AverageMeter, LabelGenerator
+from ..utils import LabelGenerator
 class CVUSADatasetTrain(Dataset):
-    
+
     def __init__(self,
                  data_folder,
                  transforms_query=None,
@@ -514,6 +514,13 @@ class CVUSADatasetTrainSinGeo(Dataset):
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
 
 class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
+
+    # curriculum stats: [ground FoV high, ground FoV low, aerial FoV high,
+    #                    aerial FoV low, orient offset low-diff, orient offset high-diff]
+    CURRICULUM_STATS = 6
+    # one accumulator slot for the main process + one per DataLoader worker
+    CURRICULUM_SLOTS = 65
+
     def __init__(self,
                  data_folder,
                  transforms_query1=None,
@@ -577,15 +584,28 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.train_ids = train_ids_list
         self.samples = copy.deepcopy(self.train_ids)
 
-        self.fovl_mean = AverageMeter()
-        self.fovh_mean = AverageMeter()
-        self.fovl_aer_mean = AverageMeter()
-        self.fovh_aer_mean = AverageMeter()
-        self.orient_low_mean = AverageMeter()
-        self.orient_high_mean = AverageMeter()
+        # __getitem__ runs inside DataLoader worker processes, which hold a
+        # forked *copy* of this dataset, so plain AverageMeters updated there
+        # never reach the main process that prints them in shuffle(). Accumulate
+        # (sum, count) into a shared-memory tensor instead, with a private slot
+        # per worker so concurrent read-modify-writes cannot lose updates.
+        self.curriculum_stats = torch.zeros(self.CURRICULUM_SLOTS,
+                                            self.CURRICULUM_STATS, 2).share_memory_()
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+
+    def update_curriculum_stats(self, values):
+        worker = get_worker_info()
+        slot = 0 if worker is None else worker.id % (self.CURRICULUM_SLOTS - 1) + 1
+        stats = self.curriculum_stats[slot]
+        for i, value in enumerate(values):
+            stats[i, 0] += float(value)
+            stats[i, 1] += 1.0
+
+    def curriculum_means(self):
+        totals = self.curriculum_stats.sum(dim=0)
+        return (totals[:, 0] / totals[:, 1].clamp(min=1.0)).tolist()
 
     def get_fovs(self, t, ground=False):
         """
@@ -736,12 +756,14 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         def _circ_off(a, b):
             d = abs(float(a) - float(b)) % 360.0
             return min(d, 360.0 - d)
-        self.fovh_mean.update(samples[0][0])       # ground high FoV
-        self.fovl_mean.update(samples[3][0])       # ground low FoV
-        self.fovh_aer_mean.update(samples[0][1])   # aerial high FoV
-        self.fovl_aer_mean.update(samples[3][1])   # aerial low FoV
-        self.orient_low_mean.update(_circ_off(samples[2][2], samples[2][3]))    # low-diff offset
-        self.orient_high_mean.update(_circ_off(samples[3][2], samples[3][3]))   # high-diff offset
+        self.update_curriculum_stats((
+            samples[0][0],                          # ground high FoV
+            samples[3][0],                          # ground low FoV
+            samples[0][1],                          # aerial high FoV
+            samples[3][1],                          # aerial low FoV
+            _circ_off(samples[2][2], samples[2][3]),  # low-diff orientation offset
+            _circ_off(samples[3][2], samples[3][3]),  # high-diff orientation offset
+        ))
 
         for fov_g, fov_a, orient_g, orient_a in samples:
             grd_semi, aer_semi = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=fov_g, aerial_fov=fov_a if self.aerial_cropping else 360, grd_orientation_shift=orient_g, aer_orientation_shift=orient_a, pad=True)
@@ -890,14 +912,10 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             print("Break Counter:", break_counter)
             print("Pairs left out of last batch to avoid creating noise:", len(self.train_ids) - len(self.samples))
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
+            fovh_g, fovl_g, fovh_a, fovl_a, orient_low, orient_high = self.curriculum_means()
             print("Curriculum (epoch {} means from actual training samples):".format(self.epoch))
-            print("  Ground FoV  high/low: {:.1f} / {:.1f}".format(self.fovh_mean.avg, self.fovl_mean.avg))
-            print("  Aerial FoV  high/low: {:.1f} / {:.1f}".format(self.fovh_aer_mean.avg, self.fovl_aer_mean.avg))
-            print("  Orient off  low/high: {:.1f} / {:.1f}".format(self.orient_low_mean.avg, self.orient_high_mean.avg))
+            print("  Ground FoV  high/low: {:.1f} / {:.1f}".format(fovh_g, fovl_g))
+            print("  Aerial FoV  high/low: {:.1f} / {:.1f}".format(fovh_a, fovl_a))
+            print("  Orient off  low/high: {:.1f} / {:.1f}".format(orient_low, orient_high))
 
-            self.fovh_mean.reset()
-            self.fovl_mean.reset()
-            self.fovh_aer_mean.reset()
-            self.fovl_aer_mean.reset()
-            self.orient_low_mean.reset()
-            self.orient_high_mean.reset()
+            self.curriculum_stats.zero_()
