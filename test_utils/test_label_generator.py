@@ -4,6 +4,7 @@ from singeo.utils import LabelGenerator
 import numpy as np
 from singeo.transforms import LimitedFoVCropGrdAerPair, get_transforms_train_singeo_unified
 from singeo.dataset.cvusa_multiple_aug import CVUSADatasetTrainSinGeoUnifiedAugmentation
+from singeo.trainer_supcon_w_aeraug import PAIRING_NAMES
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -299,27 +300,29 @@ def visualize_label_consistency(fov_g, fov_a, orient_g, orient_a, transform):
     plt.show()
 
 def audit_fov_curriculum(dataset, n_samples=500):
-    results = {"epoch_frac": [], "high_fov": [], "low_fov": []}
+    # get_fovs now yields ONE FoV per domain (single crop-augmented view per
+    # sample), so audit the ground and aerial draws side by side instead of a
+    # high/low pair within each domain.
+    results = {"epoch_frac": [], "ground_fov": [], "aerial_fov": []}
     for epoch_frac in [0.0, 0.25, 0.5, 0.75, 1.0]:
         dataset.epoch = int(epoch_frac * dataset.max_epochs)
         for _ in range(n_samples):
-            high_fov, low_fov = dataset.get_fovs(epoch_frac)
             results["epoch_frac"].append(epoch_frac)
-            results["high_fov"].append(high_fov)
-            results["low_fov"].append(low_fov)
+            results["ground_fov"].append(dataset.get_fovs(epoch_frac, ground=True))
+            results["aerial_fov"].append(dataset.get_fovs(epoch_frac))
 
     import pandas as pd
     df = pd.DataFrame(results)
-    print(df.groupby("epoch_frac")[["high_fov", "low_fov"]].agg(["mean", "std", "min", "max"]))
+    print(df.groupby("epoch_frac")[["ground_fov", "aerial_fov"]].agg(["mean", "std", "min", "max"]))
    
 def inspect_sample_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.8), out_dir="test_utils/eyeball"):
     """
     Fetches a single dataset item (by plain index, same convention as
     dataset.__getitem__) at several curriculum progress points (fraction of
-    dataset.max_epochs) and dumps the 4 ground/aerial crops plus their
-    g2a/a2g/g2g/a2a label rows - for eyeballing whether LabelGenerator's
-    output matches what the crops actually look like on real curriculum
-    FoV/orientation combinations, not just synthetic test cases.
+    dataset.max_epochs) and dumps the un-cropped ground/aerial pair, the
+    crop-augmented ones, and every AngularIoU target block - for eyeballing
+    whether the targets match what the crops actually look like on real
+    curriculum FoV/orientation combinations, not just synthetic test cases.
     """
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
@@ -328,34 +331,35 @@ def inspect_sample_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.8), o
     for frac in progress_fractions:
         epoch = max(1, round(frac * dataset.max_epochs))
         dataset.set_epoch(epoch)
-        queries, references, ids, g2a, a2g, g2g, a2a = dataset[item_id]
+        query_full, reference_full, queries, references, ids, *targets = dataset[item_id]
 
         frac_dir = f"{out_dir}/progress_{frac}"
         os.makedirs(frac_dir, exist_ok=True)
 
         print(f"\n{'='*20} item {item_id}, progress {frac:.0%} (epoch {epoch}/{dataset.max_epochs}) {'='*20}")
-        print("labels_g2a (row=ground anchor, col=aerial candidate):\n", g2a)
-        print("labels_a2g (row=aerial anchor, col=ground candidate):\n", a2g)
-        print("labels_g2g (row=ground anchor, col=ground candidate):\n", g2g)
-        print("labels_a2a (row=aerial anchor, col=aerial candidate):\n", a2a)
+        for name, target in zip(PAIRING_NAMES, targets):
+            print(f"{name} (row=anchor, col=candidate):\n", target)
 
+        torchvision.utils.save_image(query_full * std + mean, f"{frac_dir}/query_full.png")
+        torchvision.utils.save_image(reference_full * std + mean, f"{frac_dir}/aerial_full.png")
+
+        by_name = dict(zip(PAIRING_NAMES, targets))
         for i in range(queries.shape[0]):
             qdenorm = queries[i] * std + mean
             rdenorm = references[i] * std + mean
-            g2a_row = [round(v, 3) for v in g2a[i].tolist()]
-            a2g_row = [round(v, 3) for v in a2g[i].tolist()]
-            torchvision.utils.save_image(qdenorm, f"{frac_dir}/query_{i}_g2a={g2a_row}.png")
-            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_a2g={a2g_row}.png")
+            # each semi view is a COLUMN of the full-vs-semi blocks
+            q_iou = [round(v, 3) for v in by_name["q2q_semi"][:, i].tolist()]
+            r_iou = [round(v, 3) for v in by_name["r2r_semi"][:, i].tolist()]
+            torchvision.utils.save_image(qdenorm, f"{frac_dir}/query_{i}_iou_vs_full={q_iou}.png")
+            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_iou_vs_full={r_iou}.png")
 
 
 def inspect_same_domain_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.8), out_dir="test_utils/eyeball_same_domain"):
     """
-    Same idea as inspect_sample_by_id, but surfaces the SAME-DOMAIN labels
-    (g2g: ground crop vs ground crop, a2a: aerial crop vs aerial crop) instead
-    of the cross-domain ones. With symmetric_same_domain=True (default) these
-    matrices are symmetric: the two directional coverage scores are averaged,
-    so a narrow crop engulfed by a wide crop of the same view reads as a
-    moderate positive (mean of full and partial coverage), the same both ways.
+    Same idea as inspect_sample_by_id, but surfaces only the SAME-DOMAIN pairings
+    - q2q_semi (full ground vs its crop) and r2r_semi (full aerial vs its crop) -
+    for eyeballing whether the IoU matches how much of the full view the crop
+    actually kept.
     """
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
@@ -364,67 +368,80 @@ def inspect_same_domain_by_id(dataset, item_id, progress_fractions=(0.2, 0.5, 0.
     for frac in progress_fractions:
         epoch = max(1, round(frac * dataset.max_epochs))
         dataset.set_epoch(epoch)
-        queries, references, ids, g2a, a2g, g2g, a2a = dataset[item_id]
+        query_full, reference_full, queries, references, ids, *targets = dataset[item_id]
+        by_name = dict(zip(PAIRING_NAMES, targets))
 
         frac_dir = f"{out_dir}/progress_{frac}"
         os.makedirs(frac_dir, exist_ok=True)
 
         print(f"\n{'='*20} item {item_id}, progress {frac:.0%} (epoch {epoch}/{dataset.max_epochs}) {'='*20}")
-        print("labels_g2g (row=ground anchor, col=ground candidate):\n", g2g)
-        print("labels_a2a (row=aerial anchor, col=aerial candidate):\n", a2a)
+        print("q2q_semi (row=full ground, col=semi ground):\n", by_name["q2q_semi"])
+        print("r2r_semi (row=full aerial, col=semi aerial):\n", by_name["r2r_semi"])
 
+        torchvision.utils.save_image(query_full * std + mean, f"{frac_dir}/ground_full.png")
+        torchvision.utils.save_image(reference_full * std + mean, f"{frac_dir}/aerial_full.png")
         for i in range(queries.shape[0]):
             qdenorm = queries[i] * std + mean
             rdenorm = references[i] * std + mean
-            g2g_row = [round(v, 3) for v in g2g[i].tolist()]
-            a2a_row = [round(v, 3) for v in a2a[i].tolist()]
-            torchvision.utils.save_image(qdenorm, f"{frac_dir}/ground_{i}_g2g={g2g_row}.png")
-            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_a2a={a2a_row}.png")
+            q_iou = [round(v, 3) for v in by_name["q2q_semi"][:, i].tolist()]
+            r_iou = [round(v, 3) for v in by_name["r2r_semi"][:, i].tolist()]
+            torchvision.utils.save_image(qdenorm, f"{frac_dir}/ground_{i}_q2q_semi={q_iou}.png")
+            torchvision.utils.save_image(rdenorm, f"{frac_dir}/aerial_{i}_r2r_semi={r_iou}.png")
 
 
 def test_getitem_label_image_consistency(dataset, index=0):
-    queries, references, label, g2a, a2g, g2g, a2a = dataset[index]
-    # basic shape/bounds sanity
-    assert queries.shape[0] == 4 and references.shape[0] == 4
-    assert torch.all(g2a >= 0) and torch.all(g2a <= 1)
-    assert torch.all(a2g >= 0) and torch.all(a2g <= 1)
-    # g2g and a2a diagonals should be self-similarity == 1 (same fov/orientation vs itself)
-    assert torch.allclose(torch.diagonal(g2g), torch.ones(4), atol=1e-3)
-    assert torch.allclose(torch.diagonal(a2a), torch.ones(4), atol=1e-3)
-    assert torch.all(g2g >= 0) and torch.all(g2g <= 1)
-    assert torch.all(a2a >= 0) and torch.all(a2a <= 1)
-    # With symmetric_same_domain=True (the default), same-domain targets MUST be
-    # symmetric: their similarity matrix feats@feats.t is symmetric, so an
-    # asymmetric target stalls the loss. (Cross-domain g2a/a2g stay asymmetric.)
-    if getattr(dataset, "symmetric_same_domain", True):
-        assert torch.allclose(g2g, g2g.T, atol=1e-3)
-        assert torch.allclose(a2a, a2a.T, atol=1e-3)
+    query_full, reference_full, queries, references, label, *targets = dataset[index]
+    by_name = dict(zip(PAIRING_NAMES, targets))
+    assert len(targets) == len(PAIRING_NAMES)
 
-def check_same_domain_symmetry_on_dataset(dataset, n_items=8, atol=1e-5):
+    # n_aug is read off the item rather than hard-coded, so this still holds if
+    # the number of crop-augmented views per sample changes.
+    n_aug = queries.shape[0]
+    assert references.shape[0] == n_aug
+    # the un-cropped pair is a single view per domain, at the same resolution as
+    # the augmented ones so both can go through the same backbone
+    assert query_full.shape == queries.shape[1:]
+    assert reference_full.shape == references.shape[1:]
+
+    # every block is [rows, cols] over the view sets its name names, and every
+    # entry is an IoU
+    expected_shape = {
+        "q2r":           (1, 1),
+        "q2r_semi":      (1, n_aug),
+        "q_semi2r":      (n_aug, 1),
+        "q_semi2r_semi": (n_aug, n_aug),
+        "q2q_semi":      (1, n_aug),
+        "r2r_semi":      (1, n_aug),
+    }
+    for name, target in by_name.items():
+        assert target.shape == expected_shape[name], (name, target.shape)
+        assert torch.all(target >= 0) and torch.all(target <= 1), name
+
+    # both sides of q2r span the full circle, so they overlap completely whatever
+    # headings were drawn for them
+    assert torch.allclose(by_name["q2r"], torch.ones(1, 1), atol=1e-6)
+    # a full view against a semi one reduces to semi_fov/360, so the two blocks
+    # that compare the same semi view against a 360 view must agree
+    assert torch.allclose(by_name["q_semi2r"].t(), by_name["q2q_semi"], atol=1e-6)
+    assert torch.allclose(by_name["q2r_semi"], by_name["r2r_semi"], atol=1e-6)
+
+
+def check_iou_targets_on_dataset(dataset, n_items=8, atol=1e-6):
     """
-    End-to-end guard on the REAL pipeline: pulls actual g2g/a2a label matrices
-    from the dataset across several epochs/items and asserts they are symmetric
-    (when symmetric_same_domain is on), while cross-domain g2a is NOT. Raises on
-    the first violation; prints a summary otherwise. Requires the data folder,
-    so it's invoked from __main__ rather than collected as a pytest test.
+    End-to-end guard on the REAL pipeline: pulls actual AngularIoU targets across
+    several epochs/items and asserts the invariants that must hold for every one
+    of them. Raises on the first violation; prints a summary otherwise. Requires
+    the data folder, so it's invoked from __main__ rather than collected by pytest.
     """
-    assert getattr(dataset, "symmetric_same_domain", False), \
-        "dataset.symmetric_same_domain must be True for this check"
     n = min(n_items, len(dataset))
     checked = 0
-    cross_asym_seen = False
     for epoch in [1, max(1, dataset.max_epochs // 2), dataset.max_epochs]:
         dataset.set_epoch(epoch)
         for idx in range(n):
-            _, _, _, g2a, a2g, g2g, a2a = dataset[idx]
-            assert torch.allclose(g2g, g2g.T, atol=atol), f"g2g not symmetric @ epoch {epoch}, item {idx}:\n{g2g}"
-            assert torch.allclose(a2a, a2a.T, atol=atol), f"a2a not symmetric @ epoch {epoch}, item {idx}:\n{a2a}"
-            if not torch.allclose(g2a, g2a.T, atol=1e-2):
-                cross_asym_seen = True
+            test_getitem_label_image_consistency(dataset, idx)
             checked += 1
-    print(f"check_same_domain_symmetry_on_dataset: g2g & a2a symmetric on all "
-          f"{checked} sampled items (3 epochs x {n} items). "
-          f"cross-domain g2a asymmetric seen: {cross_asym_seen}")
+    print(f"check_iou_targets_on_dataset: all {len(PAIRING_NAMES)} target blocks "
+          f"valid on {checked} sampled items (3 epochs x {n} items).")
 
 if __name__=="__main__":
     # test_full_overlap_identical_views()
@@ -487,21 +504,26 @@ if __name__=="__main__":
 
 
 
-    for epoch in [10,20,40,60]:                        
+    for epoch in [10,20,40,60]:
         train_dataset.set_epoch(epoch)
-        queries,references, ids, labels_g2a, labels_a2g, labels_g2g, labels_a2a = train_dataset.__getitem__(3)
+        query_full, reference_full, queries, references, ids, *targets = train_dataset.__getitem__(3)
+        by_name = dict(zip(PAIRING_NAMES, targets))
 
+        os.makedirs(f"test_utils/{epoch}", exist_ok=True)
+        torchvision.utils.save_image(query_full * std + mean, f"test_utils/{epoch}/query_image_full.png")
+        torchvision.utils.save_image(reference_full * std + mean, f"test_utils/{epoch}/reference_image_full.png")
         for i in range(queries.shape[0]):
-            # de normalize images
+            # de normalize images. the semi views are the COLUMNS of q_semi2r_semi
             qdenorm = queries[i] * std + mean
             rdenorm = references[i] * std + mean
-            torchvision.utils.save_image(qdenorm, f"test_utils/{epoch}/query_image_{i}_{[labels_g2a[i].tolist()]}.png")
-            torchvision.utils.save_image(rdenorm, f"test_utils/{epoch}/reference_image_{i}_{labels_g2a[i].tolist()}.png")
+            iou = [round(v, 3) for v in by_name["q_semi2r_semi"][i].tolist()]
+            torchvision.utils.save_image(qdenorm, f"test_utils/{epoch}/query_image_{i}_{iou}.png")
+            torchvision.utils.save_image(rdenorm, f"test_utils/{epoch}/reference_image_{i}_{iou}.png")
         print("-"*10)
 
     inspect_sample_by_id(train_dataset, item_id=3, progress_fractions=(0.2, 0.5, 0.8))
     inspect_same_domain_by_id(train_dataset, item_id=3, progress_fractions=(0.2, 0.5, 0.8))
 
     # ensure the real g2g/a2a labels coming out of the pipeline are symmetric
-    check_same_domain_symmetry_on_dataset(train_dataset, n_items=8)
+    check_iou_targets_on_dataset(train_dataset, n_items=8)
 

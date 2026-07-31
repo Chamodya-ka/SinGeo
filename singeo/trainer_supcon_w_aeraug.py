@@ -18,30 +18,87 @@ def build_supervised_labels(batch_size, device):
     return labels
 
 
+# The six pairings of view sets. A bare q/r is the un-cropped ("full") view, a
+# _semi suffix the crop-augmented one; the name reads [rows]2[cols] and matches
+# the target the dataset emits for it.
+PAIRING_NAMES = ("q2r", "q2r_semi", "q_semi2r", "q_semi2r_semi", "q2q_semi", "r2r_semi")
+
+
 def composite_contrast_loss(
-    features_q1,
-    features_r1,
-    g2a_target,
-    a2g_target,
-    g2g_target,
-    a2a_target,
+    features_q_full,
+    features_q_semi,
+    features_r_full,
+    features_r_semi,
+    target_q2r,
+    target_q2r_semi,
+    target_q_semi2r,
+    target_q_semi2r_semi,
+    target_q2q_semi,
+    target_r2r_semi,
     loss_function,
+    bce_loss_function,
     logit_scale,
+    bce_logit_scale,
+    bce_logit_bias,
     device,
+    pairing_weights=None,
+    infonce_weight=1.0,
+    bce_weight=1.0,
+    a2g_weight=1.0,
 ):
-    if isinstance(loss_function, SupervisedInfoNCE):
-        loss_a2g = loss_function(features_r1, features_q1, logit_scale, a2g_target, bidirectional=False, same_domain=False)
-        loss_g2a = loss_function(features_q1, features_r1, logit_scale, g2a_target, bidirectional=False, same_domain=False)
-        
-        # contrast query to reference features
-        loss_q2q = loss_function(features_q1, features_q1, logit_scale, g2g_target, bidirectional=False, same_domain=True)
-        loss_r2r = loss_function(features_r1, features_r1, logit_scale, a2a_target, bidirectional=False, same_domain=True)
+    """Score every pairing of view sets under both objectives and combine them.
 
+    Each pairing is its own contrastive problem over its own similarity matrix -
+    the four feature sets are never concatenated, so a pairing's negatives are
+    only the other locations' views of the same kind. Per pairing:
 
-        return loss_a2g, loss_g2a, 0.5*loss_q2q, 0.5*loss_r2r
-    loss1 = loss_function(features_q1, features_r1, logit_scale)
-    print("This should not happen")
-    return loss1 
+      InfoNCE, both directions, against a BINARY target. Row-normalization would
+        discard a soft label's magnitude anyway (a row holding one positive
+        normalizes to 1.0 whatever its IoU), so the target here is just "is this
+        pair a positive at all" and the geometry is left to the BCE term.
+      PairwiseSigmoidBCE, one call, against the AngularIoU target. It scores
+        PAIRS rather than rows, so the transposed direction would be the same set
+        of pairs and adds nothing.
+
+    Returns (total, terms) where terms holds every raw unweighted component, so
+    the log shows what each pairing actually costs independent of its weight.
+    """
+    if not isinstance(loss_function, SupervisedInfoNCE):
+        raise TypeError("composite_contrast_loss expects a SupervisedInfoNCE, got "
+                        f"{type(loss_function).__name__}")
+
+    # (name, row features, col features, IoU target, weight on the reverse pass).
+    # a2g_weight rides on the aerial-anchored direction of the pairings whose
+    # aerial side is a crop-augmented view - the same two terms it used to scale.
+    pairings = (
+        ("q2r",           features_q_full, features_r_full, target_q2r,           1.0),
+        ("q2r_semi",      features_q_full, features_r_semi, target_q2r_semi,      a2g_weight),
+        ("q_semi2r",      features_q_semi, features_r_full, target_q_semi2r,      1.0),
+        ("q_semi2r_semi", features_q_semi, features_r_semi, target_q_semi2r_semi, a2g_weight),
+        ("q2q_semi",      features_q_full, features_q_semi, target_q2q_semi,      1.0),
+        ("r2r_semi",      features_r_full, features_r_semi, target_r2r_semi,      1.0),
+    )
+
+    total = torch.zeros((), device=device)
+    terms = {}
+    for name, row_feats, col_feats, iou, reverse_weight in pairings:
+        binary = (iou > 0).to(iou.dtype)
+        # same_domain stays False even for q2q_semi / r2r_semi: those compare two
+        # DIFFERENT tensors (a full view against a semi one), so there is no
+        # self-similarity diagonal to mask out - the diagonal is a real positive.
+        nce_fwd = loss_function(row_feats, col_feats, logit_scale, binary,
+                                bidirectional=False, same_domain=False)
+        nce_rev = loss_function(col_feats, row_feats, logit_scale, binary.t().contiguous(),
+                                bidirectional=False, same_domain=False)
+        nce = nce_fwd + reverse_weight * nce_rev
+        bce = bce_loss_function(row_feats, col_feats, bce_logit_scale, bce_logit_bias, iou)
+
+        weight = 1.0 if pairing_weights is None else pairing_weights.get(name, 1.0)
+        total = total + weight * (infonce_weight * nce + bce_weight * bce)
+        terms[name + "_nce"] = nce
+        terms[name + "_bce"] = bce
+
+    return total, terms
 
 
 def train(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None):
@@ -854,16 +911,24 @@ def train_contrast_congeo_vit(train_config, model, dataloader, loss_function, op
 
 
 
-def train_contrast_singeo(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None, a2g_weight=1.0):
+def train_contrast_singeo(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None, a2g_weight=1.0, bce_loss_function=None, pairing_weights=None, infonce_weight=1.0, bce_weight=1.0):
+    """
+    pairing_weights scales the six view-set pairings against each other (see
+    composite_contrast_loss); infonce_weight / bce_weight balance the two
+    objectives applied to every pairing. All default to 1.0.
+    """
+    if bce_loss_function is None:
+        raise ValueError("train_contrast_singeo needs a bce_loss_function "
+                         "(loss.PairwiseSigmoidBCE) for the absolute-IoU term")
 
     # set model train mode
     model.train()
-    
+
     losses = AverageMeter()
-    a2g_loss =  AverageMeter()
-    g2a_loss =  AverageMeter()
-    a2a_loss =  AverageMeter()
-    g2g_loss =  AverageMeter()
+    # one meter per raw component, so the per-pairing cost stays visible
+    # independent of the weight it is given
+    term_meters = {f"{name}_{kind}": AverageMeter()
+                   for name in PAIRING_NAMES for kind in ("nce", "bce")}
     # wait before starting progress bar
     time.sleep(0.1)
     
@@ -876,9 +941,14 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
         bar = tqdm(dataloader, total=len(dataloader))
     else:
         bar = dataloader
-    # grd_batch, aerial_batch, label_g2a_batch, label_a2g_batch, ids_a, ids_g
-    for query_images, reference_images, g2a_target, a2g_target, g2g_target, a2a_target in bar:
-        
+    # query_full, reference_full, grd_batch, aerial_batch, <6 AngularIoU targets>
+    for (query_full, reference_full, query_images, reference_images,
+         target_q2r, target_q2r_semi, target_q_semi2r, target_q_semi2r_semi,
+         target_q2q_semi, target_r2r_semi) in bar:
+
+        targets = [target_q2r, target_q2r_semi, target_q_semi2r,
+                   target_q_semi2r_semi, target_q2q_semi, target_r2r_semi]
+
         if scaler:
             with autocast():
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(1,-1,1,1)
@@ -886,55 +956,62 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
 
                 if step == 1:
                     os.makedirs("debug", exist_ok=True)
+                    for x in range(len(query_full)):
+                        qdenorm = query_full[x] * std + mean
+                        rdenorm = reference_full[x] * std + mean
+                        torchvision.utils.save_image(qdenorm, f"debug/query_image_full_{x}.png")
+                        torchvision.utils.save_image(rdenorm, f"debug/reference_image_full_{x}.png")
                     for x in range(len(query_images)):
                         qdenorm = query_images[x] * std + mean
                         rdenorm = reference_images[x] * std + mean
                         torchvision.utils.save_image(qdenorm, f"debug/query_image_{x}.png")
                         torchvision.utils.save_image(rdenorm, f"debug/reference_image_{x}.png")
-                        # print(g2a_target[x])
+                query_full = query_full.to(train_config.device) # [B,C,H,W]
+                reference_full = reference_full.to(train_config.device) # [B,C,H,W]
                 query_images = query_images.to(train_config.device) # [B*A,C,H,W]
                 reference_images = reference_images.to(train_config.device) # [B*A,C,H,W]
-                g2a_target = g2a_target.to(train_config.device) # [B*A, B*A]
-                a2g_target = a2g_target.to(train_config.device)
-                g2g_target = g2g_target.to(train_config.device)
-                a2a_target = a2a_target.to(train_config.device)
-                assert not torch.isnan(a2a_target).any(), "NaN already present in a2a_target before it reaches the loss"
-                assert not torch.isinf(a2a_target).any(), "Inf already present in a2a_target before it reaches the loss"
-                assert not torch.isnan(g2g_target).any(), "NaN already present in g2g_target before it reaches the loss"
-                assert not torch.isinf(g2g_target).any(), "Inf already present in g2g_target before it reaches the loss"
-                # ids [B*A,]
-                # debug - save the first 2 images of the first batch to check if they are loaded correctly
+                targets = [t.to(train_config.device) for t in targets]
+                for name, t in zip(PAIRING_NAMES, targets):
+                    assert not torch.isnan(t).any(), f"NaN already present in {name} target before it reaches the loss"
+                    assert not torch.isinf(t).any(), f"Inf already present in {name} target before it reaches the loss"
 
-                # Forward pass
-                features_query, features_reference = model(query_images, reference_images)
-                if torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1:
-                    logit_scale = model.module.logit_scale.exp()
-                else:
-                    logit_scale = model.logit_scale.exp()
+                # Forward pass - four separate feature sets, so every pairing stays
+                # its own contrastive problem, with its own similarity matrix and
+                # its own negatives.
+                features_query_full, features_query, features_reference_full, features_reference = model(
+                    query_full, reference_full, query_images, reference_images)
+                base = model.module if (torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1) else model
+                logit_scale = base.logit_scale.exp()
+                bce_logit_scale = base.bce_logit_scale.exp()
+                bce_logit_bias = base.bce_logit_bias
                 if step % 250 == 0:
-                    print("logit scale:", logit_scale)
-                loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
+                    print("logit scale:", logit_scale,
+                          "| bce scale:", bce_logit_scale, "bias:", bce_logit_bias)
+                # a2g_weight and the pairing/objective weights are applied only to
+                # the back-propagated total, never to the meters below - so every
+                # logged term stays an honest, unweighted read on its own magnitude.
+                loss, terms = composite_contrast_loss(
+                    features_query_full,
                     features_query,
+                    features_reference_full,
                     features_reference,
-                    g2a_target,
-                    a2g_target,
-                    g2g_target,
-                    a2a_target,
-                    loss_function,
-                    logit_scale,
-                    train_config.device,
+                    *targets,
+                    loss_function=loss_function,
+                    bce_loss_function=bce_loss_function,
+                    logit_scale=logit_scale,
+                    bce_logit_scale=bce_logit_scale,
+                    bce_logit_bias=bce_logit_bias,
+                    device=train_config.device,
+                    pairing_weights=pairing_weights,
+                    infonce_weight=infonce_weight,
+                    bce_weight=bce_weight,
+                    a2g_weight=a2g_weight,
                 )
-                # a2g_weight is applied only to the backpropagated total, not to
-                # the tracked a2g_loss meter below - so the printed a2g_loss stays
-                # an honest, unweighted diagnostic of the raw term's magnitude.
-                loss = a2g_weight * loss_a2g + loss_g2a + loss_q2q + loss_r2r
                 losses.update(loss.item())
-                g2a_loss.update(loss_g2a.item())
-                a2a_loss.update(loss_r2r.item())
-                g2g_loss.update(loss_q2q.item())
-                a2g_loss.update(loss_a2g.item())
+                for key, value in terms.items():
+                    term_meters[key].update(value.item())
 
-                  
+
             scaler.scale(loss).backward()
             
             # Gradient clipping 
@@ -955,37 +1032,40 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
    
         else:
             # data (batches) to device
+            query_full = query_full.to(train_config.device)
+            reference_full = reference_full.to(train_config.device)
             query_images = query_images.to(train_config.device)
             reference_images = reference_images.to(train_config.device)
-            g2a_target = g2a_target.to(train_config.device)
-            a2g_target = a2g_target.to(train_config.device)
-            g2g_target = g2g_target.to(train_config.device)
-            a2a_target = a2a_target.to(train_config.device)
+            targets = [t.to(train_config.device) for t in targets]
 
             # Forward pass
-            features_query, features_reference = model(query_images, reference_images)
-            if torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1:
-                logit_scale = model.module.logit_scale.exp()
-            else:
-                logit_scale = model.logit_scale.exp()
+            features_query_full, features_query, features_reference_full, features_reference = model(
+                query_full, reference_full, query_images, reference_images)
+            base = model.module if (torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1) else model
+            logit_scale = base.logit_scale.exp()
+            bce_logit_scale = base.bce_logit_scale.exp()
+            bce_logit_bias = base.bce_logit_bias
 
-            loss_a2g, loss_g2a, loss_q2q, loss_r2r = composite_contrast_loss(
+            loss, terms = composite_contrast_loss(
+                features_query_full,
                 features_query,
+                features_reference_full,
                 features_reference,
-                g2a_target,
-                a2g_target,
-                g2g_target,
-                a2a_target,
-                loss_function,
-                logit_scale,
-                train_config.device,
+                *targets,
+                loss_function=loss_function,
+                bce_loss_function=bce_loss_function,
+                logit_scale=logit_scale,
+                bce_logit_scale=bce_logit_scale,
+                bce_logit_bias=bce_logit_bias,
+                device=train_config.device,
+                pairing_weights=pairing_weights,
+                infonce_weight=infonce_weight,
+                bce_weight=bce_weight,
+                a2g_weight=a2g_weight,
             )
-            loss = a2g_weight * loss_a2g + loss_g2a + loss_q2q + loss_r2r
             losses.update(loss.item())
-            g2a_loss.update(loss_g2a.item())
-            a2a_loss.update(loss_r2r.item())
-            g2g_loss.update(loss_q2q.item())
-            a2g_loss.update(loss_a2g.item())
+            for key, value in terms.items():
+                term_meters[key].update(value.item())
             # Calculate gradient using backward pass
             loss.backward()
             
@@ -1003,22 +1083,25 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 scheduler.step()
         
         if train_config.verbose:
+            # 12 raw components is too many for one progress bar - show the two
+            # objectives summed across pairings here, and let the caller print the
+            # per-pairing breakdown from the returned dict at epoch end.
+            nce_total = sum(term_meters[f"{n}_nce"].avg for n in PAIRING_NAMES)
+            bce_total = sum(term_meters[f"{n}_bce"].avg for n in PAIRING_NAMES)
             monitor = {"loss": "{:.4f}".format(loss.item()),
                        "loss_avg": "{:.4f}".format(losses.avg),
-                       "g2a_loss": "{:.4f}".format(g2a_loss.avg),
-                       "a2a_loss": "{:.4f}".format(a2a_loss.avg),
-                       "g2g_loss": "{:.4f}".format(g2g_loss.avg),
-                       "a2g_loss": "{:.4f}".format(a2g_loss.avg),
+                       "nce": "{:.4f}".format(nce_total),
+                       "bce": "{:.4f}".format(bce_total),
                        "lr" : "{:.6f}".format(optimizer.param_groups[0]['lr'])}
-            
+
             bar.set_postfix(ordered_dict=monitor)
-        
+
         step += 1
 
     if train_config.verbose:
         bar.close()
 
-    return losses.avg, g2a_loss.avg, a2g_loss.avg, g2g_loss.avg, a2a_loss.avg
+    return losses.avg, {key: meter.avg for key, meter in term_meters.items()}
 
 
 

@@ -242,19 +242,39 @@ class TimmModel_SinGeo_SemiPositives(nn.Module):
             # print(self.model)
         
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-        
-        
+        # Separate temperature and bias for the pairwise-sigmoid (absolute IoU)
+        # objective - see loss.PairwiseSigmoidBCE. Kept here rather than on the loss
+        # module so the optimizer (built from model.parameters()) trains them and
+        # the checkpoints carry them, exactly like logit_scale. The bias starts at
+        # -10 because a BxB IoU target is mostly ~0 off the block diagonal.
+        self.bce_logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(10.0))
+        self.bce_logit_bias = torch.nn.Parameter(torch.ones([]) * -10.0)
+
+
     def get_config(self,):
         data_config = timm.data.resolve_model_data_config(self.model)
         return data_config
-    
+
     def set_grad_checkpointing(self, enable=True):
         self.model.set_grad_checkpointing(enable)
 
-    def forward(self, imgq, imgr=None):
+    def forward(self, imgq, imgr=None, imgq_semi=None, imgr_semi=None):
+        # TRAINING-ONLY 4-in / 4-out path: the un-cropped ("full") ground/aerial
+        # pair and the crop-augmented ("semi") views are encoded as four separate
+        # batches rather than one concatenated batch, so the caller gets four
+        # distinct feature sets and can build - and independently weight - a loss
+        # term per retrieval regime. Eval still goes through the 1-arg path below.
+        if imgq is not None and imgr is not None and imgq_semi is not None and imgr_semi is not None:
+            # random_fov is a test-time ablation knob and is deliberately not
+            # applied here: the semi views already carry their own FoV crops.
+            features_q_full = self.model(imgq)
+            features_q_semi = self.model(imgq_semi)
+            features_r_full = self.model(imgr)
+            features_r_semi = self.model(imgr_semi)
+            return features_q_full, features_q_semi, features_r_full, features_r_semi
         if imgq is not None and imgr is not None: # for datasets containing panorama, e.g., CVUSA, CVACT, VIGOR.
-            if self.random_fov == False: 
-                image_featuresq = self.model(imgq)     
+            if self.random_fov == False:
+                image_featuresq = self.model(imgq)
                 image_featuresr = self.model(imgr)
                 return image_featuresq, image_featuresr
             else: # enable random FoV testing.

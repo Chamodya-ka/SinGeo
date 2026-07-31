@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 import time
 
-from ..utils import LabelGenerator
+from ..utils import AngularIoU
 class CVUSADatasetTrain(Dataset):
 
     def __init__(self,
@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -233,9 +233,9 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         else:
-            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=5000)
+            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None, nrows=10000)
         
         self.df = self.df.rename(columns={0:"sat", 1:"ground", 2:"ground_anno"})
         
@@ -323,7 +323,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.transforms_query2 = transforms_query2           # ground
         self.transforms_reference1 = transforms_reference1   # satellite
         self.transforms_reference2 = transforms_reference2
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -515,9 +515,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
 class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
 
-    # curriculum stats: [ground FoV high, ground FoV low, aerial FoV high,
-    #                    aerial FoV low, orient offset low-diff, orient offset high-diff]
-    CURRICULUM_STATS = 6
+    # curriculum stats: [semi ground FoV, semi aerial FoV, semi ground/aerial
+    #                    orient offset, full-pair orient misalignment]
+    # - one crop-augmented view per sample, so one value each
+    CURRICULUM_STATS = 4
     # one accumulator slot for the main process + one per DataLoader worker
     CURRICULUM_SLOTS = 65
 
@@ -537,8 +538,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
                 #  many_to_many=False, fovs=[360,270,180,90,70],
                  max_epochs=80,
                  aerial_cropping=True,
-                 discretize_aer_orient=True,
-                 symmetric_same_domain=True):
+                 discretize_aer_orient=True):
 
         super().__init__()
         self.data_folder = data_folder
@@ -550,12 +550,9 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         self.transforms_query1 = transforms_query1
         self.transforms_reference1 = transforms_reference1
         self.unified_aer_grd_transforms = unified_aer_grd_transforms
-        # same-domain (g2g/a2a) targets: True -> LabelGenerator averages the two
-        # directional scores -> symmetric matrix (same-domain sim is symmetric).
-        # False -> asymmetric directional labels (for A/B). Cross-domain g2a/a2g
-        # stay asymmetric regardless.
-        self.symmetric_same_domain = symmetric_same_domain
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        # (there is no symmetric_same_domain switch any more: AngularIoU is
+        # symmetric by construction, so there is no directional variant to pick.)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None, nrows=10000)
         self.discretize_aer_orient = discretize_aer_orient
         self.aerial_cropping = aerial_cropping
         self.epoch = epoch
@@ -607,44 +604,56 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         totals = self.curriculum_stats.sum(dim=0)
         return (totals[:, 0] / totals[:, 1].clamp(min=1.0)).tolist()
 
+    def mean_semi_ground_fov(self):
+        """
+        Mean ground FoV of the crop-augmented views actually drawn since the last
+        shuffle() - shuffle() is what resets the accumulator, so read this after an
+        epoch's training pass and before its shuffle to get that epoch's draws.
+
+        Lets callers follow the real curriculum instead of recomputing a parallel
+        schedule that can drift from it. Returns 0.0 if nothing has been sampled
+        yet (curriculum_means clamps the count), so guard before using it.
+        """
+        return self.curriculum_means()[0]
+
     def get_fovs(self, t, ground=False):
         """
         t: epoch/max_epochs
 
-        return n FoV samples around 360-210(left skewed) 210-60(right skewed)
+        Return ONE FoV for the single crop-augmented view. Ground narrows as the
+        curriculum advances (t); aerial is driven by (1-t), i.e. it starts narrow
+        and widens.
         """
         if ground:
-            fov_h = self.sample_dynamic_range(t, min_value=50, max_value=360)[0]
-            fov_l = self.sample_dynamic_range(t, min_value=55, max_value=210)[0]
-            return fov_h,fov_l
+            fov_aug = self.sample_dynamic_range(t, min_value=50, max_value=360, max_peak_intensity=20)[0]
+            # fov_l = self.sample_dynamic_range(t, min_value=55, max_value=210)[0]
+            return fov_aug #,fov_l
         t = np.clip(t, 0.0, 1.0)
-        fov_h = 360 #self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
+        # fov_h = 360 #self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
         # lets reverse aerial FoV?
-        fov_l = self.sample_dynamic_range((1-t), min_value=135, max_value=360)[0]
-        return fov_h,fov_l
+        fov_aug = self.sample_dynamic_range((1-t), min_value=135, max_value=360)[0]
+        return fov_aug #,fov_l
 
     def get_orientation(self, fov_g, fov_a):
         """
-        fov_h: high fov
-        fov_l: low fov
-        return 4 orientation pairs for 4 ground and aerial image pairs
+        fov_g / fov_a: the sampled ground and aerial FoVs, which cap how far the
+        two headings may drift apart (half their sum) so the pair keeps some
+        overlap.
+        return [ground_heading, aerial_heading] for the one augmented pair
         """
         heading_l = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
-        heading_h = random.choice([0,90,180,270]) if self.discretize_aer_orient else  random.randint(0,359)
         t = float(self.epoch)/self.max_epochs
-        orientation_shift_diff_low = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
+        # orientation_shift_diff_low = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
         # flow orientation needed to ensure at least one sample pair is a postive in a batch
-        orientation_shift_diff_high = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(360,(fov_g+fov_a)//2))[0]
+        orientation_shift_aug = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(180,(fov_g+fov_a)//2))[0]
 
         lor_l= random.choice([1, -1])
-        lor_h = random.choice([1, -1])
-        low_diff_orientation = [(heading_l+(orientation_shift_diff_low * lor_l))%360, heading_l]
-        high_diff_orientation = [(heading_h+(orientation_shift_diff_high * lor_h))%360, heading_h]
+        diff_orientation = [(heading_l+(orientation_shift_aug * lor_l))%360, heading_l]
 
-        return low_diff_orientation, high_diff_orientation
+        return diff_orientation
+    
 
-
-    def sample_dynamic_range(self, t, size=1, min_value=60, max_value=360):
+    def sample_dynamic_range(self, t, size=1, min_value=60, max_value=360, max_peak_intensity=5):
         """
         Samples values from a dynamically morphing distribution bounded between 60 and 360.
         Parameters:
@@ -656,7 +665,6 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         
         # Linear interpolation for Beta parameters to shift shapes smoothly
         # High alpha pushes values right (towards 360). High beta pushes values left (towards 60).
-        max_peak_intensity = 5.0
         alpha = 1.0 + (max_peak_intensity - 1.0) * (1.0 - t)
         beta = 1.0 + (max_peak_intensity - 1.0) * t
         
@@ -669,11 +677,34 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         
         return scaled_samples
 
+    def get_full_orientations(self):
+        """
+        Absolute headings for the UN-CROPPED pair.
+
+        Aerial: a 90/180/270 turn with probability prob_rotate - matching the
+        discretised aerial transform, which floors any angle to a multiple of 90
+        anyway. Ground: a roll whose magnitude follows the curriculum, so the pair
+        starts near-aligned and drifts to arbitrary misalignment late in training.
+
+        Both views span 360 degrees, so neither shift changes their angular
+        COVERAGE and the AngularIoU targets come out the same either way. What
+        changes is the image the backbone sees: the un-cropped pair stops being
+        north-up-aligned by construction, so the model cannot lean on a fixed
+        convention to match them.
+        """
+        aer_orient = random.choice([90, 180, 270]) if np.random.random() < self.prob_rotate else 0
+        t = float(self.epoch) / self.max_epochs
+        # 180 is the ceiling, not 360: orientation offset is circular, so a 300deg
+        # shift IS a 60deg misalignment. Sampling the magnitude over [0, 360] would
+        # make the curriculum fold back on itself and peak mid-training. Signing a
+        # [0, 180] magnitude still reaches every relative orientation.
+        magnitude = self.sample_dynamic_range(t=(1 - t), min_value=0, max_value=180)[0]
+        grd_orient = (magnitude * random.choice([1, -1])) % 360
+        return grd_orient, aer_orient
+
     def get_fovs_and_orientations(self):
-        # 1. sample a pair of high fov images with similar orientations
-        # 2. sample a pair of high fov images with disimilar orientations
-        # 3. sample a pair of low fov images with similar orientations
-        # 4. sample a pair of low fov images with disimilar orientations
+        # sample ONE ground/aerial pair: an FoV per domain plus the two headings
+        # -> [fov_g, fov_a, orient_g, orient_a]
 
         # introducing curriculum learning
             # FOV: fov images gradually reduce mean and increase std_dev
@@ -681,19 +712,14 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             # park this idea: transition from semi positive labels to hard positive labels when IoU > 0.5
         # idea is that the CNN learns not a signature for the image pair but a real object presence in the image pairs
 
-        high_fov_g, low_fov_g = self.get_fovs(self.epoch/self.max_epochs, ground=True)
-        high_fov_a, low_fov_a = self.get_fovs(self.epoch/self.max_epochs)
+        aug_fov_g = self.get_fovs(self.epoch/self.max_epochs, ground=True)
+        aug_fov_a = self.get_fovs(self.epoch/self.max_epochs)
 
 
-        low_fov_low_orientation_diff, low_fov_high_orientation_diff = self.get_orientation(low_fov_g,low_fov_a)
-        high_fov_low_orientation_diff, high_fov_high_orientation_diff = self.get_orientation(high_fov_g, high_fov_a)
-        # ground aerial fov and orientation pairs
+        orientation_diff = self.get_orientation(aug_fov_g,aug_fov_a)
     
         return (
-            [high_fov_g, high_fov_a] + high_fov_low_orientation_diff,
-            [high_fov_g, high_fov_a] + high_fov_high_orientation_diff,
-            [low_fov_g, low_fov_a] + low_fov_low_orientation_diff,
-            [low_fov_g, low_fov_a] + low_fov_high_orientation_diff
+            [aug_fov_g, aug_fov_a] + orientation_diff
         )
         
 
@@ -741,14 +767,27 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             shifts = - w//4 * r
             query_img1 = torch.roll(torch.tensor(query_img1), shifts=shifts, dims=1).numpy()
         
-        # do fov and orientation synchronized augmentation
+        # The UN-CROPPED pair: full 360 FoV on both sides, but each side gets its
+        # OWN heading (see get_full_orientations) so the two are not aligned by
+        # construction. Routed through the exact same transform chain as the
+        # augmented views so it comes out at the same resolution/normalization and
+        # can go through the same backbone - what sets it apart is that nothing is
+        # cropped away, which is the clean retrieval problem the trainer scores
+        # under its own loss weight.
+        full_grd_orient, full_aer_orient = self.get_full_orientations()
+        grd_full, aer_full = self.unified_aer_grd_transforms(image1=query_img1, image2=reference_img1, fov=360, aerial_fov=360, grd_orientation_shift=full_grd_orient, aer_orientation_shift=full_aer_orient, pad=True)
+        query_full = self.standard_transform_grd(image=grd_full)["image"]
+        reference_full = self.standard_transform_aer(image=aer_full)["image"]
+
+        # do fov and orientation synchronized augmentation. get_fovs_and_orientations
+        # yields ONE [fov_g, fov_a, orient_g, orient_a] sample, so there is a single
+        # crop-augmented view per location and every target block below is 1x1; the
+        # collate's block_diag then makes each batch-level target a plain diagonal,
+        # i.e. a view's only positive is its own counterpart from the same location.
+        samples = [self.get_fovs_and_orientations()]
+        n_aug = len(samples)
         queries = []
         references = []
-        labels_g2a = torch.zeros([4,4]) # [i,j] ith ground image to jth aerial image
-        labels_a2g = torch.zeros([4,4]) # [i,j] ith aerial image to jth ground image
-        labels_g2g = torch.zeros([4,4])
-        labels_a2a = torch.zeros([4,4])
-        samples = self.get_fovs_and_orientations()
 
         # Instrumentation: track the ACTUAL sampled curriculum values so the log
         # reflects what the network trains on (not the cosmetic schedules printed
@@ -757,12 +796,10 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             d = abs(float(a) - float(b)) % 360.0
             return min(d, 360.0 - d)
         self.update_curriculum_stats((
-            samples[0][0],                          # ground high FoV
-            samples[3][0],                          # ground low FoV
-            samples[0][1],                          # aerial high FoV
-            samples[3][1],                          # aerial low FoV
-            _circ_off(samples[2][2], samples[2][3]),  # low-diff orientation offset
-            _circ_off(samples[3][2], samples[3][3]),  # high-diff orientation offset
+            samples[0][0],                            # ground FoV
+            samples[0][1],                            # aerial FoV
+            _circ_off(samples[0][2], samples[0][3]),  # semi ground/aerial orientation offset
+            _circ_off(full_grd_orient, full_aer_orient),  # full-pair misalignment
         ))
 
         for fov_g, fov_a, orient_g, orient_a in samples:
@@ -776,30 +813,49 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         orient_gs = [s[2] for s in samples]
         orient_as = [s[3] for s in samples]
 
-        for i,[fov_g,orient_g] in enumerate(zip(fov_gs, orient_gs)):
-            for j,[fov_a, orient_a]in enumerate(zip(fov_as, orient_as)):
-                g2a_score, a2g_score =  LabelGenerator(fov_a, fov_g, orient_a, orient_g)
-                labels_g2a[i,j] = g2a_score
-                labels_a2g[j,i] = a2g_score
-        # same-domain targets. symmetric=True -> both returned scores equal
-        # (average of the two directions) -> symmetric matrix, which the loss's
-        # symmetric same-domain similarity can realize. symmetric=False keeps
-        # the asymmetric variant; index [1] is the coverage of anchor i's own
-        # FoV, which is what belongs at [i,j].
-        sym = self.symmetric_same_domain
-        same_idx = 0 if sym else 1
-        for i,[fov_g1,orient_g1] in enumerate(zip(fov_gs, orient_gs)):
-            for j,[fov_g2,orient_g2] in enumerate(zip(fov_gs, orient_gs)):
-                labels_g2g[i,j] = LabelGenerator(fov_g1, fov_g2, orient_g1, orient_g2, symmetric=sym)[same_idx]
-        for i,[fov_a1,orient_a1] in enumerate(zip(fov_as, orient_as)):
-            for j,[fov_a2,orient_a2] in enumerate(zip(fov_as, orient_as)):
-                labels_a2a[i,j] = LabelGenerator(fov_a1, fov_a2, orient_a1, orient_a2, symmetric=sym)[same_idx]
+        # ---- targets -------------------------------------------------------
+        # One target matrix per PAIRING of view sets, so the trainer can score and
+        # weight each retrieval regime on its own. Naming is [rows]2[cols], where a
+        # bare q/r means the un-cropped ("full") view and q_semi/r_semi the
+        # augmented ones.
+        #
+        # AngularIoU is symmetric and single-valued, so each pairing needs exactly
+        # ONE matrix - the reverse direction is its transpose, which the trainer
+        # takes with .t(). That is what LabelGenerator could not do: its two
+        # one-sided coverages differ, so it needed a matrix per direction.
+        FULL_FOV = 360.0
+        grd_views     = list(zip(fov_gs, orient_gs))
+        aer_views     = list(zip(fov_as, orient_as))
+        grd_full_view = [(FULL_FOV, full_grd_orient)]
+        aer_full_view = [(FULL_FOV, full_aer_orient)]
 
+        def _iou_block(rows, cols):
+            m = torch.zeros(len(rows), len(cols))
+            for i, (fov1, orient1) in enumerate(rows):
+                for j, (fov2, orient2) in enumerate(cols):
+                    m[i, j] = AngularIoU(fov1, fov2, orient1, orient2)
+            return m
+
+        # A 360-span view covers the whole circle, so its heading does not move its
+        # angular coverage: every block involving a full view is orientation-free
+        # (q2r is always 1.0, and the mixed ones reduce to semi_fov/360). The
+        # headings are still threaded through rather than hard-coded to 0, so these
+        # stay correct if a "full" view ever stops being a true 360.
+        label_q2r           = _iou_block(grd_full_view, aer_full_view)  # [1, 1]
+        label_q2r_semi      = _iou_block(grd_full_view, aer_views)      # [1, n_aug]
+        label_q_semi2r      = _iou_block(grd_views,     aer_full_view)  # [n_aug, 1]
+        label_q_semi2r_semi = _iou_block(grd_views,     aer_views)      # [n_aug, n_aug]
+        label_q2q_semi      = _iou_block(grd_full_view, grd_views)      # [1, n_aug] same domain
+        label_r2r_semi      = _iou_block(aer_full_view, aer_views)      # [1, n_aug] same domain
 
         label = torch.tensor(idx, dtype=torch.long)
         queries = torch.stack(queries)
         references = torch.stack(references)
-        return queries,references, label, labels_g2a, labels_a2g, labels_g2g, labels_a2a
+        # un-cropped pair kept separate from the crop-augmented views so the two
+        # retrieval regimes can be weighted independently in the loss
+        return (query_full, reference_full, queries, references, label,
+                label_q2r, label_q2r_semi, label_q_semi2r, label_q_semi2r_semi,
+                label_q2q_semi, label_r2r_semi)
     
     def __len__(self):
         return len(self.samples)
@@ -912,10 +968,11 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             print("Break Counter:", break_counter)
             print("Pairs left out of last batch to avoid creating noise:", len(self.train_ids) - len(self.samples))
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
-            fovh_g, fovl_g, fovh_a, fovl_a, orient_low, orient_high = self.curriculum_means()
+            fov_g, fov_a, orient_off, full_orient_off = self.curriculum_means()
             print("Curriculum (epoch {} means from actual training samples):".format(self.epoch))
-            print("  Ground FoV  high/low: {:.1f} / {:.1f}".format(fovh_g, fovl_g))
-            print("  Aerial FoV  high/low: {:.1f} / {:.1f}".format(fovh_a, fovl_a))
-            print("  Orient off  low/high: {:.1f} / {:.1f}".format(orient_low, orient_high))
+            print("  Semi ground FoV:        {:.1f}".format(fov_g))
+            print("  Semi aerial FoV:        {:.1f}".format(fov_a))
+            print("  Semi orient offset:     {:.1f}".format(orient_off))
+            print("  Full-pair misalignment: {:.1f}".format(full_orient_off))
 
             self.curriculum_stats.zero_()

@@ -6,7 +6,7 @@ import random
 import torch
 import pickle
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -16,8 +16,8 @@ from singeo.transforms import LimitedFoVCropGrdAerPair, get_transforms_train_sin
 from singeo.transforms import get_dynamic_fov, get_n_fovs, get_beta_distribution_mean, get_dynamic_a2g_weight
 
 from singeo.utils import setup_system, Logger
-from singeo.trainer_supcon_w_aeraug import train_contrast_singeo
-from singeo.loss import InfoNCE, SupervisedInfoNCE
+from singeo.trainer_supcon_w_aeraug import train_contrast_singeo, PAIRING_NAMES
+from singeo.loss import InfoNCE, SupervisedInfoNCE, PairwiseSigmoidBCE
 from singeo.model import TimmModel_SinGeo_SemiPositives
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 
@@ -46,12 +46,12 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    gps_dict_path: str = "./data/CVUSA/gps_dict.pkl"   # path to pre-computed distances
+    gps_dict_path: str = "./data/CVUSA/gps_dict_10k.pkl"   # path to pre-computed distances
     
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 4        # eval every n Epoch
+    eval_every_n_epoch: int = 2        # eval every n Epoch
     normalize_features: bool = True
     eval_fov_180: bool = True          # if True, also evaluate at 180 FoV alongside the primary (90) FoV
 
@@ -67,9 +67,25 @@ class Configuration:
                                         # aerial FoV curriculum widens and g2a saturates, so a2g's
                                         # geometrically-capped target doesn't dominate the shared
                                         # ground<->aerial similarity gradient unopposed
-    symmetric_same_domain: bool = True  # g2g/a2a targets symmetric (required - same-domain sim is
-                                        # symmetric; asymmetric targets stall the loss). False = old
-                                        # asymmetric variant, for A/B only.
+    # (symmetric_same_domain is gone: AngularIoU is symmetric by construction, so there is
+    # no directional variant left to select.)
+    # Weight per PAIRING of view sets. A bare q/r is the un-cropped ("full") 360-FoV view,
+    # a _semi suffix the crop-augmented one; the name reads [rows]2[cols]. Every pairing is
+    # scored by both objectives below. Read the per-pairing breakdown in the epoch log to see
+    # the raw magnitudes before tuning these.
+    pairing_weights: dict = field(default_factory=lambda: {
+        "q2r":           1.0,   # full ground   <-> full aerial   (IoU is always 1.0)
+        "q2r_semi":      .25,   # full ground   <-> semi aerial
+        "q_semi2r":      .25,   # semi ground   <-> full aerial
+        "q_semi2r_semi": .25,   # semi ground   <-> semi aerial
+        "q2q_semi":      0.5,   # full ground   <-> semi ground   (same domain)
+        "r2r_semi":      0.5,   # full aerial   <-> semi aerial   (same domain)
+    })
+    # Balance of the two objectives, applied to every pairing. InfoNCE ranks candidates
+    # against a BINARY target (is this pair a positive at all); PairwiseSigmoidBCE regresses
+    # the similarity onto the AngularIoU so the actual overlap fraction reaches the gradient.
+    infonce_weight: float = 1.0
+    bce_weight: float = .5
     
     # Learning Rate
     lr: float = 0.0001
@@ -214,61 +230,36 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
                                       max_epochs = config.epochs,
-                                      aerial_cropping=True, discretize_aer_orient=True,
-                                      symmetric_same_domain=config.symmetric_same_domain
+                                      aerial_cropping=True, discretize_aer_orient=True
                                       )
 
-    def variable_size_collate(batch):
-        # query_img1, query_img2, reference_img1, reference_img2, label
-        q1, q2, r1, r2, labels = zip(*batch)
-        max_h = max(img.shape[1] for img in q2)
-        max_w = max(img.shape[2] for img in q2)
-
-        padded = torch.zeros(len(q2), q1[0].shape[0], max_h, max_w)
-        masks = torch.zeros(len(q2), max_h, max_w, dtype=torch.bool)
-
-        for i,img in enumerate(q2):
-            padded[i, :, :img.shape[1], :img.shape[2]] = img
-            masks[i, :img.shape[1], :img.shape[2]] = True
-
-        query_image1 = torch.stack(q1)
-        query_image2 = padded
-        reference_image1 = torch.stack(r1)
-        reference_image2 = torch.stack(r2)
-        # query_img, reference_img, label
-        # Return images as a raw list, but turn labels into a standard tensor
-        labels = torch.tensor(labels, dtype=torch.long)
-        return query_image1, query_image2, reference_image1, reference_image2, labels
-
-    def variable_size_collate_test(batch):
-        # query_img1, query_img2, reference_img1, reference_img2, label
-        image, labels = zip(*batch)
-        max_h = max(img.shape[1] for img in image)
-        max_w = max(img.shape[2] for img in image)
-
-        padded = torch.zeros(len(image), image[0].shape[0], max_h, max_w)
-        masks = torch.zeros(len(image), max_h, max_w, dtype=torch.bool)
-
-        for i,img in enumerate(image):
-            padded[i, :, :img.shape[1], :img.shape[2]] = img
-            masks[i, :img.shape[1], :img.shape[2]] = True
-
-        image = padded
-    
-        labels = torch.tensor(labels, dtype=torch.long)
-        return image, labels
 
     def shuffle_collate_function(batch, permute_views: bool = True):
         """
-        batch: queries,references, label, labels
-        queries - ground level images
-        references - aerial view iamges
+        batch: query_full, reference_full, queries, references, label, labels
+        query_full / reference_full - the UN-CROPPED (360 FoV, no orientation
+            shift) ground/aerial pair. One per sample, returned as its own
+            [B, C, H, W] batch so the trainer can score it against plain identity
+            targets and weight that term separately from the crop-augmented one.
+            Deliberately NOT view-permuted: row i stays paired with row i.
+        queries - crop-augmented ground level images
+        references - crop-augmented aerial view iamges
         label - ids
-        labels_g2a - N,[4,4] tensor containing the labels ground to aerial of each samples' augmentations based on I
-        labels_a2g - N,[4,4] tensor containing the labels aerial to ground of each samples' augmentations based on I
+        label_* - one AngularIoU target block per pairing of view sets. A full
+            view contributes 1 row/col per sample and a semi view A of them, so
+            per-sample blocks are [1,1], [1,A], [A,1] or [A,A] and block_diag
+            takes them to [B,B], [B,B*A], [B*A,B] or [B*A,B*A]. A is the number
+            of crop-augmented views per sample (currently 1, so all six come out
+            [B, B]). Off the block diagonal everything is zero - views of
+            different locations are negatives for each other.
         """
-        # queries,references, label, labels_g2a, labels_a2g, labels_g2g, labels_a2a
-        query_images, reference_images, ids, labels_g2a, labels_a2g, labels_g2g, labels_a2a = zip(*batch)
+        # query_full, reference_full, queries, references, label, <6 target blocks>
+        (query_full, reference_full, query_images, reference_images, ids,
+         label_q2r, label_q2r_semi, label_q_semi2r, label_q_semi2r_semi,
+         label_q2q_semi, label_r2r_semi) = zip(*batch)
+
+        query_full = torch.stack(query_full)               # [B, C, H, W]
+        reference_full = torch.stack(reference_full)       # [B, C, H, W]
 
         query_images = torch.stack(query_images)          # [B, A, C, H, W]
         reference_images = torch.stack(reference_images)   # [B, A, C, H, W]
@@ -277,31 +268,33 @@ if __name__ == '__main__':
         query_images = query_images.reshape(B * A, *query_images.shape[2:])
         reference_images = reference_images.reshape(B * A, *reference_images.shape[2:])
 
-        labels_g2a = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_g2a]
-        labels_a2g = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_a2g]
-        labels_g2g = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_g2g]
-        labels_a2a = [x if isinstance(x, torch.Tensor) else torch.as_tensor(x) for x in labels_a2a]
-
-        label_g2a_batch = torch.block_diag(*labels_g2a)  # (4B, 4B)
-        label_a2g_batch = torch.block_diag(*labels_a2g)  # (4B, 4B)
-        label_g2g_batch = torch.block_diag(*labels_g2g)
-        label_a2a_batch = torch.block_diag(*labels_a2a)
+        label_q2r = torch.block_diag(*label_q2r)                      # [B, B]
+        label_q2r_semi = torch.block_diag(*label_q2r_semi)            # [B, B*A]
+        label_q_semi2r = torch.block_diag(*label_q_semi2r)            # [B*A, B]
+        label_q_semi2r_semi = torch.block_diag(*label_q_semi2r_semi)  # [B*A, B*A]
+        label_q2q_semi = torch.block_diag(*label_q2q_semi)            # [B, B*A]
+        label_r2r_semi = torch.block_diag(*label_r2r_semi)            # [B, B*A]
 
         if permute_views:
+            # Shuffle the semi views so a location's crop does not sit at a fixed
+            # offset in the batch. The full views are one row per sample and stay
+            # put, so only the axes indexed by a semi view get permuted.
             perm_q = torch.randperm(B * A)
             perm_r = torch.randperm(B * A)
 
             query_images = query_images[perm_q]
             reference_images = reference_images[perm_r]
 
-            label_g2a_batch = label_g2a_batch[perm_q][:, perm_r]
-            label_a2g_batch = label_a2g_batch[perm_r][:, perm_q]
-            label_g2g_batch = label_g2g_batch[perm_q][:, perm_q]
-            label_a2a_batch = label_a2a_batch[perm_r][:, perm_r]
+            label_q2r_semi = label_q2r_semi[:, perm_r]
+            label_q_semi2r = label_q_semi2r[perm_q]
+            label_q_semi2r_semi = label_q_semi2r_semi[perm_q][:, perm_r]
+            label_q2q_semi = label_q2q_semi[:, perm_q]
+            label_r2r_semi = label_r2r_semi[:, perm_r]
+            # label_q2r is full-vs-full on both axes - nothing to permute
 
-        return query_images, reference_images, label_g2a_batch, label_a2g_batch, label_g2g_batch, label_a2a_batch
-
-        # return query_images, reference_images, target_matrix, query_target_matrix, reference_target_matrix
+        return (query_full, reference_full, query_images, reference_images,
+                label_q2r, label_q2r_semi, label_q_semi2r, label_q_semi2r_semi,
+                label_q2q_semi, label_r2r_semi)
 
 
 
@@ -424,11 +417,15 @@ if __name__ == '__main__':
     # Loss                                                                        #
     #-----------------------------------------------------------------------------#
 
-    print("Using InfoNCE Loss")
+    print("Using InfoNCE Loss (binary targets) + PairwiseSigmoidBCE (AngularIoU targets)")
     loss_function = SupervisedInfoNCE(
                         device=config.device,
                         label_smoothing=config.label_smoothing,
                         )
+    # absolute-value objective: keeps the overlap fraction that InfoNCE's row
+    # normalization would otherwise discard. Its temperature/bias are parameters on
+    # the model (bce_logit_scale / bce_logit_bias), so the optimizer trains them.
+    bce_loss_function = PairwiseSigmoidBCE(device=config.device)
 
     if config.mixed_precision:
         scaler = GradScaler(init_scale=2.**10)
@@ -583,10 +580,8 @@ if __name__ == '__main__':
         # was dead code (the transform assignment below it is commented out), so it
         # is removed to avoid implying a schedule that never runs.
 
-        # modulate the fov of the ground branch
-        fov_dynamic = get_beta_distribution_mean(epoch,config.epochs, max_value=270, min_value=50)
-        # fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
-        # 4 positive FoV crops for epoch
+        # (fov_dynamic is no longer computed from a schedule here - it is read off
+        # the dataset's actual sampled ground FoV after the training pass below.)
         
         # _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
         #                                                         img_size_ground,
@@ -595,41 +590,60 @@ if __name__ == '__main__':
         #                                                         fov=fov_dynamic, fovs = fov_ranges)
 
         # modulate the Fov of sim-sampling at the same time
-        _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
-                                                        img_size_ground,
-                                                        mean=mean,
-                                                        std=std,
-                                                        fov=fov_dynamic,
-                                                        )
-        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample 
         # train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
         train_dataloader.dataset.set_epoch(epoch)
-        print(f"For Epoch {epoch}: Sim-sampling ground FOV = {fov_dynamic:.4f} "
-              f"(hard-neighbour mining only; NOT the training-crop FoV -- the actual "
-              f"training curriculum means are printed under 'Shuffle Dataset')")
-
-        # anneal loss_a2g's weight down as the aerial FoV curriculum widens
-        a2g_weight = get_dynamic_a2g_weight(epoch, config.epochs,
-                                            w_start=config.a2g_weight_start,
-                                            w_end=config.a2g_weight_end)
-        print(f"For Epoch {epoch}: a2g loss weight = {a2g_weight:.4f}")
-
+        
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
 
 
-        train_loss, g2a_loss, a2g_loss, g2g_loss, a2a_loss = train_contrast_singeo(config,
+        train_loss, loss_terms = train_contrast_singeo(config,
                         model,
                         dataloader=train_dataloader,
                         loss_function=loss_function,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         scaler=scaler,
-                        a2g_weight=a2g_weight)
-        
+                        bce_loss_function=bce_loss_function,
+                        pairing_weights=config.pairing_weights,
+                        infonce_weight=config.infonce_weight,
+                        bce_weight=config.bce_weight)
+
         print("Epoch: {}, Train Loss = {:.3f}, Lr = {:.6f}".format(epoch,
                                                                    train_loss,
                                                                    optimizer.param_groups[0]['lr']))
-        print("g2a_loss:{}, a2g_loss:{}, g2g_loss:{}, a2a_loss:{}".format(g2a_loss, a2g_loss, g2g_loss, a2a_loss))
+        # raw (unweighted) magnitude of each pairing under each objective - tune
+        # config.pairing_weights / infonce_weight / bce_weight against these
+        print("Per-pairing loss (unweighted):")
+        print("  {:<16s} {:>10s} {:>10s} {:>8s}".format("pairing", "infonce", "bce", "weight"))
+        for name in PAIRING_NAMES:
+            print("  {:<16s} {:>10.4f} {:>10.4f} {:>8.2f}".format(
+                name, loss_terms[f"{name}_nce"], loss_terms[f"{name}_bce"],
+                config.pairing_weights.get(name, 1.0)))
+
+        # Sim-sampling FoV now FOLLOWS the training crop instead of running its own
+        # parallel schedule: take the mean ground FoV the dataset actually drew this
+        # epoch. Read here, after the training pass and before the shuffle below -
+        # shuffle() is what resets the accumulator, so at this point it holds
+        # exactly this epoch's draws. Falls back to the previous cosmetic schedule
+        # only if nothing was accumulated (an epoch that trained no batches).
+        fov_dynamic = train_dataloader.dataset.mean_semi_ground_fov()
+        if fov_dynamic <= 0.0:
+            fov_dynamic = get_beta_distribution_mean(epoch, config.epochs, max_value=360, min_value=50)
+            print(f"For Epoch {epoch}: no curriculum samples accumulated - falling back "
+                  f"to the scheduled sim-sampling FoV")
+        fov_dynamic = float(np.clip(fov_dynamic, 50.0, 360.0))
+        print(f"For Epoch {epoch}: Sim-sampling ground FOV = {fov_dynamic:.4f} "
+              f"(mean ground FoV of this epoch's actual training crops, so hard-neighbour "
+              f"mining sees the same FoV the model was trained at)")
+
+        _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
+                                                                img_size_ground,
+                                                                mean=mean,
+                                                                std=std,
+                                                                fov=fov_dynamic,
+                                                                )
+        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
+
 
         # evaluate
         if (epoch % config.eval_every_n_epoch == 0 and epoch != 0) or epoch == config.epochs:

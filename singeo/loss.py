@@ -59,6 +59,43 @@ class SupervisedInfoNCE(nn.Module):
         else:
             return loss_g2a
 
+class PairwiseSigmoidBCE(nn.Module):
+    """
+    Absolute-value objective: regress every pair's cosine similarity onto its
+    AngularIoU, each pair scored independently.
+
+    Complements SupervisedInfoNCE rather than replacing it. InfoNCE normalizes each
+    row of its target into a distribution over candidates, so it can only express
+    which candidate is MORE likely - the absolute magnitude of a soft label is
+    discarded (a row with a single positive normalizes to 1.0 no matter what its
+    overlap was). That is why InfoNCE is fed a BINARY target here and this loss
+    carries the geometry: sigmoid(scale * cos + bias) is pushed toward the IoU, so
+    a pair sharing a third of its view is driven to a genuinely lower similarity
+    than one sharing all of it, and cross-location pairs (IoU 0) toward zero.
+
+    `scale` and `bias` are supplied by the caller (they live on the model next to
+    logit_scale, so the optimizer and checkpoints pick them up) and are deliberately
+    NOT the InfoNCE logit_scale: a peaky softmax temperature and a calibrated
+    probability temperature want different values and would otherwise fight over one
+    parameter. The bias starts strongly negative because a BxB target is
+    overwhelmingly near-zero off the block diagonal - SigLIP's trick, without which
+    the early steps are swamped by simply driving every pair to 0.
+    """
+
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        super().__init__()
+        self.device = device
+
+    def forward(self, features_a, features_b, logit_scale, logit_bias, targets):
+        a = F.normalize(features_a, dim=-1)
+        b = F.normalize(features_b, dim=-1)
+
+        logits = logit_scale * (a @ b.t()) + logit_bias
+
+        return F.binary_cross_entropy_with_logits(
+            logits.float(), targets.float(), reduction="mean")
+
+
 class InfoNCE(nn.Module):
 
     def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu'):

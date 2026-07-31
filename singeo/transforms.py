@@ -53,7 +53,7 @@ def get_dynamic_a2g_weight(epoch, max_epoch, w_start=1.0, w_end=0.3):
     """
     return w_start - (w_start - w_end) * (epoch / max_epoch)
 
-def get_beta_distribution_mean(epoch,max_epoch,max_peak = 5, min_value=60, max_value=360):
+def get_beta_distribution_mean(epoch,max_epoch,max_peak = 20, min_value=60, max_value=360):
     t = epoch/float(max_epoch)
     alpha = 1.0 + (max_peak - 1.0) * (1.0 - t)
     beta = 1.0 + (max_peak - 1.0) * t

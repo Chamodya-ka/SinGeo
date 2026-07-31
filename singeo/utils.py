@@ -9,6 +9,53 @@ import numpy as np
 from datetime import timedelta
 
 
+def sector_intersection(fov_a, fov_g, orient_a, orient_g):
+    """
+    Angular overlap, in DEGREES, between two circular sectors given as
+    (fov, centre orientation). Handles wrap past the 0/360 seam and spans of
+    360 or more. This is the shared numerator behind both label formulations:
+    AngularIoU divides it by the union, LabelGenerator by each side's own FoV.
+    """
+    aerial_segs = _circular_segments(orient_a - fov_a / 2.0, orient_a + fov_a / 2.0)
+    ground_segs = _circular_segments(orient_g - fov_g / 2.0, orient_g + fov_g / 2.0)
+    return _segments_overlap_length(aerial_segs, ground_segs)
+
+
+def AngularIoU(fov_a, fov_g, orient_a, orient_g):
+    """
+    Symmetric angular intersection-over-union: overlap / union, in [0, 1].
+
+    This is the target for the ABSOLUTE-value objective
+    (loss.PairwiseSigmoidBCE), and it is deliberately a different quantity from
+    utils.LabelGenerator's two directional coverages:
+
+      - LabelGenerator returns a pair of one-sided scores whose only job is to
+        shape a categorical distribution over candidates. Softmax cross-entropy
+        row-normalizes them (see loss.SupervisedInfoNCE._multi_positive_ce), so
+        their absolute magnitude is discarded - only within-row ratios survive.
+      - cos(g_i, a_j) is ONE number per pair, so an absolute-value objective can
+        only be trained against ONE symmetric target per pair. IoU is that
+        target, and it encodes exactly the "the ground crop sees at most
+        grd_fov/aerial_fov of what the aerial tile sees" intent: under
+        engulfment (narrow ground wedge inside a wide aerial one) union ==
+        aerial_fov and overlap == grd_fov, so IoU == grd_fov/aerial_fov. Unlike
+        overlap/aerial_fov it stays correct in the other direction too (a
+        panorama against a narrow aerial wedge caps at aerial_fov/grd_fov rather
+        than reporting 1.0).
+
+    No `sharpness` curve and no `floor` here, on purpose. Both of those exist to
+    reshape a probability distribution; applied to an absolute target they would
+    just be a lie about how much of the scene is actually shared. Disjoint
+    wedges return exactly 0, which is also the target used for cross-location
+    pairs - correct, since neither shares any content.
+    """
+    intersection = sector_intersection(fov_a, fov_g, orient_a, orient_g)
+    # the min() clamps a >360 span so it cannot inflate the union
+    union = min(float(fov_a) + float(fov_g) - intersection, 360.0)
+    if union <= 0.0:
+        return 0.0
+    return intersection / union
+
 def _circular_segments(start: float, end: float):
     """
     Splits a (possibly wrapping, possibly >360-span) angular interval into
