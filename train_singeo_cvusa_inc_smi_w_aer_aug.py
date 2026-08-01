@@ -70,20 +70,22 @@ class Configuration:
     # (symmetric_same_domain is gone: AngularIoU is symmetric by construction, so there is
     # no directional variant left to select.)
     # Weight per PAIRING of view sets. A bare q/r is the un-cropped ("full") 360-FoV view,
-    # a _semi suffix the crop-augmented one; the name reads [rows]2[cols]. Every pairing is
-    # scored by both objectives below. Read the per-pairing breakdown in the epoch log to see
-    # the raw magnitudes before tuning these.
+    # a _semi suffix the crop-augmented one; the name reads [rows]2[cols]. Which objectives
+    # each pairing is scored by is set in trainer_supcon_w_aeraug.PAIRING_OBJECTIVES and noted
+    # per line below. Read the per-pairing breakdown in the epoch log to see the raw magnitudes
+    # before tuning these.
     pairing_weights: dict = field(default_factory=lambda: {
-        "q2r":           1.0,   # full ground   <-> full aerial   (IoU is always 1.0)
-        "q2r_semi":      .25,   # full ground   <-> semi aerial
-        "q_semi2r":      .25,   # semi ground   <-> full aerial
-        "q_semi2r_semi": .25,   # semi ground   <-> semi aerial
-        "q2q_semi":      0.5,   # full ground   <-> semi ground   (same domain)
-        "r2r_semi":      0.5,   # full aerial   <-> semi aerial   (same domain)
+        "q2r":           1.0,   # full ground   <-> full aerial   (nce)       (IoU is always 1.0)
+        "q2r_semi":      .25,   # full ground   <-> semi aerial   (bce)
+        "q_semi2r":      .25,   # semi ground   <-> full aerial   (nce)
+        "q_semi2r_semi": .25,   # semi ground   <-> semi aerial   (bce)
+        "q2q_semi":      0.5,   # full ground   <-> semi ground   (nce+bce)   (same domain)
+        "r2r_semi":      0.5,   # full aerial   <-> semi aerial   (nce+bce)   (same domain)
     })
-    # Balance of the two objectives, applied to every pairing. InfoNCE ranks candidates
-    # against a BINARY target (is this pair a positive at all); PairwiseSigmoidBCE regresses
-    # the similarity onto the AngularIoU so the actual overlap fraction reaches the gradient.
+    # Balance of the two objectives, applied wherever a pairing runs them. InfoNCE ranks
+    # candidates against a BINARY target (is this pair a positive at all); PairwiseSigmoidBCE
+    # regresses the similarity onto the AngularIoU so the actual overlap fraction reaches the
+    # gradient.
     infonce_weight: float = 1.0
     bce_weight: float = .5
     
@@ -97,11 +99,11 @@ class Configuration:
     data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
     
     # Augment Images
-    prob_rotate: float = 0.5          # rotates the sat image and ground images simultaneously
+    prob_rotate: float = 0.0       
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
     # Savepath for model checkpoints
-    model_path: str = "./singeo_cvusa"
+    model_path: str = "/home/71/25021871/data/data/singeo/checkpoints"
     
     # Eval before training
     zero_shot: bool = False
@@ -213,7 +215,7 @@ if __name__ == '__main__':
                                                                 img_size_ground,
                                                                 mean=mean,
                                                                 std=std,
-                                                                discretize_aer_orient=True
+                                                                discretize_aer_orient=False
                                                                 )
                                                                    
     # unified_transform = LimitedFoVCropGrdAerPair(fov=360, aerial_fov=360, grd_orientation_shift=45, aer_orientation_shift=45)                                                             
@@ -230,7 +232,7 @@ if __name__ == '__main__':
                                       prob_rotate=config.prob_rotate,
                                       shuffle_batch_size=config.batch_size,
                                       max_epochs = config.epochs,
-                                      aerial_cropping=True, discretize_aer_orient=True
+                                      aerial_cropping=True, discretize_aer_orient=False
                                       )
 
 
@@ -616,8 +618,12 @@ if __name__ == '__main__':
         print("Per-pairing loss (unweighted):")
         print("  {:<16s} {:>10s} {:>10s} {:>8s}".format("pairing", "infonce", "bce", "weight"))
         for name in PAIRING_NAMES:
-            print("  {:<16s} {:>10.4f} {:>10.4f} {:>8.2f}".format(
-                name, loss_terms[f"{name}_nce"], loss_terms[f"{name}_bce"],
+            # a pairing only runs the objectives listed in PAIRING_OBJECTIVES, so
+            # the column for one it does not run is blank rather than 0.0000
+            cell = lambda key: ("{:>10.4f}".format(loss_terms[key])
+                                if key in loss_terms else "{:>10s}".format("-"))
+            print("  {:<16s} {} {} {:>8.2f}".format(
+                name, cell(f"{name}_nce"), cell(f"{name}_bce"),
                 config.pairing_weights.get(name, 1.0)))
 
         # Sim-sampling FoV now FOLLOWS the training crop instead of running its own
@@ -631,7 +637,7 @@ if __name__ == '__main__':
             fov_dynamic = get_beta_distribution_mean(epoch, config.epochs, max_value=360, min_value=50)
             print(f"For Epoch {epoch}: no curriculum samples accumulated - falling back "
                   f"to the scheduled sim-sampling FoV")
-        fov_dynamic = float(np.clip(fov_dynamic, 50.0, 360.0))
+        fov_dynamic = float(np.clip(fov_dynamic, 70.0, 360.0))
         print(f"For Epoch {epoch}: Sim-sampling ground FOV = {fov_dynamic:.4f} "
               f"(mean ground FoV of this epoch's actual training crops, so hard-neighbour "
               f"mining sees the same FoV the model was trained at)")

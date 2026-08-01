@@ -591,6 +591,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+        self.prob_rotate = min(1,self.prob_rotate+1/self.max_epochs)
 
     def update_curriculum_stats(self, values):
         worker = get_worker_info()
@@ -630,8 +631,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
             return fov_aug #,fov_l
         t = np.clip(t, 0.0, 1.0)
         # fov_h = 360 #self.sample_dynamic_range(t, min_value=270, max_value=360)[0]
-        # lets reverse aerial FoV?
-        fov_aug = self.sample_dynamic_range((1-t), min_value=135, max_value=360)[0]
+        fov_aug = self.sample_dynamic_range(t, min_value=135, max_value=360, max_peak_intensity=20)[0]
         return fov_aug #,fov_l
 
     def get_orientation(self, fov_g, fov_a):
@@ -645,7 +645,7 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         t = float(self.epoch)/self.max_epochs
         # orientation_shift_diff_low = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(80,(fov_g+fov_a)//2))[0]
         # flow orientation needed to ensure at least one sample pair is a postive in a batch
-        orientation_shift_aug = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(180,(fov_g+fov_a)//2))[0]
+        orientation_shift_aug = self.sample_dynamic_range(t=(1-t),min_value=0, max_value=min(180,(fov_g+fov_a)//2), max_peak_intensity=15)[0]
 
         lor_l= random.choice([1, -1])
         diff_orientation = [(heading_l+(orientation_shift_aug * lor_l))%360, heading_l]
@@ -692,13 +692,13 @@ class CVUSADatasetTrainSinGeoUnifiedAugmentation(Dataset):
         north-up-aligned by construction, so the model cannot lean on a fixed
         convention to match them.
         """
-        aer_orient = random.choice([90, 180, 270]) if np.random.random() < self.prob_rotate else 0
+        aer_orient = random.choice([0, 90, 180, 270]) if np.random.random() < self.prob_rotate else 0
         t = float(self.epoch) / self.max_epochs
         # 180 is the ceiling, not 360: orientation offset is circular, so a 300deg
         # shift IS a 60deg misalignment. Sampling the magnitude over [0, 360] would
         # make the curriculum fold back on itself and peak mid-training. Signing a
         # [0, 180] magnitude still reaches every relative orientation.
-        magnitude = self.sample_dynamic_range(t=(1 - t), min_value=0, max_value=180)[0]
+        magnitude = self.sample_dynamic_range(t=(1-t), min_value=0, max_value=180)[0] # 1-t because t ->1 output goes to max value
         grd_orient = (magnitude * random.choice([1, -1])) % 360
         return grd_orient, aer_orient
 

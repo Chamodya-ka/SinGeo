@@ -24,6 +24,44 @@ def build_supervised_labels(batch_size, device):
 PAIRING_NAMES = ("q2r", "q2r_semi", "q_semi2r", "q_semi2r_semi", "q2q_semi", "r2r_semi")
 
 
+# Which objectives each pairing is trained under.
+#
+# InfoNCE only runs where a FULL view - the un-cropped panorama or the whole
+# aerial tile - is one side of the pair. A full view spans the entire 360, so it
+# necessarily overlaps whatever crop it is matched against: the same-location
+# pair really is a positive and pulling it above the other locations is a claim
+# the geometry supports. Once BOTH sides are crop-augmented that guarantee is
+# gone - two wedges of the same location can face opposite ways and share
+# nothing - so demanding they rank first would be enforcing a similarity that
+# isn't there. Those pairings (q2r_semi, q_semi2r_semi) are left to BCE, which
+# regresses each pair onto its AngularIoU independently and is therefore free to
+# say "these two views of one location have nothing in common".
+#
+# BCE is dropped on the two cross-domain pairings against the full aerial tile,
+# because those ARE the retrieval pairing: at test time a ground query (often a
+# limited-FoV one) is scored against whole aerial tiles, and that score wants to
+# be as high as it can get for the true match. Their IoU diagonal is only
+# grd_fov/360 (0.19 for a 70 crop), so regressing the similarity onto it would
+# cap the correct pair at a fraction of 1 in exactly the comparison retrieval is
+# read off. The same-domain pairings carry the overlap geometry instead - there
+# the target is a genuine "how much of this view does that crop show" and it
+# costs the retrieval score nothing.
+PAIRING_OBJECTIVES = {
+    "q2r":           ("nce",),
+    "q2r_semi":      ("nce", "bce"),
+    "q_semi2r":      ("nce",),
+    "q_semi2r_semi": ("bce",),
+    "q2q_semi":      ("nce", "bce"),
+    "r2r_semi":      ("nce", "bce"),
+}
+
+# Meter/term keys in a stable order, so the caller can iterate them without
+# having to know which pairing runs which objective.
+TERM_KEYS = tuple(f"{name}_{kind}"
+                  for name in PAIRING_NAMES
+                  for kind in PAIRING_OBJECTIVES[name])
+
+
 def composite_contrast_loss(
     features_q_full,
     features_q_semi,
@@ -46,11 +84,13 @@ def composite_contrast_loss(
     bce_weight=1.0,
     a2g_weight=1.0,
 ):
-    """Score every pairing of view sets under both objectives and combine them.
+    """Score every pairing of view sets under its objectives and combine them.
 
     Each pairing is its own contrastive problem over its own similarity matrix -
     the four feature sets are never concatenated, so a pairing's negatives are
-    only the other locations' views of the same kind. Per pairing:
+    only the other locations' views of the same kind. The objectives a given
+    pairing runs are declared in PAIRING_OBJECTIVES (see the reasoning there);
+    where one applies it is:
 
       InfoNCE, both directions, against a BINARY target. Row-normalization would
         discard a soft label's magnitude anyway (a row holding one positive
@@ -60,8 +100,9 @@ def composite_contrast_loss(
         PAIRS rather than rows, so the transposed direction would be the same set
         of pairs and adds nothing.
 
-    Returns (total, terms) where terms holds every raw unweighted component, so
-    the log shows what each pairing actually costs independent of its weight.
+    Returns (total, terms) where terms holds the raw unweighted component of
+    every objective that ran (keys are TERM_KEYS), so the log shows what each
+    pairing actually costs independent of its weight.
     """
     if not isinstance(loss_function, SupervisedInfoNCE):
         raise TypeError("composite_contrast_loss expects a SupervisedInfoNCE, got "
@@ -69,7 +110,10 @@ def composite_contrast_loss(
 
     # (name, row features, col features, IoU target, weight on the reverse pass).
     # a2g_weight rides on the aerial-anchored direction of the pairings whose
-    # aerial side is a crop-augmented view - the same two terms it used to scale.
+    # aerial side is a crop-augmented view. Both of those (q2r_semi,
+    # q_semi2r_semi) are now BCE-only, and BCE has no separate reverse pass, so
+    # a2g_weight currently scales nothing - it is kept wired up for when those
+    # pairings are given InfoNCE back.
     pairings = (
         ("q2r",           features_q_full, features_r_full, target_q2r,           1.0),
         ("q2r_semi",      features_q_full, features_r_semi, target_q2r_semi,      a2g_weight),
@@ -82,21 +126,30 @@ def composite_contrast_loss(
     total = torch.zeros((), device=device)
     terms = {}
     for name, row_feats, col_feats, iou, reverse_weight in pairings:
-        binary = (iou > 0).to(iou.dtype)
-        # same_domain stays False even for q2q_semi / r2r_semi: those compare two
-        # DIFFERENT tensors (a full view against a semi one), so there is no
-        # self-similarity diagonal to mask out - the diagonal is a real positive.
-        nce_fwd = loss_function(row_feats, col_feats, logit_scale, binary,
-                                bidirectional=False, same_domain=False)
-        nce_rev = loss_function(col_feats, row_feats, logit_scale, binary.t().contiguous(),
-                                bidirectional=False, same_domain=False)
-        nce = nce_fwd + reverse_weight * nce_rev
-        bce = bce_loss_function(row_feats, col_feats, bce_logit_scale, bce_logit_bias, iou)
+        objectives = PAIRING_OBJECTIVES[name]
+        contribution = torch.zeros((), device=device)
+
+        if "nce" in objectives:
+            binary = (iou > 0).to(iou.dtype)
+            # same_domain stays False even for q2q_semi / r2r_semi: those compare
+            # two DIFFERENT tensors (a full view against a semi one), so there is
+            # no self-similarity diagonal to mask out - the diagonal is a real
+            # positive.
+            nce_fwd = loss_function(row_feats, col_feats, logit_scale, binary,
+                                    bidirectional=False, same_domain=False)
+            nce_rev = loss_function(col_feats, row_feats, logit_scale, binary.t().contiguous(),
+                                    bidirectional=False, same_domain=False)
+            nce = nce_fwd + reverse_weight * nce_rev
+            contribution = contribution + infonce_weight * nce
+            terms[name + "_nce"] = nce
+
+        if "bce" in objectives:
+            bce = bce_loss_function(row_feats, col_feats, bce_logit_scale, bce_logit_bias, iou)
+            contribution = contribution + bce_weight * bce
+            terms[name + "_bce"] = bce
 
         weight = 1.0 if pairing_weights is None else pairing_weights.get(name, 1.0)
-        total = total + weight * (infonce_weight * nce + bce_weight * bce)
-        terms[name + "_nce"] = nce
-        terms[name + "_bce"] = bce
+        total = total + weight * contribution
 
     return total, terms
 
@@ -925,10 +978,9 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
     model.train()
 
     losses = AverageMeter()
-    # one meter per raw component, so the per-pairing cost stays visible
-    # independent of the weight it is given
-    term_meters = {f"{name}_{kind}": AverageMeter()
-                   for name in PAIRING_NAMES for kind in ("nce", "bce")}
+    # one meter per raw component that actually runs (see PAIRING_OBJECTIVES), so
+    # the per-pairing cost stays visible independent of the weight it is given
+    term_meters = {key: AverageMeter() for key in TERM_KEYS}
     # wait before starting progress bar
     time.sleep(0.1)
     
@@ -1083,11 +1135,12 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
                 scheduler.step()
         
         if train_config.verbose:
-            # 12 raw components is too many for one progress bar - show the two
-            # objectives summed across pairings here, and let the caller print the
-            # per-pairing breakdown from the returned dict at epoch end.
-            nce_total = sum(term_meters[f"{n}_nce"].avg for n in PAIRING_NAMES)
-            bce_total = sum(term_meters[f"{n}_bce"].avg for n in PAIRING_NAMES)
+            # the raw components are too many for one progress bar - show the two
+            # objectives summed across the pairings that run them, and let the
+            # caller print the per-pairing breakdown from the returned dict at
+            # epoch end.
+            nce_total = sum(m.avg for k, m in term_meters.items() if k.endswith("_nce"))
+            bce_total = sum(m.avg for k, m in term_meters.items() if k.endswith("_bce"))
             monitor = {"loss": "{:.4f}".format(loss.item()),
                        "loss_avg": "{:.4f}".format(losses.avg),
                        "nce": "{:.4f}".format(nce_total),
