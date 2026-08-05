@@ -26,6 +26,195 @@ class InfoNCE(nn.Module):
         return loss  
  
 
+class RankNContrast(nn.Module):
+    """Rank-N-Contrast loss over an arbitrary anchor/reference pair of view sets.
+
+    For anchor `i` and reference `j`, the rank set is every reference `k` that
+    is at least as far from `i` as `j` is::
+
+        S_{i,j} = { k : dist[i,k] >= dist[i,j] }
+
+    and the loss drives `sims[i,j]` above every similarity in that set::
+
+        loss[i,j] = logsumexp_{k in S_{i,j}} sims[i,k] - sims[i,j]
+
+    This is the same objective as the reference Rank-N-Contrast implementation,
+    with the per-`k` Python loop replaced by a `[B_a, B_r, B_r]` broadcast so
+    the whole batch is built in one shot.
+
+    The module is domain-agnostic: pass ground features as `anchor` and aerial
+    features as `reference` for a cross-domain group, or the same domain twice
+    (with `valid` masking out the diagonal) for a same-domain group.  It never
+    mixes the two, which matters because same-domain and cross-domain
+    similarities are not on a comparable scale and must not share a softmax.
+
+    Args:
+        temperature: divides the similarities before the softmax.
+        similarity: ``"cosine"`` (default, matches the SinGeo InfoNCE head) or
+            ``"l2"`` (negative L2 distance, matches the reference RnC code).
+        chunk_size: number of anchors per chunk when materialising the
+            `[B_a, B_r, B_r]` intermediate. `None` picks a size automatically.
+    """
+
+    def __init__(self, temperature=2.0, similarity='cosine', chunk_size=None):
+        super().__init__()
+
+        if similarity not in ('cosine', 'l2'):
+            raise ValueError("similarity must be 'cosine' or 'l2', got {!r}".format(similarity))
+
+        self.t = temperature
+        self.similarity = similarity
+        self.chunk_size = chunk_size
+
+    def _similarity(self, anchor, reference):
+        if self.similarity == 'cosine':
+            return F.normalize(anchor, dim=-1) @ F.normalize(reference, dim=-1).T
+        return -torch.cdist(anchor, reference, p=2)
+
+    def _resolve_chunk_size(self, n_anchor, n_ref):
+        if self.chunk_size is not None:
+            return max(1, int(self.chunk_size))
+
+        # Cap the intermediate at ~16M elements. At SinGeo's batch sizes the
+        # whole thing fits in one chunk and this never bites.
+        budget = 16_777_216
+        per_anchor = max(1, n_ref * n_ref)
+        return max(1, min(n_anchor, budget // per_anchor))
+
+    def forward(self, anchor, reference, distances, valid=None):
+        """
+        Args:
+            anchor: `[B_a, D]` features.
+            reference: `[B_r, D]` features.
+            distances: `[B_a, B_r]` target distances. Only the *ordering*
+                within each row matters.
+            valid: optional `[B_a, B_r]` bool mask. `False` entries are used
+                neither as a positive `j` nor inside any denominator, which is
+                how same-domain calls drop the self-pair diagonal.
+
+        Returns:
+            Scalar loss, averaged over the valid `(i, j)` pairs.
+        """
+        # Similarities and distances in fp32: logsumexp over -inf-masked rows is
+        # not something to trust to fp16 under autocast.
+        sims = self._similarity(anchor, reference).float() / self.t
+        dist = distances.float()
+
+        n_anchor, n_ref = sims.shape
+
+        if valid is None:
+            valid = torch.ones_like(sims, dtype=torch.bool)
+        else:
+            valid = valid.bool()
+
+        total = sims.new_zeros(())
+        count = sims.new_zeros(())
+
+        chunk = self._resolve_chunk_size(n_anchor, n_ref)
+
+        for start in range(0, n_anchor, chunk):
+            stop = min(start + chunk, n_anchor)
+
+            s = sims[start:stop]              # [b, B_r]
+            d = dist[start:stop]              # [b, B_r]
+            v = valid[start:stop]             # [b, B_r]
+
+            # ge[i, j, k] = dist[i, k] >= dist[i, j], restricted to refs that
+            # are allowed in the denominator at all.
+            ge = (d.unsqueeze(1) >= d.unsqueeze(2)) & v.unsqueeze(1)
+
+            # Rows for a masked-out positive j would otherwise be all -inf and
+            # poison the backward pass with NaNs. Give them a finite (unused)
+            # denominator; `v` discards their contribution below.
+            ge = torch.where(v.unsqueeze(2), ge, v.unsqueeze(1).expand_as(ge))
+
+            logits = s.unsqueeze(1).expand(-1, n_ref, -1)
+            logits = logits.masked_fill(~ge, float('-inf'))
+
+            term = torch.logsumexp(logits, dim=-1) - s   # [b, B_r]
+            term = torch.where(v, term, torch.zeros_like(term))
+
+            total = total + term.sum()
+            count = count + v.sum()
+
+        return total / count.clamp(min=1.0)
+
+
+def rnc_same_domain_mask(batch_size, device=None):
+    """`[B, B]` mask that drops the self-pair diagonal for same-domain RNC."""
+    return ~torch.eye(batch_size, dtype=torch.bool, device=device)
+
+
+def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
+                       ids_ground, ids_aerial, arcs_ground, arcs_aerial):
+    """Run RNC separately for the four anchor/reference groups.
+
+    The groups are kept apart on purpose. Same-domain and cross-domain
+    similarities do not live on the same scale, so folding them into one
+    softmax would let one dominate the other for reasons that have nothing to
+    do with the ranking. This mirrors how the existing SinGeo/ConGeo InfoNCE
+    terms are also computed as separate pairwise losses.
+
+    Args:
+        rnc: a :class:`RankNContrast` instance.
+        builder: a :class:`singeo.distances.RnCDistanceBuilder`.
+        features_ground: `[N_g, D]` stacked ground views.
+        features_aerial: `[N_a, D]` stacked aerial views.
+        ids_ground, ids_aerial: `[N_g]` / `[N_a]` location ids.
+        arcs_ground, arcs_aerial: `[N_g, 2]` / `[N_a, 2]` (center, extent).
+
+    Returns:
+        Dict with keys ``g2a``, ``g2g``, ``a2g``, ``a2a`` holding the four raw
+        (unweighted) losses.
+    """
+    def hardness(anchor, reference):
+        # Only 'dss' tiering reads this. Detached at source: it is meant to
+        # shape the target ranking, never to receive gradient.
+        if builder.mode != 'dss':
+            return None
+        with torch.no_grad():
+            return F.normalize(anchor.detach().float(), dim=-1) @ \
+                   F.normalize(reference.detach().float(), dim=-1).T
+
+    n_g = features_ground.shape[0]
+    n_a = features_aerial.shape[0]
+    device = features_ground.device
+
+    groups = {}
+
+    # (a) ground anchors -> aerial references
+    groups['g2a'] = rnc(
+        features_ground, features_aerial,
+        builder(ids_ground, arcs_ground, ids_aerial, arcs_aerial,
+                hardness=hardness(features_ground, features_aerial)),
+    )
+
+    # (b) ground anchors -> ground references (self-pairs dropped)
+    groups['g2g'] = rnc(
+        features_ground, features_ground,
+        builder(ids_ground, arcs_ground, ids_ground, arcs_ground,
+                hardness=hardness(features_ground, features_ground)),
+        valid=rnc_same_domain_mask(n_g, device=device),
+    )
+
+    # (c) aerial anchors -> ground references
+    groups['a2g'] = rnc(
+        features_aerial, features_ground,
+        builder(ids_aerial, arcs_aerial, ids_ground, arcs_ground,
+                hardness=hardness(features_aerial, features_ground)),
+    )
+
+    # (d) aerial anchors -> aerial references (self-pairs dropped)
+    groups['a2a'] = rnc(
+        features_aerial, features_aerial,
+        builder(ids_aerial, arcs_aerial, ids_aerial, arcs_aerial,
+                hardness=hardness(features_aerial, features_aerial)),
+        valid=rnc_same_domain_mask(n_a, device=device),
+    )
+
+    return groups
+
+
 class CARE(nn.Module):
     def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu', 
                  equiv_weight=0.01, num_equiv_chunks=8):

@@ -177,7 +177,62 @@ def build_satellite_dynamic_continuous_transforms_outline(image_size_sat, mean, 
         ToTensorV2(),
     ])
 
-def build_satellite_dynamic_transforms(image_size_sat, mean, std, rotate_prob):
+def build_dropout_block(base_size, grid_ratio=0.4, strength=1.0, p=0.3):
+    """The GridDropout/CoarseDropout block, with a knob for how destructive it is.
+
+    `strength=1.0` reproduces the original settings exactly; `strength=0.0`
+    removes the block entirely.
+
+    The two controls are deliberately independent:
+
+    * `strength` scales how much of the image an occlusion removes -- the grid
+      ratio, the hole count and each hole's side length.
+    * `p` scales how often any occlusion happens at all, and is *not* touched by
+      `strength`.
+
+    Folding both into one multiplier compounds: `p * ratio * count * side^2`
+    falls off roughly as `strength^4`, so a seemingly mild 0.35 blanks ~25x
+    fewer pixels rather than ~3x fewer. Keeping them separate means the view
+    still gets occluded as often as before, just less catastrophically.
+
+    This exists for the cropped "view 2" pipelines. A 70 degree ground crop or a
+    120 degree aerial wedge has already discarded most of the image, and
+    GridDropout at ratio 0.5 removes half of what is left -- the crop and the
+    dropout compound.
+
+    Args:
+        base_size: reference side length the hole sizes are derived from.
+        grid_ratio: GridDropout ratio at full strength.
+        strength: severity multiplier in [0, 1].
+        p: probability of applying the block.
+
+    Returns:
+        A list holding the `A.OneOf` block, or an empty list when disabled, so
+        it can be splatted straight into an `A.Compose([...])`.
+    """
+    strength = max(0.0, min(1.0, float(strength)))
+
+    if strength <= 0.0 or p <= 0.0:
+        return []
+
+    def _size(fraction):
+        # Albumentations needs a positive integer, so never round down to 0.
+        return max(1, int(fraction * strength * base_size))
+
+    return [A.OneOf([
+        A.GridDropout(ratio=max(0.01, grid_ratio * strength), p=1.0),
+        A.CoarseDropout(max_holes=max(1, int(round(25 * strength))),
+                        max_height=_size(0.2),
+                        max_width=_size(0.2),
+                        min_holes=max(1, int(round(10 * strength))),
+                        min_height=_size(0.1),
+                        min_width=_size(0.1),
+                        p=1.0),
+    ], p=p)]
+
+
+def build_satellite_dynamic_transforms(image_size_sat, mean, std, rotate_prob,
+                                       dropout_strength=1.0):
     class DynamicRandomRotate(ImageOnlyTransform):
         def __init__(self, always_apply=False, p=1.0, keep_prob=rotate_prob):
             super().__init__(always_apply, p)
@@ -199,16 +254,7 @@ def build_satellite_dynamic_transforms(image_size_sat, mean, std, rotate_prob):
             A.AdvancedBlur(p=1.0),
             A.Sharpen(p=1.0),
         ], p=0.3),
-        A.OneOf([
-            A.GridDropout(ratio=0.4, p=1.0),
-            A.CoarseDropout(max_holes=25,
-                            max_height=int(0.2*image_size_sat[0]),
-                            max_width=int(0.2*image_size_sat[0]),
-                            min_holes=10,
-                            min_height=int(0.1*image_size_sat[0]),
-                            min_width=int(0.1*image_size_sat[0]),
-                            p=1.0),
-        ], p=0.3),
+        *build_dropout_block(image_size_sat[0], grid_ratio=0.4, strength=dropout_strength),
         A.Normalize(mean, std),
         ToTensorV2(),
     ])
@@ -290,6 +336,128 @@ class Zoomin(ImageOnlyTransform):
         
         return resized_tensor   
 
+def apply_limited_fov(x, fov, angle):
+    """Ground FoV crop that also reports the azimuth arc it kept.
+
+    Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
+    keep the leading `fov` degrees -- but with the crop window handed back so
+    the RNC distance labels can be computed from it. `LimitedFoV` draws `angle`
+    internally and throws it away, which makes it useless for labelling.
+
+    Args:
+        x: `[C, H, W]` panorama tensor spanning 360 degrees of azimuth.
+        fov: kept field of view in degrees. `<= 0` is a no-op. At exactly 360
+            the panorama is still rolled -- that is the arbitrary-orientation
+            augmentation -- it just is not narrowed.
+        angle: roll angle in degrees, the value `LimitedFoV` would have drawn.
+
+    Returns:
+        `(cropped, center_deg, extent_deg)` where the arc is expressed in the
+        panorama's own azimuth frame.
+    """
+    if fov <= 0:
+        return x, 0.0, 360.0
+
+    width = x.shape[2]
+    rotate_index = int(angle / 360. * width)
+    fov_index = min(int(fov / 360. * width), width)
+
+    if rotate_index > 0:
+        img_shift = torch.zeros_like(x)
+        img_shift[:, :, :rotate_index] = x[:, :, -rotate_index:]
+        img_shift[:, :, rotate_index:] = x[:, :, :(width - rotate_index)]
+    else:
+        img_shift = x
+
+    cropped = img_shift[:, :, :fov_index]
+
+    # Column c of the rolled image holds original column (c - rotate_index) mod
+    # W, so keeping columns [0, fov_index) keeps original azimuths starting at
+    # -angle. Extent comes from fov_index, not fov, to absorb the rounding.
+    start = (360.0 - angle) % 360.0
+    extent = fov_index / width * 360.0
+    center = (start + extent / 2.0) % 360.0
+
+    return cropped, center, extent
+
+
+_ANGLE_GRID_CACHE = {}
+
+
+def _bearing_grid(height, width, device):
+    """`[H, W]` compass bearing of every pixel, measured from image centre.
+
+    0 = up (north), 90 = right (east), matching a north-up aerial tile.
+    """
+    key = (height, width, str(device))
+    if key not in _ANGLE_GRID_CACHE:
+        ys = torch.arange(height, dtype=torch.float32, device=device).unsqueeze(1)
+        xs = torch.arange(width, dtype=torch.float32, device=device).unsqueeze(0)
+        dy = (height - 1) / 2.0 - ys     # up is positive
+        dx = xs - (width - 1) / 2.0      # right is positive
+        bearing = torch.rad2deg(torch.atan2(dx, dy))
+        _ANGLE_GRID_CACHE[key] = torch.remainder(bearing, 360.0)
+    return _ANGLE_GRID_CACHE[key]
+
+
+def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True):
+    """Aerial analogue of the ground FoV crop: rotate the tile, keep a wedge.
+
+    The aerial branch's counterpart to a limited ground FoV is a limited
+    *azimuth sector* of the tile. A plain centre crop would not do -- it keeps
+    every azimuth and only trims range, so it carries no angular information to
+    label. Masking a wedge does, and it mirrors `LimitedFoV` exactly: both
+    views end up described by an arc, and the two arcs are directly comparable.
+
+    The tile is first rotated by `rot_deg` (the continuous-rotation
+    augmentation the repo already uses via `DynamicContinuousRotateOutline`),
+    so the wedge's orientation in image space is unknown to the model while
+    staying exactly known to the loss.
+
+    Args:
+        x: `[C, H, W]` aerial tile tensor, square and north-up.
+        rot_deg: counter-clockwise rotation applied to the tile, in degrees.
+        arc_center: centre of the kept sector, in *world* azimuth degrees.
+        arc_extent: angular extent of the kept sector, in degrees. `>= 360`
+            keeps the whole tile.
+        circular_mask: also mask the tile to its inscribed disc, matching
+            `CircularMask` in the existing continuous-rotation pipeline.
+
+    Returns:
+        `[C, H, W]` tensor, same shape as the input.
+    """
+    import torchvision.transforms.functional as TF
+
+    if rot_deg != 0.0:
+        x = TF.rotate(x.unsqueeze(0), float(rot_deg)).squeeze(0)
+
+    if arc_extent >= 360.0 and not circular_mask:
+        return x
+
+    height, width = x.shape[1], x.shape[2]
+    bearing = _bearing_grid(height, width, x.device)
+
+    mask = torch.ones_like(bearing, dtype=torch.bool)
+
+    if arc_extent < 360.0:
+        # Rotating the image CCW by `rot_deg` moves content from world azimuth
+        # b to image bearing b - rot_deg, so the wedge to keep in image space
+        # is the world arc shifted by -rot_deg.
+        image_center = (arc_center - rot_deg) % 360.0
+        delta = torch.remainder(bearing - image_center, 360.0)
+        delta = torch.minimum(delta, 360.0 - delta)
+        mask &= delta <= (arc_extent / 2.0)
+
+    if circular_mask:
+        ys = torch.arange(height, dtype=torch.float32, device=x.device).unsqueeze(1)
+        xs = torch.arange(width, dtype=torch.float32, device=x.device).unsqueeze(0)
+        radius = min(height, width) / 2.0
+        dist = ((ys - (height - 1) / 2.0) ** 2 + (xs - (width - 1) / 2.0) ** 2).sqrt()
+        mask &= dist <= radius
+
+    return x * mask.unsqueeze(0).to(x.dtype)
+
+
 class LimitedFoV(ImageOnlyTransform):
     def __init__(self, fov=360.):
         super(LimitedFoV, self).__init__(fov)
@@ -299,18 +467,11 @@ class LimitedFoV(ImageOnlyTransform):
         #print(x.shape)
         if self.fov > 0:
             angle = random.randint(0, 359)
-            rotate_index = int(angle / 360. * x.shape[2])
-            fov_index = int(self.fov / 360. * x.shape[2])
-            if rotate_index > 0:
-                img_shift = torch.zeros(x.shape)
-                img_shift[:,:,:rotate_index] = x[:,:,-rotate_index:]
-                img_shift[:,:,rotate_index:] = x[:,:,:(x.shape[2] - rotate_index)]
-            else:
-                img_shift = x
-            return img_shift[:,:,:fov_index]
+            cropped, _, _ = apply_limited_fov(x, self.fov, angle)
+            return cropped
         else:
             return x
-        
+
 
 class LimitedFoV_consistency(ImageOnlyTransform):
     def __init__(self, fov=360.):
@@ -630,13 +791,13 @@ def get_transforms_train_singeo(image_size_sat,
                                                A.Sharpen(p=1.0),
                                               ], p=0.3),
                                       A.OneOf([
-                                               A.GridDropout(ratio=0.4, p=1.0),
-                                               A.CoarseDropout(max_holes=25,
-                                                               max_height=int(0.2*image_size_sat[0]),
-                                                               max_width=int(0.2*image_size_sat[0]),
-                                                               min_holes=10,
-                                                               min_height=int(0.1*image_size_sat[0]),
-                                                               min_width=int(0.1*image_size_sat[0]),
+                                               A.GridDropout(ratio=0.12, p=0.8),
+                                               A.CoarseDropout(max_holes=10,
+                                                               max_height=int(0.1*image_size_sat[0]),
+                                                               max_width=int(0.1*image_size_sat[0]),
+                                                               min_holes=5,
+                                                               min_height=int(0.05*image_size_sat[0]),
+                                                               min_width=int(0.05*image_size_sat[0]),
                                                                p=1.0),
                                               ], p=0.3),
                                       A.Normalize(mean, std),
@@ -675,13 +836,13 @@ def get_transforms_train_singeo(image_size_sat,
                                             A.Sharpen(p=1.0),
                                            ], p=0.3),
                                    A.OneOf([
-                                            A.GridDropout(ratio=0.5, p=1.0),
-                                            A.CoarseDropout(max_holes=25,
-                                                            max_height=int(0.2*img_size_ground[0]),
-                                                            max_width=int(0.2*img_size_ground[0]),
-                                                            min_holes=10,
-                                                            min_height=int(0.1*img_size_ground[0]),
-                                                            min_width=int(0.1*img_size_ground[0]),
+                                            A.GridDropout(ratio=0.1, p=.8),
+                                            A.CoarseDropout(max_holes=10,
+                                                            max_height=int(0.1*img_size_ground[0]),
+                                                            max_width=int(0.1*img_size_ground[0]),
+                                                            min_holes=5,
+                                                            min_height=int(0.05*img_size_ground[0]),
+                                                            min_width=int(0.05*img_size_ground[0]),
                                                             p=1.0),
                                            ], p=0.3),
                                    A.Normalize(mean, std),
@@ -697,7 +858,14 @@ def get_transforms_train_singeo_rot(image_size_sat,
                          mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225],
                          ground_cutting=0,
-                         fov=180):
+                         fov=180,
+                         con_dropout_strength=1.0):
+    """
+    `con_dropout_strength` scales the GridDropout/CoarseDropout severity on the
+    cropped ground view (`ground_transforms_con`) only. It defaults to 1.0, the
+    original behaviour; lower it when that view is also being FoV-cropped, so
+    the crop and the dropout do not compound into near-empty images.
+    """
     
     
     satellite_transforms = A.Compose([
@@ -776,22 +944,14 @@ def get_transforms_train_singeo_rot(image_size_sat,
                                             A.AdvancedBlur(p=1.0),
                                             A.Sharpen(p=1.0),
                                            ], p=0.3),
-                                   A.OneOf([
-                                            A.GridDropout(ratio=0.5, p=1.0),
-                                            A.CoarseDropout(max_holes=25,
-                                                            max_height=int(0.2*img_size_ground[0]),
-                                                            max_width=int(0.2*img_size_ground[0]),
-                                                            min_holes=10,
-                                                            min_height=int(0.1*img_size_ground[0]),
-                                                            min_width=int(0.1*img_size_ground[0]),
-                                                            p=1.0),
-                                           ], p=0.3),
+                                   *build_dropout_block(img_size_ground[0], grid_ratio=0.5,
+                                                        strength=con_dropout_strength),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
                                    LimitedFoV(fov=fov),
                                    #LimitedFoVPad(fov=fov),
                                    ])
-                
+
     return satellite_transforms, satellite_transforms_con_rot, ground_transforms, ground_transforms_con
 
 
