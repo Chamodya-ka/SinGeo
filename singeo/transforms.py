@@ -336,7 +336,7 @@ class Zoomin(ImageOnlyTransform):
         
         return resized_tensor   
 
-def apply_limited_fov(x, fov, angle):
+def apply_limited_fov(x, fov, angle, pad=False):
     """Ground FoV crop that also reports the azimuth arc it kept.
 
     Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
@@ -350,10 +350,27 @@ def apply_limited_fov(x, fov, angle):
             the panorama is still rolled -- that is the arbitrary-orientation
             augmentation -- it just is not narrowed.
         angle: roll angle in degrees, the value `LimitedFoV` would have drawn.
+        pad: fill the discarded azimuths instead of dropping them, so the output
+            keeps the input's width -- the behaviour of :class:`LimitedFoVPad`,
+            which routes through here.
+
+            Without it the FoV is readable off the tensor's own shape: 192
+            columns at 90 degrees where 302 degrees gives 644. That hands the
+            encoder a free scalar for "how narrow is this view", and the RNC
+            cross-domain groups reward using it, because they rank a location's
+            full panorama strictly above its own crop as a match for the aerial
+            tile and one monotone function of that scalar satisfies the
+            ordering for every location at once. Padding removes the carrier:
+            every ground tensor is the same width, so the FoV has to be read
+            from content.
+
+            Set it the same way for training and evaluation. Padding one side
+            only trades the shortcut for a plain geometry mismatch.
 
     Returns:
         `(cropped, center_deg, extent_deg)` where the arc is expressed in the
-        panorama's own azimuth frame.
+        panorama's own azimuth frame. `pad` does not move the arc: it changes
+        which columns hold the kept azimuths, not which azimuths are kept.
     """
     if fov <= 0:
         return x, 0.0, 360.0
@@ -370,6 +387,21 @@ def apply_limited_fov(x, fov, angle):
         img_shift = x
 
     cropped = img_shift[:, :, :fov_index]
+
+    if pad and fov_index < width:
+        # The fill is zero *after* A.Normalize, which decodes back to the
+        # dataset mean colour -- RGB (123.7, 116.3, 103.5) for the ImageNet
+        # statistics this repo trains with -- not to black. Every pipeline that
+        # reaches here crops after Normalize/ToTensorV2, so that holds
+        # everywhere; move the crop before Normalize and it would not.
+        filled = torch.zeros_like(x)
+        filled[:, :, :fov_index] = cropped
+
+        # Left at columns [0, fov_index) the block's boundary would still spell
+        # out the FoV, which is the cue padding exists to remove. Put it at an
+        # arbitrary column instead. The panorama is circular, so wrapping the
+        # block costs nothing and the arc below is unaffected.
+        cropped = torch.roll(filled, random.randint(0, width - 1), dims=2)
 
     # Column c of the rolled image holds original column (c - rotate_index) mod
     # W, so keeping columns [0, fov_index) keeps original azimuths starting at
@@ -496,49 +528,29 @@ class LimitedFoV_consistency(ImageOnlyTransform):
             return x
 
 class LimitedFoVPad(ImageOnlyTransform):
+    """:class:`LimitedFoV` that keeps the panorama's full width.
+
+    The dropped azimuths are filled rather than removed, and the kept block is
+    moved to an arbitrary column. Prefer this over :class:`LimitedFoV` whenever
+    the FoV differs between training and evaluation, or whenever a loss can
+    profit from telling a full view from a partial one: a bare crop leaks the
+    FoV through the tensor's width. See :func:`apply_limited_fov` for what that
+    leak costs.
+
+    `fov=361.0` is a sentinel for "draw a fresh FoV in [180, 360] per sample".
+    """
+
     def __init__(self, fov=360.):
         super(LimitedFoVPad, self).__init__(fov)
         self.fov = fov
 
     def apply(self, x, **params):
-        #print(x.shape) # 3, h, w
-        if self.fov == 361.0: 
-            angle = random.randint(0, 359)
-            rand_fov = random.randint(180, 360)
-            rotate_index = int(angle / 360. * x.shape[2])
-            fov_index = int(rand_fov/ 360. * x.shape[2])
-            angle2 = random.randint(0, 359)
-            roll_index = int(angle2 / 360. * x.shape[2])
-            if rotate_index > 0:
-                img_shift = torch.zeros(x.shape)
-                img_shift[:,:,:rotate_index] = x[:,:,-rotate_index:]
-                img_shift[:,:,rotate_index:] = x[:,:,:(x.shape[2] - rotate_index)]
-            else:
-                img_shift = x
-            img_shift = img_shift[:,:,:fov_index]  
-            img_pad = torch.zeros([x.shape[0], x.shape[1], x.shape[2]-fov_index])
-            pad_img_shift = torch.cat((img_shift, img_pad), dim=2)
-            rolled_img_shift = torch.roll(pad_img_shift, shifts=roll_index, dims=2)
-            return rolled_img_shift                     
-        elif self.fov > 0:
-            angle = random.randint(0, 359)
-            rotate_index = int(angle / 360. * x.shape[2])
-            fov_index = int(self.fov / 360. * x.shape[2])
-            angle2 = random.randint(0, 359)
-            roll_index = int(angle2 / 360. * x.shape[2])
-            if rotate_index > 0:
-                img_shift = torch.zeros(x.shape)
-                img_shift[:,:,:rotate_index] = x[:,:,-rotate_index:]
-                img_shift[:,:,rotate_index:] = x[:,:,:(x.shape[2] - rotate_index)]
-            else:
-                img_shift = x
-            img_shift = img_shift[:,:,:fov_index]  
-            img_pad = torch.zeros([x.shape[0], x.shape[1], x.shape[2]-fov_index])
-            pad_img_shift = torch.cat((img_shift, img_pad), dim=2)
-            rolled_img_shift = torch.roll(pad_img_shift, shifts=roll_index, dims=2)
-            return rolled_img_shift
-        else:
+        if self.fov <= 0:
             return x
+
+        fov = random.randint(180, 360) if self.fov == 361.0 else self.fov
+        padded, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True)
+        return padded
 
 
 class ShiftFoV(ImageOnlyTransform):
@@ -629,24 +641,26 @@ def get_transforms_val(image_size_sat,
                        ground_cutting=0,
                        fov=0.0,
                        rotate=False,
-                       mask_ratio=0.0):
-    
-    
-    
+                       mask_ratio=0.0,
+                       fov_pad=False):
+
+
+
     satellite_transforms = A.Compose([A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                                       A.Normalize(mean, std),
                                       ToTensorV2(),
                                      ])
-            
-    
- 
+
+
+
 
     ground_transforms = A.Compose([Cut(cutting=ground_cutting, p=1.0),
                                    A.Resize(img_size_ground[0], img_size_ground[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                   LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
+                                   # Must match the training crop: whichever of
+                                   # the two is used here has to be used there.
+                                   LimitedFoVPad(fov=fov) if fov_pad else LimitedFoV(fov=fov),
                                   ])
             
                
@@ -757,7 +771,8 @@ def get_transforms_train_singeo(image_size_sat,
                          mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225],
                          ground_cutting=0,
-                         fov=180):
+                         fov=180,
+                         fov_pad=False):
     
     
     satellite_transforms = A.Compose([
@@ -847,10 +862,9 @@ def get_transforms_train_singeo(image_size_sat,
                                            ], p=0.3),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                   LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
+                                   LimitedFoVPad(fov=fov) if fov_pad else LimitedFoV(fov=fov),
                                    ])
-                
+
     return satellite_transforms, satellite_transforms_con, ground_transforms, ground_transforms_con
 
 def get_transforms_train_singeo_rot(image_size_sat,
@@ -859,12 +873,18 @@ def get_transforms_train_singeo_rot(image_size_sat,
                          std=[0.229, 0.224, 0.225],
                          ground_cutting=0,
                          fov=180,
-                         con_dropout_strength=1.0):
+                         con_dropout_strength=1.0,
+                         fov_pad=False):
     """
     `con_dropout_strength` scales the GridDropout/CoarseDropout severity on the
     cropped ground view (`ground_transforms_con`) only. It defaults to 1.0, the
     original behaviour; lower it when that view is also being FoV-cropped, so
     the crop and the dropout do not compound into near-empty images.
+
+    `fov_pad` keeps the cropped view at full width (:class:`LimitedFoVPad`)
+    instead of returning a narrower tensor. Whatever it is set to here must
+    also be set on `get_transforms_val` for the eval crop, or the two produce
+    different geometry for the same FoV.
     """
     
     
@@ -948,8 +968,12 @@ def get_transforms_train_singeo_rot(image_size_sat,
                                                         strength=con_dropout_strength),
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
-                                   LimitedFoV(fov=fov),
-                                   #LimitedFoVPad(fov=fov),
+                                   # Bypassed under RNC (the trainer passes
+                                   # fov=0 and the dataset crops instead, so it
+                                   # can record the arc) -- but it still has to
+                                   # agree with the eval crop for the plain
+                                   # InfoNCE path.
+                                   LimitedFoVPad(fov=fov) if fov_pad else LimitedFoV(fov=fov),
                                    ])
 
     return satellite_transforms, satellite_transforms_con_rot, ground_transforms, ground_transforms_con

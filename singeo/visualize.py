@@ -55,22 +55,27 @@ class RnCSampleVisualizer:
             first/middle/last triple.
         positive_scale: must match `config.rnc_positive_scale`, so the printed
             distances are the ones the loss actually sees.
+        positive_overlap: likewise must match `config.rnc_positive_overlap`.
+            It changes the ordering, not just the numbers, so a mismatch here
+            draws a picture of a loss that is not being trained.
     """
 
-    def __init__(self, output_dir, mean, std, num_samples=5, epochs=(), positive_scale=0.5):
+    def __init__(self, output_dir, mean, std, num_samples=5, epochs=(), positive_scale=0.5,
+                 positive_overlap="iou"):
         self.output_dir = output_dir
         self.mean = mean
         self.std = std
         self.num_samples = num_samples
         self.epochs = tuple(sorted(set(int(e) for e in epochs)))
-        self.positive = PositiveOverlapDistance(scale=positive_scale)
+        self.positive = PositiveOverlapDistance(scale=positive_scale, measure=positive_overlap)
 
     @classmethod
-    def for_schedule(cls, output_dir, mean, std, total_epochs, num_samples=5, positive_scale=0.5):
+    def for_schedule(cls, output_dir, mean, std, total_epochs, num_samples=5, positive_scale=0.5,
+                     positive_overlap="iou"):
         """Capture the first, middle and last epoch of a run."""
         epochs = (1, max(1, (total_epochs + 1) // 2), total_epochs)
         return cls(output_dir, mean, std, num_samples=num_samples, epochs=epochs,
-                   positive_scale=positive_scale)
+                   positive_scale=positive_scale, positive_overlap=positive_overlap)
 
     def should_capture(self, epoch):
         return int(epoch) in self.epochs

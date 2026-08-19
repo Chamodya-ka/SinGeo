@@ -4,7 +4,9 @@ import shutil
 import sys
 import torch
 import pickle
+import pandas as pd
 from dataclasses import dataclass
+from typing import Optional
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -17,7 +19,7 @@ from singeo.transforms import get_dynamic_fov
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
 from singeo.loss import InfoNCE, RankNContrast
-from singeo.distances import GeoNeighbourRanks, RnCDistanceBuilder
+from singeo.distances import GeoNeighbourRanks, GeoCoordinates, SatelliteEmbeddings, RnCDistanceBuilder
 from singeo.model import TimmModel_SinGeo
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 from singeo.transforms import get_dynamic_rotation_angle
@@ -66,8 +68,22 @@ class Configuration:
     # Rank-N-Contrast (RNC) auxiliary loss
     # Added alongside the six InfoNCE terms, never replacing them.
     use_rnc: bool = True              # master switch for the whole RNC path
-    rnc_weight: float = 0.5            # weight of the summed RNC term
+    rnc_weight: float = 0.25            # weight of the summed RNC term
     rnc_tau: float = 2.0               # RNC temperature
+
+    # How equidistant references are treated in each other's rank sets.
+    #
+    # False (the original RnC formulation) reads a tie as "make these two
+    # equally similar": every tied reference sits in every other's denominator,
+    # and that sum is minimised only when their similarities are identical. The
+    # group's contribution is then pinned at |T|*log|T| and cannot descend, so
+    # the term keeps producing gradient forever without being satisfiable.
+    # True drops tied references from each other's rank sets; a term carrying
+    # no ordering information then costs exactly 0.
+    #
+    # The reported RNC group losses drop on this switch simply because those
+    # zeros are averaged in, so they are not comparable across the flag.
+    rnc_exclude_ties: bool = False
     rnc_similarity: str = "cosine"     # "cosine" | "l2"
     # Per-group weights, ordered (ground->aerial, ground->ground,
     # aerial->ground, aerial->aerial). The four groups are always computed and
@@ -78,6 +94,32 @@ class Configuration:
     rnc_positive_scale: float = 0.5
     rnc_negative_margin: float = 1e-2
 
+    # How the overlap of two views of the same location is measured. RNC reads
+    # only the ordering within a row, so this decides what the loss actually
+    # asks for -- rnc_positive_scale does not, it only rescales.
+    #
+    # Required orderings, for two views of the same location:
+    #   ground anchor (panorama or crop):  full aerial tile < aerial sector
+    #   aerial anchor (tile or sector):    ground panorama  < ground crop
+    # i.e. the uncropped counterpart always wins, on both sides. Anything else
+    # trains the model toward references and queries the eval never produces.
+    #
+    #   "circle"      - inter / 360. Constant denominator, so distance falls
+    #                   strictly with the intersection and all four orderings
+    #                   hold by construction. Default.
+    #   "iou"         - inter / union. Violates one of the four on 66% of
+    #                   curriculum pairs: the union shrinks for a narrow
+    #                   reference, so a 324 deg aerial sector outranks the full
+    #                   tile as a match for a 302 deg ground crop.
+    #   "containment" - inter / min(extent_a, extent_b). Never inverts, but
+    #                   ties 99.5% of pairs, leaving the positive block with
+    #                   almost no ordering at all.
+    #
+    # inter / max(extent_a, extent_b) is not offered: it equals "iou" exactly
+    # whenever one arc contains the other, and widens the sector inversion
+    # elsewhere (84% of pairs violate).
+    rnc_positive_overlap: str = "circle"
+
     # Where negative-pair distances come from:
     #   "geo"  - geographic proximity from the pre-computed neighbour ranking
     #            (gps_dict_path). Stable, independent of model state. Default.
@@ -87,7 +129,46 @@ class Configuration:
     #            similarity. This makes the ranking target chase the model's
     #            own confusion, which can pull against the discriminative
     #            objective. Emits a runtime warning when selected.
-    negative_tiering: str = "geo"
+    #   "embed" - scene dissimilarity between the two aerial tiles, from the
+    #            Google Satellite Embedding sampled at each location
+    #            (fetch_satellite_embeddings_cvusa.py). Unlike "geo" this is a
+    #            target the encoder can actually represent: a photograph cannot
+    #            reveal whether a negative is 500 km or 1500 km away, but it can
+    #            reveal that two scenes look alike. Dense, so it barely ties.
+    negative_tiering: str = "embed"
+
+    # Embeddings CSV for negative_tiering="embed". Restricted to the ids in the
+    # training split at load time.
+    sat_embedding_csv: str = "/home/71/25021871/data/data/cvusa/CVPR_subset/satellite_embeddings_2024.csv"
+
+    # Where "geo" tiering gets its separations from:
+    #   "coords" - haversine computed on demand from the raw (lat, lon) table
+    #              below. Exact for every pair, 0.28 MB resident, ~0.1 ms per
+    #              batch. Default.
+    #   "ranks"  - legacy top-K neighbour lookup from gps_dict_path. Stores ids
+    #              and not distances, so every pair outside an anchor's top-128
+    #              ties at 1.0 -- which, under similarity sampling, is ~99.7% of
+    #              the pairs in a batch. Kept only for comparison.
+    rnc_geo_source: str = "coords"    # "coords" | "ranks"
+    gps_coords_csv: str = "/home/71/25021871/data/data/cvusa/CVPR_subset/all.csv"
+
+    # Separation at which negatives reach the maximum distance label; pairs
+    # beyond it tie at 1.0. RNC reads only the *ordering* within a row, so the
+    # value of this constant is irrelevant except where it clamps -- which
+    # makes it purely a control over how many pairs are allowed to tie.
+    #
+    #   None  - normalise by the batch maximum. Nothing clamps, so the row
+    #           keeps the true geographic ordering: 120 distinct labels per
+    #           batch, 0.8% tied. Default.
+    #   2500  - 94 distinct labels, 22.5% tied.
+    #   100   - 100% tied. Every pair in a similarity-sampled batch is farther
+    #           apart than this (median separation 1527 km), so the whole
+    #           matrix collapses onto one value and RNC degenerates.
+    #
+    # A short ceiling is only defensible once tied pairs are excluded from the
+    # rank sets in singeo.loss.RankNContrast; as the loss stands, a tie is an
+    # active instruction to make the two similarities equal.
+    rnc_geo_max_km: Optional[float] = None
 
     # Aerial crop augmentation (the aerial counterpart of the ground FoV
     # curriculum). When False the aerial branch only ever yields the full tile
@@ -145,7 +226,25 @@ class Configuration:
     # make cudnn deterministic
     cudnn_deterministic: bool = False
     fov: float=90 # eval fov setting (with unknown orientation)
-    random_fov: bool=False 
+    eval_fov_extra: float=180
+    random_fov: bool=False
+
+    # Keep every ground view at the panorama's full width, filling the azimuths
+    # the FoV crop drops (LimitedFoVPad) instead of handing the encoder a
+    # narrower tensor (LimitedFoV).
+    #
+    # False leaks the FoV through the tensor's own width -- 192 columns at the
+    # eval's 90 degrees against 644 at epoch 16's 302 -- which is a shortcut the
+    # RNC cross-domain groups reward: they rank a location's full panorama above
+    # its own crop as a match for the aerial tile, and one monotone function of
+    # that width satisfies the ordering everywhere. The model then meets an eval
+    # width it never saw in training and every query lands far from every tile.
+    #
+    # Applies to training and evaluation together, by design. Padding one side
+    # only swaps the shortcut for a geometry mismatch. Note this makes test
+    # recall incomparable with logs from before the switch -- the eval input
+    # changes shape -- so re-baseline rather than reading it against them.
+    fov_pad: bool=True
 
 #-----------------------------------------------------------------------------#
 # Train Config                                                                #
@@ -229,6 +328,7 @@ if __name__ == '__main__':
                                                                 img_size_ground,
                                                                 mean=mean,
                                                                 std=std,
+                                                                fov_pad=config.fov_pad,
                                                                 )
                                                                    
                                                                    
@@ -248,19 +348,25 @@ if __name__ == '__main__':
                                       )
     
     
+    # Under RNC the FoV crop lives in the dataset (it has to record the arc it
+    # drew), so the padding switch is handed over here rather than baked into
+    # the transform pipeline.
+    train_dataset.fov_pad = config.fov_pad
+
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
                                   pin_memory=True)
-    
-    
+
+
     # transformations for Eval and Sim sampling.
     sat_transforms_val, ground_transforms_val = get_transforms_val(image_size_sat,
                                                                img_size_ground,
                                                                mean=mean,
                                                                std=std,
                                                                fov=fov,
+                                                               fov_pad=config.fov_pad,
                                                                )
 
 
@@ -276,7 +382,24 @@ if __name__ == '__main__':
                                            num_workers=config.num_workers,
                                            shuffle=False,
                                            pin_memory=True)
-    
+    if config.eval_fov_extra:
+        sat_transforms_val_extra, ground_transforms_val_extra = get_transforms_val(image_size_sat,
+                                                               img_size_ground,
+                                                               mean=mean,
+                                                               std=std,
+                                                               fov=config.eval_fov_extra,
+                                                               fov_pad=config.fov_pad,
+                                                               )
+        query_dataset_test_extra = CVUSADatasetEval(data_folder=config.data_folder ,
+                                          split="test",
+                                          img_type="query",    
+                                          transforms=ground_transforms_val_extra,
+                                          )
+        query_dataloader_test_extra = DataLoader(query_dataset_test_extra,
+                                       batch_size=config.batch_size_eval,
+                                       num_workers=config.num_workers,
+                                       shuffle=False,
+                                       pin_memory=True) 
     
     
     # Query Ground Images Test
@@ -306,15 +429,51 @@ if __name__ == '__main__':
     else:
         sim_dict = None
 
-    # RNC geographic tiering reads the same pre-computed neighbour file, but
-    # into its own structure. `sim_dict` above is only the *initial* value of
-    # the sampling dictionary -- calc_sim overwrites it with model-similarity
-    # rankings after the first eval. The distance labels must not inherit that.
+    # RNC geographic tiering keeps its own source, separate from `sim_dict`
+    # above: that one is only the *initial* value of the sampling dictionary --
+    # calc_sim overwrites it with model-similarity rankings after the first
+    # eval. The distance labels must not inherit that.
     geo_ranks = None
+    geo_coords = None
+    sat_embeddings = None
+    if config.use_rnc and config.negative_tiering == "embed":
+        df_split = pd.read_csv(f"{config.data_folder}/splits/train-19zl.csv", header=None)
+        train_ids = df_split[0].map(lambda x: int(x.split("/")[-1].split(".")[0])).values
+        sat_embeddings = SatelliteEmbeddings.from_csv(config.sat_embedding_csv, ids=train_ids)
+        covered = len(sat_embeddings.id2row)
+        if covered < len(train_ids):
+            raise ValueError(
+                "{} of {} training ids have no satellite embedding in {}. Every id the "
+                "dataset can emit needs one, or lookups raise mid-epoch.".format(
+                    len(train_ids) - covered, len(train_ids), config.sat_embedding_csv))
+        print("RNC embed tiering: {} x {}-d satellite embeddings from {}".format(
+            covered, sat_embeddings.vectors.shape[1], config.sat_embedding_csv))
     if config.use_rnc and config.negative_tiering == "geo":
-        with open(config.gps_dict_path, "rb") as f:
-            geo_ranks = GeoNeighbourRanks(pickle.load(f))
-        print("RNC geo tiering: loaded neighbour ranking from", config.gps_dict_path)
+        if config.rnc_geo_source == "coords":
+            # Raw (lat, lon) per training location; separations are computed
+            # per batch rather than looked up, so no pair is ever quantised
+            # into a rank bucket or dropped for falling outside a top-K.
+            df_loc = pd.read_csv(config.gps_coords_csv, header=None)
+            df_split = pd.read_csv(f"{config.data_folder}/splits/train-19zl.csv", header=None)
+            train_ids = df_split[0].map(lambda x: int(x.split("/")[-1].split(".")[0])).values
+            rows = df_loc.iloc[train_ids - 1]
+            geo_coords = GeoCoordinates({
+                int(i): (float(lat), float(lon))
+                for i, lat, lon in zip(train_ids,
+                                       rows[2].to_numpy(dtype=float),
+                                       rows[3].to_numpy(dtype=float))
+            })
+            print("RNC geo tiering: {} coordinates from {} (max {})".format(
+                len(train_ids), config.gps_coords_csv,
+                "batch max" if config.rnc_geo_max_km is None
+                else "{:.0f} km".format(config.rnc_geo_max_km)))
+        elif config.rnc_geo_source == "ranks":
+            with open(config.gps_dict_path, "rb") as f:
+                geo_ranks = GeoNeighbourRanks(pickle.load(f))
+            print("RNC geo tiering: loaded neighbour ranking from", config.gps_dict_path)
+        else:
+            raise ValueError("rnc_geo_source must be 'coords' or 'ranks', got {!r}".format(
+                config.rnc_geo_source))
 
     #-----------------------------------------------------------------------------#
     # Sim Sample                                                                  #
@@ -368,13 +527,21 @@ if __name__ == '__main__':
     distance_builder = None
     if config.use_rnc:
         rnc_loss = RankNContrast(temperature=config.rnc_tau,
-                                 similarity=config.rnc_similarity)
+                                 similarity=config.rnc_similarity,
+                                 exclude_ties=config.rnc_exclude_ties)
         distance_builder = RnCDistanceBuilder(positive_scale=config.rnc_positive_scale,
                                               negative_tiering=config.negative_tiering,
                                               negative_margin=config.rnc_negative_margin,
-                                              geo_ranks=geo_ranks)
+                                              geo_ranks=geo_ranks,
+                                              geo_coords=geo_coords,
+                                              geo_max_km=config.rnc_geo_max_km,
+                                              positive_overlap=config.rnc_positive_overlap,
+                                              sat_embeddings=sat_embeddings)
         print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
             config.rnc_weight, config.rnc_tau, config.negative_tiering))
+        print("RNC positive overlap:", config.rnc_positive_overlap)
+        print("RNC tie handling:", "ties excluded from rank sets"
+              if config.rnc_exclude_ties else "ties compete (original RnC)")
         print("RNC group weights (g2a, g2g, a2g, a2a):", config.rnc_group_weights)
         print("Aerial crop:", "enabled" if config.enable_aerial_crop else "disabled")
 
@@ -501,7 +668,8 @@ if __name__ == '__main__':
                                                                 mean=mean,
                                                                 std=std,
                                                                 fov=fov_for_transform,
-                                                                con_dropout_strength=config.crop_dropout_strength)
+                                                                con_dropout_strength=config.crop_dropout_strength,
+                                                                fov_pad=config.fov_pad)
 
         # modulate the Fov of sim-sampling at the same time
         _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
@@ -509,10 +677,12 @@ if __name__ == '__main__':
                                                         mean=mean,
                                                         std=std,
                                                         fov=fov_dynamic,
+                                                        fov_pad=config.fov_pad,
                                                         )
-        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample 
+        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
-        print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}")
+        print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
+              f"{' (padded to full width)' if config.fov_pad else ''}")
 
         if config.use_rnc:
             # Hand the curriculum state to the dataset, which now performs the
@@ -570,7 +740,15 @@ if __name__ == '__main__':
                                ranks=[1, 5, 10],
                                step_size=1000,
                                cleanup=True)
-            
+            if config.eval_fov_extra:
+                r1_test_extra = evaluate(config=config,
+                                         model=model,
+                                         reference_dataloader=reference_dataloader_test,
+                                         query_dataloader=query_dataloader_test_extra, 
+                                         ranks=[1, 5, 10],
+                                         step_size=1000,
+                                         cleanup=True)
+                print(f"Extra eval with FoV {config.eval_fov_extra}: R@1 = {r1_test_extra:.4f}")
             # after we evaluate, we update the similiarity sampling dictionary for training the dataset.
             if config.sim_sample:
                 r1_train, sim_dict = calc_sim(config=config, # Update the sim_dict when training with dynamic_fov

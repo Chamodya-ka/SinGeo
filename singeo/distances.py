@@ -65,21 +65,71 @@ def haversine_km(gps_a, gps_b):
     return 2 * EARTH_RADIUS_KM * torch.asin(torch.sqrt(h.clamp(0.0, 1.0)))
 
 
-def angular_overlap(center_a, extent_a, center_b, extent_b):
-    """Angular IoU between two arcs on the azimuth circle.
+def angular_overlap(center_a, extent_a, center_b, extent_b, measure="iou"):
+    """Angular overlap between two arcs on the azimuth circle.
 
-    Each view is described by the arc of real-world azimuth it can see.  Two
-    full views overlap completely (IoU 1); a 90 degree ground crop against the
-    full panorama it came from overlaps 90/360 = 0.25; two disjoint crops
-    overlap 0.
+    Each view is described by the arc of real-world azimuth it can see.  The
+    intersection is the same either way; the two measures differ only in what
+    they divide it by.
+
+    ``"iou"``
+        `inter / (ea + eb - inter)`.  Two full views overlap 1; a 90 degree
+        ground crop against the full panorama it came from overlaps
+        90/360 = 0.25; two disjoint crops overlap 0.
+
+        Note what the union does to a *contained* pair: the wider arc is
+        charged for every degree it sees beyond the narrower one.  A 302 degree
+        ground crop scores 0.84 against the full aerial tile but 0.93 against a
+        324 degree sector of that same tile -- the sector wins for showing
+        strictly *less* of the world, purely because it shrinks the
+        denominator.  Since the eval gallery is nothing but full tiles, that
+        ordering trains against the retrieval task.
+
+    ``"containment"``
+        `inter / min(ea, eb)`, the Szymkiewicz-Simpson overlap coefficient.
+        Asks whether one arc is contained in the other rather than whether the
+        two are the same set, so a wider reference is never penalised for being
+        a superset.  It over-corrects: *any* contained pair scores 1, so a five
+        degree sliver ties with the full panorama and 99.5% of curriculum pairs
+        carry no ordering at all.
+
+    ``"circle"``
+        `inter / 360`.  The fraction of the whole compass that both views can
+        see.  The denominator is a constant, so the distance is a strictly
+        decreasing function of the intersection alone -- and that is what makes
+        the four orderings the retrieval task needs hold *by construction*
+        rather than by luck:
+
+            ground anchor, either view :  full aerial tile  <  aerial sector
+            aerial anchor, either view :  ground panorama   <  ground crop
+
+        The full aerial tile's intersection with any ground arc is that whole
+        ground arc, the largest any aerial reference can achieve, so no sector
+        can beat it; the full ground panorama's intersection with any aerial
+        arc is that whole aerial arc, likewise.  Neither ``"iou"`` (66% of
+        curriculum pairs violate one of the four) nor `inter / max(ea, eb)`
+        (84%) has this property -- both let a narrower reference win by
+        shrinking its own denominator.
+
+        The one slack case is equality, not inversion: when the aerial sector
+        happens to contain the ground arc outright, the two cover the same
+        azimuths and arc geometry cannot separate them (~30% of draws, roughly
+        flat across the curriculum).  Telling them apart needs a term about the
+        sector's masked-out region, which is not an azimuth property.
 
     Args:
         center_a, extent_a: `[N]` tensors, arc centre and extent in degrees.
         center_b, extent_b: `[M]` tensors, arc centre and extent in degrees.
+        measure: ``"iou"`` or ``"containment"``.
 
     Returns:
-        `[N, M]` tensor of IoU values in [0, 1].
+        `[N, M]` tensor of overlap values in [0, 1].
     """
+    if measure not in ("iou", "containment", "circle"):
+        raise ValueError(
+            "measure must be 'iou', 'containment' or 'circle', got {!r}".format(measure)
+        )
+
     ca = center_a.unsqueeze(1)
     ea = extent_a.unsqueeze(1).clamp(0.0, 360.0)
     cb = center_b.unsqueeze(0)
@@ -99,25 +149,49 @@ def angular_overlap(center_a, extent_a, center_b, extent_b):
     far = (torch.minimum(ha, d - 360.0 + hb) - torch.maximum(-ha, d - 360.0 - hb)).clamp(min=0.0)
 
     inter = torch.minimum(near + far, torch.minimum(ea, eb))
-    union = (ea + eb - inter).clamp(min=1e-6)
-    return (inter / union).clamp(0.0, 1.0)
+
+    if measure == "iou":
+        denom = ea + eb - inter
+    elif measure == "containment":
+        denom = torch.minimum(ea, eb)
+    else:
+        denom = torch.full_like(inter, 360.0)
+
+    return (inter / denom.clamp(min=1e-6)).clamp(0.0, 1.0)
 
 
 class PositiveOverlapDistance:
     """Continuous distance for two views of the *same* location.
 
-    `dist = scale * (1 - angular_IoU)`, which puts every positive pair inside
-    `[0, scale]`.  `scale` must stay below the floor used by
+    `dist = scale * (1 - angular_overlap)`, which puts every positive pair
+    inside `[0, scale]`.  `scale` must stay below the floor used by
     :class:`NegativeDistanceTiering` so that positives and negatives never
     share a value.
+
+    `measure` selects how the overlap is computed; see :func:`angular_overlap`.
+    It is the single most consequential setting here, because RNC reads only
+    the *ordering* within a row -- `scale` rescales, `measure` decides what the
+    loss actually asks for.  ``"circle"`` is the one that keeps an uncropped
+    view ranked ahead of a cropped one on both sides of the pair, which is what
+    stops the loss from steering the model toward references (narrow aerial
+    sectors) and queries (full panoramas) that the eval protocol never sees.
     """
 
-    def __init__(self, scale=0.5):
+    VALID_MEASURES = ("iou", "containment", "circle")
+
+    def __init__(self, scale=0.5, measure="iou"):
+        if measure not in self.VALID_MEASURES:
+            raise ValueError(
+                "measure must be one of {}, got {!r}".format(self.VALID_MEASURES, measure)
+            )
+
         self.scale = float(scale)
+        self.measure = measure
 
     def __call__(self, arcs_a, arcs_b):
         """Args: `[N, 2]` and `[M, 2]` tensors of (center, extent) in degrees."""
-        overlap = angular_overlap(arcs_a[:, 0], arcs_a[:, 1], arcs_b[:, 0], arcs_b[:, 1])
+        overlap = angular_overlap(arcs_a[:, 0], arcs_a[:, 1], arcs_b[:, 0], arcs_b[:, 1],
+                                  measure=self.measure)
         return self.scale * (1.0 - overlap)
 
 
@@ -187,6 +261,183 @@ class GeoNeighbourRanks:
         return out
 
 
+class GeoCoordinates:
+    """`id -> (lat, lon)` table, with pairwise distance computed on demand.
+
+    The alternative to :class:`GeoNeighbourRanks`, and the reason to prefer it:
+    that class can only answer "is B among A's top-K, and at what position",
+    because the pre-computed file stores neighbour *ids* and discards the
+    distances that produced them.  Every pair outside the top-K therefore
+    collapses onto one constant, and with batches drawn by similarity sampling
+    that is essentially every pair -- which leaves the ranking objective with
+    nothing but ties to order.
+
+    Holding the coordinates instead costs 0.28 MB for CVUSA's 35k training
+    locations and yields the exact kilometre separation of any pair, computed
+    when it is needed.  A 32x32 block takes ~0.1 ms, against a ~450 ms training
+    step.
+
+    Args:
+        coords_by_id: `{location_id: (latitude, longitude)}` in degrees.
+    """
+
+    def __init__(self, coords_by_id):
+        if not coords_by_id:
+            raise ValueError("coordinate table is empty")
+
+        ids = sorted(int(i) for i in coords_by_id)
+        self.id2row = {idx: row for row, idx in enumerate(ids)}
+        self.coords = torch.tensor([list(coords_by_id[idx]) for idx in ids],
+                                   dtype=torch.float32)
+
+    def _rows(self, ids):
+        try:
+            return [self.id2row[int(i)] for i in ids.tolist()]
+        except KeyError as missing:
+            raise KeyError(
+                "location id {} has no coordinates. The table must cover every "
+                "id the dataset can emit.".format(missing)
+            )
+
+    def km(self, ids_a, ids_b):
+        """`[N, M]` great-circle separation in kilometres."""
+        coords = self.coords.to(ids_a.device)
+        return haversine_km(coords[self._rows(ids_a)], coords[self._rows(ids_b)])
+
+
+class SatelliteEmbeddings:
+    """`id -> 64-d Google Satellite Embedding`, cosine computed on demand.
+
+    Built by `fetch_satellite_embeddings_cvusa.py` from
+    `GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL`, sampled at each location's aerial
+    coordinate.
+
+    The point of this over :class:`GeoCoordinates` is *learnability*. Both give
+    a dense, model-independent ordering over negatives, but only one of them is
+    visible in the pixels: a photograph cannot tell you whether a negative is
+    500 km or 1500 km away, so the geographic ordering is a target the encoder
+    has no way to represent, and the loss sits on its floor. Scene similarity
+    it can represent -- two highway margins really do look more alike than a
+    highway and a forest.
+
+    Stored as one row per location rather than as a pre-computed matrix. The
+    full 35,532 x 35,532 similarity matrix would be 5.0 GB; the embeddings are
+    9.1 MB and a batch's 32 x 32 block is one small matmul. Storing top-K
+    neighbour *ids* instead -- the `gps_dict.pkl` approach -- would be smaller
+    still but would tie every pair outside the top-K, and a tie is an active
+    instruction to make two similarities equal (see
+    :class:`singeo.loss.RankNContrast`).
+
+    Args:
+        vectors_by_id: `{location_id: sequence of floats}`, all the same length.
+        normalise: L2-normalise each row on load, so `cosine` is a plain matmul.
+            AlphaEarth vectors are already unit-length; this makes that
+            explicit and survives any averaging done at fetch time (a buffered
+            mean is not unit-length).
+    """
+
+    def __init__(self, vectors_by_id, normalise=True):
+        if not vectors_by_id:
+            raise ValueError("embedding table is empty")
+
+        ids = sorted(int(i) for i in vectors_by_id)
+        widths = {len(vectors_by_id[i]) for i in ids}
+        if len(widths) != 1:
+            raise ValueError(
+                "embeddings must all have the same width, got {}".format(sorted(widths))
+            )
+
+        self.id2row = {idx: row for row, idx in enumerate(ids)}
+        self.vectors = torch.tensor([list(vectors_by_id[idx]) for idx in ids],
+                                    dtype=torch.float32)
+
+        if not torch.isfinite(self.vectors).all():
+            raise ValueError(
+                "embedding table contains NaN/inf. Locations the sampler found no "
+                "coverage for are written with empty values; drop those ids before "
+                "building this table."
+            )
+
+        if normalise:
+            self.vectors = torch.nn.functional.normalize(self.vectors, dim=1)
+
+        self._device_cache = {}
+
+    @classmethod
+    def from_csv(cls, path, ids=None, prefix="A", **kwargs):
+        """Load the CSV written by `fetch_satellite_embeddings_cvusa.py`.
+
+        Args:
+            path: the embeddings CSV. Needs an `id` column plus the band
+                columns.
+            ids: optional iterable to restrict to, e.g. just the training
+                split. Rows outside it are dropped before the table is built.
+            prefix: band-column prefix (`A00`..`A63` as written by the fetcher).
+        """
+        import pandas as pd
+
+        frame = pd.read_csv(path)
+        bands = [c for c in frame.columns if c.startswith(prefix) and c[len(prefix):].isdigit()]
+        if not bands:
+            raise ValueError("no band columns starting with {!r} in {}".format(prefix, path))
+
+        if ids is not None:
+            frame = frame[frame["id"].isin(set(int(i) for i in ids))]
+
+        missing = frame[bands].isna().any(axis=1)
+        if missing.any():
+            warnings.warn(
+                "{} of {} rows in {} have no embedding (the sampler found no coverage) "
+                "and were dropped. Any id the dataset can emit must survive this, or "
+                "lookups will raise.".format(int(missing.sum()), len(frame), path)
+            )
+            frame = frame[~missing]
+
+        return cls({int(i): row for i, row in
+                    zip(frame["id"].to_numpy(), frame[bands].to_numpy(dtype="float32"))},
+                   **kwargs)
+
+    def _rows(self, ids):
+        try:
+            return [self.id2row[int(i)] for i in ids.tolist()]
+        except KeyError as missing:
+            raise KeyError(
+                "location id {} has no satellite embedding. The table must cover "
+                "every id the dataset can emit.".format(missing)
+            )
+
+    def _on(self, device):
+        """Device-resident copy of the table, cached.
+
+        Without the cache this 9.1 MB tensor is copied host->device on every
+        call, and there are four calls per training step -- ~80 GB of PCIe
+        traffic per CVUSA epoch to re-send a constant.
+        """
+        key = str(device)
+        if key not in self._device_cache:
+            self._device_cache[key] = self.vectors.to(device)
+        return self._device_cache[key]
+
+    @torch.no_grad()
+    def cosine(self, ids_a, ids_b):
+        """`[N, M]` cosine similarity in [-1, 1]; 1 means the same scene."""
+        vectors = self._on(ids_a.device)
+
+        # Held in fp32 even though the training step runs under autocast. This
+        # is a distance *label*, not part of the graph, and matmul in fp16 has
+        # roughly 2e-4 resolution at these magnitudes -- coarse enough to
+        # collapse distinct scene similarities onto one value. A tie is an
+        # equality constraint in RankNContrast, not an absence of one, so
+        # manufacturing ties in the label pipeline is a correctness issue
+        # rather than a rounding detail.
+        with torch.cuda.amp.autocast(enabled=False):
+            return vectors[self._rows(ids_a)].float() @ vectors[self._rows(ids_b)].float().T
+
+    def dissimilarity(self, ids_a, ids_b):
+        """`[N, M]` in [0, 1]: 0 for identical scenes, 1 for opposite ones."""
+        return ((1.0 - self.cosine(ids_a, ids_b)) / 2.0).clamp(0.0, 1.0)
+
+
 class NegativeDistanceTiering:
     """Distance for two views of *different* locations.
 
@@ -196,11 +447,22 @@ class NegativeDistanceTiering:
     Modes:
         ``"geo"`` (default)
             Distance grows with the geographic separation of the two
-            locations, taken from the pre-computed neighbour ranking
-            (:class:`GeoNeighbourRanks`) or, if raw coordinates are supplied
-            instead, from the haversine distance.  This is a fixed property of
-            the data: it does not move as the model trains, so the ranking
-            target the loss chases is stable.
+            locations, computed on demand from a :class:`GeoCoordinates` table
+            (or from raw coordinates passed per call).  This is a fixed
+            property of the data: it does not move as the model trains, so the
+            ranking target the loss chases is stable.
+
+            Separation is normalised by `geo_max_km`, and everything beyond
+            that ceiling ties at 1.0.  That is deliberate -- geography stops
+            predicting visual overlap long before continental scale -- but it
+            means the ceiling decides how many pairs carry any ordering at
+            all.  For reference, two locations drawn at random from CVUSA's
+            training split are a median 1527 km apart, and only 0.64% of the
+            pairs inside a similarity-sampled batch fall within 100 km.
+
+            A pre-computed neighbour ranking (:class:`GeoNeighbourRanks`) is
+            still accepted, but it stores ids rather than distances and ties
+            every pair outside its top-K.
 
         ``"none"``
             Every negative gets distance 1.0.  Recovers the original RnC
@@ -220,9 +482,10 @@ class NegativeDistanceTiering:
     mode -- where both read a hardness signal -- they stay separate objects.
     """
 
-    VALID_MODES = ("geo", "none", "dss")
+    VALID_MODES = ("geo", "embed", "none", "dss")
 
-    def __init__(self, mode="geo", floor=0.5, margin=1e-3, geo_ranks=None, geo_max_km=100.0):
+    def __init__(self, mode="geo", floor=0.5, margin=1e-3, geo_ranks=None, geo_max_km=100.0,
+                 geo_coords=None, sat_embeddings=None):
         if mode not in self.VALID_MODES:
             raise ValueError(
                 "negative_tiering must be one of {}, got {!r}".format(self.VALID_MODES, mode)
@@ -232,7 +495,16 @@ class NegativeDistanceTiering:
         self.floor = float(floor)
         self.margin = float(margin)
         self.geo_ranks = geo_ranks
+        self.geo_coords = geo_coords
         self.geo_max_km = geo_max_km
+        self.sat_embeddings = sat_embeddings
+
+        if mode == "embed" and sat_embeddings is None:
+            raise ValueError(
+                "negative_tiering='embed' needs a SatelliteEmbeddings table; build one "
+                "with SatelliteEmbeddings.from_csv(...) from the CSV that "
+                "fetch_satellite_embeddings_cvusa.py writes."
+            )
 
         # Lowest value any negative may take, and the span left above it.
         self.low = self.floor + self.margin
@@ -276,27 +548,45 @@ class NegativeDistanceTiering:
         if self.mode == "none":
             return torch.ones(shape, device=device, dtype=torch.float32)
 
+        if self.mode == "embed":
+            # Scene dissimilarity from the aerial embedding, rescaled onto the
+            # batch so the row spans the whole negative band. Absolute cosine
+            # values across CVUSA sit in a narrow window; RNC reads only the
+            # ordering, so what matters is that the window is spread out rather
+            # than where it sits.
+            raw = self.sat_embeddings.dissimilarity(ids_a, ids_b)
+            lo, hi = raw.min(), raw.max()
+            normalised = (raw - lo) / (hi - lo).clamp(min=1e-6)
+            return self.low + self.span * normalised
+
         if self.mode == "geo":
             return self._geo_distance(ids_a, ids_b, gps_a, gps_b)
 
         return self._dss_distance(shape, device, hardness)
 
     def _geo_distance(self, ids_a, ids_b, gps_a, gps_b):
-        if self.geo_ranks is not None:
+        # Sources in order of preference. The two coordinate paths give the
+        # exact separation of every pair; the rank lookup can only place pairs
+        # that fall inside the pre-computed top-K and ties everything else onto
+        # one constant, so it is kept only for backward compatibility.
+        if self.geo_coords is not None:
+            km = self.geo_coords.km(ids_a, ids_b)
+        elif gps_a is not None and gps_b is not None:
+            km = haversine_km(gps_a, gps_b)
+        elif self.geo_ranks is not None:
             ranks = self.geo_ranks.normalised_ranks(
                 ids_a.detach().cpu().numpy(), ids_b.detach().cpu().numpy()
             )
-            normalised = torch.from_numpy(ranks).to(ids_a.device)
-        elif gps_a is not None and gps_b is not None:
-            km = haversine_km(gps_a, gps_b)
-            denom = km.max().clamp(min=1e-6) if self.geo_max_km is None else float(self.geo_max_km)
-            normalised = (km / denom).clamp(0.0, 1.0)
+            return self.low + self.span * torch.from_numpy(ranks).to(ids_a.device)
         else:
             raise ValueError(
-                "negative_tiering='geo' needs either a pre-computed neighbour ranking "
-                "(gps_dict_*.pkl, as built by calc_distance_cvusa.py) or per-sample GPS "
-                "coordinates. Switch to negative_tiering='none' if neither is available."
+                "negative_tiering='geo' needs a coordinate table (GeoCoordinates), "
+                "per-sample GPS coordinates, or a pre-computed neighbour ranking "
+                "(gps_dict_*.pkl). Switch to negative_tiering='none' if none is available."
             )
+
+        denom = km.max().clamp(min=1e-6) if self.geo_max_km is None else float(self.geo_max_km)
+        normalised = (km / denom).clamp(0.0, 1.0)
 
         return self.low + self.span * normalised
 
@@ -345,14 +635,17 @@ class RnCDistanceBuilder:
     """
 
     def __init__(self, positive_scale=0.5, negative_tiering="geo", negative_margin=1e-3,
-                 geo_ranks=None, geo_max_km=100.0):
-        self.positive = PositiveOverlapDistance(scale=positive_scale)
+                 geo_ranks=None, geo_max_km=100.0, geo_coords=None,
+                 positive_overlap="iou", sat_embeddings=None):
+        self.positive = PositiveOverlapDistance(scale=positive_scale, measure=positive_overlap)
         self.negative = NegativeDistanceTiering(
             mode=negative_tiering,
             floor=positive_scale,
             margin=negative_margin,
             geo_ranks=geo_ranks,
             geo_max_km=geo_max_km,
+            geo_coords=geo_coords,
+            sat_embeddings=sat_embeddings,
         )
 
     @property

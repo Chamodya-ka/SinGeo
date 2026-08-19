@@ -54,9 +54,29 @@ class RankNContrast(nn.Module):
             ``"l2"`` (negative L2 distance, matches the reference RnC code).
         chunk_size: number of anchors per chunk when materialising the
             `[B_a, B_r, B_r]` intermediate. `None` picks a size automatically.
+        exclude_ties: drop equidistant references from each other's rank sets,
+            so `S_{i,j} = {j} u { k : dist[i,k] > dist[i,j] }`.
+
+            Worth understanding what the default `>=` does with a tie, because
+            it is not "no constraint". Every member of a tied group lands in
+            every other member's denominator, and summing their terms gives
+            `|T| * (logsumexp_T(s) - mean_T(s))`, which by AM-GM is minimised
+            -- at `|T| log |T|`, never zero -- exactly when all their
+            similarities are *equal*. So a tie is read as "make these
+            indistinguishable", and the group's contribution is pinned to a
+            floor it cannot descend below. In this repo that bit hardest with
+            the pre-computed neighbour ranking, where ~99.7% of in-batch pairs
+            tied at the maximum rank and the logged group losses sat flat on
+            `log(B_r)` for entire runs.
+
+            With `exclude_ties`, tied references simply do not constrain one
+            another and such a term costs 0. The mean is still taken over all
+            valid pairs, so the reported loss drops on the switch for that
+            reason alone -- it is not comparable across the flag.
     """
 
-    def __init__(self, temperature=2.0, similarity='cosine', chunk_size=None):
+    def __init__(self, temperature=2.0, similarity='cosine', chunk_size=None,
+                 exclude_ties=False):
         super().__init__()
 
         if similarity not in ('cosine', 'l2'):
@@ -65,6 +85,7 @@ class RankNContrast(nn.Module):
         self.t = temperature
         self.similarity = similarity
         self.chunk_size = chunk_size
+        self.exclude_ties = exclude_ties
 
     def _similarity(self, anchor, reference):
         if self.similarity == 'cosine':
@@ -119,9 +140,23 @@ class RankNContrast(nn.Module):
             d = dist[start:stop]              # [b, B_r]
             v = valid[start:stop]             # [b, B_r]
 
-            # ge[i, j, k] = dist[i, k] >= dist[i, j], restricted to refs that
-            # are allowed in the denominator at all.
-            ge = (d.unsqueeze(1) >= d.unsqueeze(2)) & v.unsqueeze(1)
+            # ge[i, j, k] = reference k belongs in j's denominator, restricted
+            # to refs that are allowed in a denominator at all.
+            if self.exclude_ties:
+                # Strictly farther, plus `j` itself. Keeping `j` is not
+                # optional: without it the farthest reference in every row has
+                # an *empty* rank set, logsumexp over all -inf returns -inf,
+                # and the loss is -inf even when nothing ties. It also restores
+                # the lower bound -- logsumexp(farther) - s_j alone is
+                # minimised by driving s_j up without limit, which is not a
+                # ranking objective. With `j` kept, a reference whose whole
+                # rank set is itself scores logsumexp({s_j}) - s_j = 0, which
+                # is what "no ordering information here" ought to cost.
+                ge = (d.unsqueeze(1) > d.unsqueeze(2)) & v.unsqueeze(1)
+                keep_self = torch.eye(n_ref, dtype=torch.bool, device=sims.device)
+                ge = ge | (keep_self.unsqueeze(0) & v.unsqueeze(1))
+            else:
+                ge = (d.unsqueeze(1) >= d.unsqueeze(2)) & v.unsqueeze(1)
 
             # Rows for a masked-out positive j would otherwise be all -inf and
             # poison the backward pass with NaNs. Give them a finite (unused)

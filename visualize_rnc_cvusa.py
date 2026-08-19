@@ -46,6 +46,9 @@ class Configuration:
     crop_dropout_strength: float = 0.5
 
     rnc_positive_scale: float = 0.5
+    # Keep in step with train_singeo_cvusa.py's rnc_positive_overlap, or the
+    # figures show a different ranking than the one being optimised.
+    rnc_positive_overlap: str = "circle"
 
     prob_rotate: float = 0.75
     prob_flip: float = 0.5
@@ -85,7 +88,8 @@ if __name__ == '__main__':
                                                   mean, std,
                                                   total_epochs=config.epochs,
                                                   num_samples=config.num_samples,
-                                                  positive_scale=config.rnc_positive_scale)
+                                                  positive_scale=config.rnc_positive_scale,
+                                                  positive_overlap=config.rnc_positive_overlap)
 
     print("Capturing epochs:", visualizer.epochs)
 
