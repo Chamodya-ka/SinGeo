@@ -32,7 +32,7 @@ class CVUSADatasetTrain(Dataset):
         self.transforms_query = transforms_query           # ground
         self.transforms_reference = transforms_reference   # satellite
         
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         #self.df = pd.read_csv(f'/data/CVUSA/CVPR_subset/splits/train-19zl.csv', header=None)
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         
@@ -229,9 +229,9 @@ class CVUSADatasetEval(Dataset):
         self.transforms = transforms
         
         if split == 'train':
-            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         else:
-            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None)#, nrows=10000)
+            self.df = pd.read_csv(f'{data_folder}/splits/val-19zl.csv', header=None) #, nrows=10000)
         
         self.df = self.df.rename(columns={0:"sat", 1:"ground", 2:"ground_anno"})
         
@@ -338,7 +338,12 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # drift off the ground crop's heading.
         self.sat_rot_max = 0.0
 
-        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None)#, nrows=10000)
+        # Keep the ground crop at the panorama's full width, filling the
+        # dropped azimuths (LimitedFoVPad's behaviour) rather than returning a
+        # narrower tensor. Has to match `fov_pad` on the eval transforms.
+        self.fov_pad = False
+
+        self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
         self.df["idx"] = self.df.sat.map(lambda x : int(x.split("/")[-1].split(".")[0]))
@@ -398,7 +403,8 @@ class CVUSADatasetTrainSinGeo(Dataset):
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
             angle = random.randint(0, 359)
-            query_img2, g_center, g_extent = apply_limited_fov(query_img2, self.ground_fov, angle)
+            query_img2, g_center, g_extent = apply_limited_fov(query_img2, self.ground_fov, angle,
+                                                               pad=self.fov_pad)
             meta[M_GROUND_CENTER] = g_center
             meta[M_GROUND_EXTENT] = g_extent
 
