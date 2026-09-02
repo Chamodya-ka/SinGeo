@@ -42,6 +42,65 @@ def get_dynamic_rotate_prob(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
 def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0):
     return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
 
+
+def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_frac=0.2):
+    """Lower bound of the per-sample FoV draw, ramped geometrically.
+
+    :func:`get_dynamic_fov` returns a single FoV that every sample in the epoch
+    shares, walking it linearly from `fov_start` to `fov_end` across the run.
+    Paired with a cosine LR that is a bad trade: the narrow views arrive only
+    once the learning rate is spent. Measured on the 80-epoch schedule, the
+    fraction of the *LR-weighted* training budget spent at or below the FoV the
+    model is evaluated at:
+
+        FoV <= 180 :  8.7%
+        FoV <=  90 :  0.1%
+        FoV <=  70 :  0.0%
+
+    So the model is scored at 90 degrees having done a thousandth of its
+    effective learning there, which is why test recall at 90 is still climbing
+    when the run ends.
+
+    This returns the *floor* of a range instead. The caller draws a fresh FoV
+    per sample from `[floor, 360]`, so every batch keeps wide-FoV examples
+    while narrow ones become available as soon as the floor descends -- a
+    curriculum by expanding support rather than by moving a point. The floor
+    reaches `fov_end` after `ramp_frac` of the run (default 20%, i.e. epoch 16
+    of 80), while the learning rate is still near its peak.
+
+    The ramp is geometric because the evaluation points (70, 90, 180, 360) are
+    geometrically spaced; a linear ramp lingers in the wide half.
+
+    Args:
+        epoch: 1-based epoch number.
+        max_epoch: total epochs in the run.
+        fov_start: floor at epoch 0, i.e. no narrowing yet.
+        fov_end: floor once the ramp completes.
+        ramp_frac: fraction of the run spent descending. `<= 0` starts at
+            `fov_end` immediately.
+
+    Returns:
+        The floor in degrees, in `[fov_end, fov_start]`.
+    """
+    if ramp_frac <= 0:
+        return fov_end
+
+    progress = min(1.0, max(0.0, epoch / (max_epoch * ramp_frac)))
+    return fov_start * (fov_end / fov_start) ** progress
+
+
+def draw_log_uniform_fov(floor, fov_max=360.0):
+    """A single FoV drawn log-uniformly from `[floor, fov_max]`.
+
+    Log-uniform rather than uniform so the narrow end is not under-sampled: on
+    `[70, 360]` a uniform draw puts only 7% of samples at or below 90 degrees,
+    a log-uniform one puts 15%.
+    """
+    lo = min(max(float(floor), 1e-3), float(fov_max))
+    if lo >= fov_max:
+        return float(fov_max)
+    return math.exp(random.uniform(math.log(lo), math.log(float(fov_max))))
+
 def get_dynamic_rotate_prob_random(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
     return random.uniform(min_prob, max_prob)
 
@@ -364,6 +423,22 @@ def apply_limited_fov(x, fov, angle, pad=False):
             every ground tensor is the same width, so the FoV has to be read
             from content.
 
+            The kept block is placed at a random *non-wrapping* column offset.
+            It used to be written at column 0 and then rolled by
+            `randint(0, width - 1)`, which wrapped the block around the tensor
+            edge and split the visible arc into two disconnected fragments at
+            opposite ends -- for 44.8% of samples at 90 degrees, 75.7% at 180.
+            ConvNeXt has no circular padding, so those fragments really do read
+            as two unrelated scenes. The roll was there to stop the block's
+            boundary spelling out the FoV, which it never achieved: both edges
+            of the block stay visible wherever it sits, so the extent is
+            readable either way. It only randomised the phase, at that cost.
+
+            What actually removes the width shortcut is the constant tensor
+            width, plus drawing a fresh FoV per sample (see
+            `CVUSADatasetTrainSinGeo.ground_fov_floor`) so there is no single
+            training FoV to tell apart from the evaluation one.
+
             Set it the same way for training and evaluation. Padding one side
             only trades the shortcut for a plain geometry mismatch.
 
@@ -395,13 +470,14 @@ def apply_limited_fov(x, fov, angle, pad=False):
         # reaches here crops after Normalize/ToTensorV2, so that holds
         # everywhere; move the crop before Normalize and it would not.
         filled = torch.zeros_like(x)
-        filled[:, :, :fov_index] = cropped
 
-        # Left at columns [0, fov_index) the block's boundary would still spell
-        # out the FoV, which is the cue padding exists to remove. Put it at an
-        # arbitrary column instead. The panorama is circular, so wrapping the
-        # block costs nothing and the arc below is unaffected.
-        cropped = torch.roll(filled, random.randint(0, width - 1), dims=2)
+        # Random start, but bounded so the block never wraps the tensor edge:
+        # the kept azimuths stay one contiguous run of columns. See `pad` above
+        # for why the previous torch.roll was both harmful and ineffective.
+        start = random.randint(0, width - fov_index)
+        filled[:, :, start:start + fov_index] = cropped
+
+        cropped = filled
 
     # Column c of the rolled image holds original column (c - rotate_index) mod
     # W, so keeping columns [0, fov_index) keeps original azimuths starting at

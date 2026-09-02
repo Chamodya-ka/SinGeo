@@ -9,7 +9,7 @@ from tqdm import tqdm
 import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
-from singeo.transforms import apply_limited_fov, apply_aerial_sector
+from singeo.transforms import apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov
 
 class CVUSADatasetTrain(Dataset):
     
@@ -219,15 +219,31 @@ class CVUSADatasetEval(Dataset):
                  split,
                  img_type,
                  transforms=None,
+                 deterministic_crop=True,
+                 crop_seed=12345,
                  ):
-        
+
         super().__init__()
- 
+
         self.data_folder = data_folder
         self.split = split
         self.img_type = img_type
         self.transforms = transforms
-        
+
+        # The eval ground transform ends in LimitedFoV/LimitedFoVPad, which
+        # draws a fresh orientation (and, when padding, a fresh column offset)
+        # from the global `random` on every call. Left alone, two evaluations of
+        # the *same* weights score two different query sets, so consecutive
+        # R@1 values differ by resampling noise as well as by model change --
+        # and `best_score` inherits that noise when it picks a checkpoint.
+        #
+        # Seeding per sample index makes the query set fixed across epochs
+        # while staying arbitrary across samples. The seed is saved and restored
+        # around the call so nothing else in the process is perturbed; with
+        # num_workers > 0 the global state is per-worker anyway.
+        self.deterministic_crop = deterministic_crop
+        self.crop_seed = crop_seed
+
         if split == 'train':
             self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         else:
@@ -281,11 +297,21 @@ class CVUSADatasetEval(Dataset):
         else:
             img = cv2.imread(f'{self.data_folder}/{self.images[index]}')
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
+
         # image transforms
         if self.transforms is not None:
-            img = self.transforms(image=img)['image']
-            
+            if self.deterministic_crop:
+                state = random.getstate()
+                # Mix the index rather than seeding with it directly, so
+                # consecutive samples do not draw correlated first values.
+                random.seed((self.crop_seed * 1_000_003 + index * 2_654_435_761) % (2 ** 63))
+                try:
+                    img = self.transforms(image=img)['image']
+                finally:
+                    random.setstate(state)
+            else:
+                img = self.transforms(image=img)['image']
+
         label = torch.tensor(self.label[index], dtype=torch.long)
 
         return img, label
@@ -332,6 +358,14 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
         # Curriculum state, refreshed per-epoch by the training script.
         self.ground_fov = 360.0        # ground FoV crop width in degrees
+
+        # When set, the ground FoV is drawn per sample from [floor, 360] rather
+        # than fixed at `ground_fov` for the whole epoch, and this is the floor.
+        # `None` keeps the original one-FoV-per-epoch behaviour, which is what
+        # the deterministic-curriculum ablation runs with. See
+        # `get_dynamic_fov_floor` for why the range beats the point.
+        self.ground_fov_floor = None
+
         self.sat_arc = 360.0           # aerial sector width in degrees
         # Bounds two things, both widening over the curriculum: the tile's
         # continuous rotation, and how far the aerial sector's heading may
@@ -402,8 +436,13 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
+            if self.ground_fov_floor is None:
+                fov = self.ground_fov
+            else:
+                fov = draw_log_uniform_fov(self.ground_fov_floor)
+
             angle = random.randint(0, 359)
-            query_img2, g_center, g_extent = apply_limited_fov(query_img2, self.ground_fov, angle,
+            query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                pad=self.fov_pad)
             meta[M_GROUND_CENTER] = g_center
             meta[M_GROUND_EXTENT] = g_extent
@@ -453,7 +492,19 @@ class CVUSADatasetTrainSinGeo(Dataset):
             # one edge back onto the other, splitting the scene at an arbitrary
             # column and destroying its spatial layout. Only roll this view
             # while it still covers the full 360 degrees.
-            if query_img2.shape[2] == w:
+            #
+            # Read that off the recorded arc, not off the tensor width: under
+            # `fov_pad` a 70 degree crop is padded back to the panorama's full
+            # width, so `shape[2] == w` is true for every view and the guard
+            # would never fire. Without meta there is no arc to consult and the
+            # width really is the only signal, which is correct for that path
+            # because it does not pad.
+            if meta is not None:
+                q2_is_full = float(meta[M_GROUND_EXTENT]) >= 360.0
+            else:
+                q2_is_full = query_img2.shape[2] == w
+
+            if q2_is_full:
                 query_img2 = torch.roll(query_img2, shifts=shifts, dims=2)
 
 

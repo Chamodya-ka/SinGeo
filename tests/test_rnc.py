@@ -3,10 +3,13 @@
 Run with `pytest tests/test_rnc.py`, or directly with `python tests/test_rnc.py`.
 """
 
+import math
 import os
+import random
 import sys
 import warnings
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +23,7 @@ from singeo.distances import (  # noqa: E402
     NegativeDistanceTiering,
     PositiveOverlapDistance,
     RnCDistanceBuilder,
+    SatelliteEmbeddings,
     angular_overlap,
     expand_views,
     full_arc_like,
@@ -83,9 +87,142 @@ def test_overlap_wraps_around_the_circle():
 def test_overlap_is_symmetric():
     a_c, a_e = torch.tensor([12.0, 300.0]), torch.tensor([80.0, 150.0])
     b_c, b_e = torch.tensor([200.0, 5.0]), torch.tensor([45.0, 360.0])
-    forward = angular_overlap(a_c, a_e, b_c, b_e)
-    backward = angular_overlap(b_c, b_e, a_c, a_e)
-    assert torch.allclose(forward, backward.T, atol=1e-5)
+    for measure in ("iou", "containment"):
+        forward = angular_overlap(a_c, a_e, b_c, b_e, measure=measure)
+        backward = angular_overlap(b_c, b_e, a_c, a_e, measure=measure)
+        assert torch.allclose(forward, backward.T, atol=1e-5), measure
+
+
+def test_containment_ignores_extent_when_one_arc_contains_the_other():
+    # Every one of these is fully contained in the panorama, so containment
+    # reports 1 regardless of how narrow it is -- where IoU reports the ratio.
+    for extent in (360.0, 302.0, 180.0, 90.0, 5.0):
+        contained = angular_overlap(torch.tensor([0.]), torch.tensor([360.]),
+                                    torch.tensor([137.]), torch.tensor([extent]),
+                                    measure="containment")
+        assert torch.allclose(contained, torch.tensor([[1.0]]), atol=1e-5), extent
+
+
+def test_containment_ranks_the_full_tile_above_a_narrower_sector():
+    # The failure IoU produces: for a 302 degree ground crop, a 324 degree
+    # aerial sector outscores the full 360 tile purely by shrinking the union,
+    # even though the tile is a superset of the sector. The eval gallery holds
+    # only full tiles, so that ordering has to come out the other way.
+    crop_c, crop_e = torch.tensor([0.]), torch.tensor([302.])
+    tile = (torch.tensor([0.]), torch.tensor([360.]))
+    sector = (torch.tensor([18.]), torch.tensor([324.]))
+
+    iou_tile = angular_overlap(crop_c, crop_e, *tile, measure="iou")
+    iou_sector = angular_overlap(crop_c, crop_e, *sector, measure="iou")
+    assert iou_sector > iou_tile
+
+    con_tile = angular_overlap(crop_c, crop_e, *tile, measure="containment")
+    con_sector = angular_overlap(crop_c, crop_e, *sector, measure="containment")
+    assert con_tile > con_sector
+    assert torch.allclose(con_tile, torch.tensor([[1.0]]), atol=1e-5)
+
+
+def test_containment_still_grades_by_angular_offset():
+    # Containment must not flatten everything: two equal arcs pulled apart have
+    # to keep separating, or the positive block carries no ordering at all.
+    grades = [angular_overlap(torch.tensor([0.]), torch.tensor([90.]),
+                              torch.tensor([float(off)]), torch.tensor([90.]),
+                              measure="containment").item()
+              for off in (0, 30, 45, 60, 90)]
+    assert grades == sorted(grades, reverse=True), grades
+    assert grades[0] == 1.0 and grades[-1] == 0.0
+
+
+def test_circle_keeps_the_uncropped_view_ahead_across_the_curriculum():
+    """The four orderings the retrieval protocol depends on.
+
+    For two views of the same location, with the eval gallery holding only full
+    aerial tiles and the eval query only ground crops:
+
+        ground anchor (panorama or crop):  full tile  <=  aerial sector
+        aerial anchor (tile or sector):    panorama   <=  ground crop
+
+    An inversion here trains the model to prefer a view type the eval never
+    produces. Equality is allowed -- it happens exactly when the aerial sector
+    contains the ground arc outright, where the two really do cover the same
+    azimuths -- but an inversion is not.
+    """
+    from singeo.transforms import get_dynamic_fov, get_dynamic_rotation_angle
+
+    positive = PositiveOverlapDistance(scale=0.5, measure="circle")
+    max_epoch, rng = 40, random.Random(0)
+
+    for epoch in range(1, max_epoch + 1):
+        gfov = get_dynamic_fov(epoch, max_epoch, fov_start=360, fov_end=70)
+        sarc = get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=180.0)
+        rot = get_dynamic_rotation_angle(epoch, max_epoch, 0.0, 180.0)
+
+        for _ in range(50):
+            gc = rng.uniform(0.0, 360.0)
+            sc = (gc + rng.uniform(-rot, rot)) % 360.0
+
+            pano, crop = _arc(0, 360), _arc(gc, gfov)
+            tile, sector = _arc(0, 360), _arc(sc, sarc)
+
+            state = "epoch {} gfov {:.1f} sarc {:.1f} gc {:.1f} sc {:.1f}".format(
+                epoch, gfov, sarc, gc, sc)
+
+            # ground anchors: the full tile is never beaten by a sector
+            assert positive(pano, tile) <= positive(pano, sector) + 1e-6, state
+            assert positive(crop, tile) <= positive(crop, sector) + 1e-6, state
+
+            # aerial anchors: the panorama is never beaten by a crop
+            assert positive(tile, pano) <= positive(tile, crop) + 1e-6, state
+            assert positive(sector, pano) <= positive(sector, crop) + 1e-6, state
+
+
+def test_iou_and_max_denominators_invert_the_sector_ordering():
+    # Why "circle" rather than a union or a pairwise max: both let a narrower
+    # aerial reference win by shrinking its own denominator.
+    crop_c, crop_e = torch.tensor([0.]), torch.tensor([302.])
+    tile = (torch.tensor([0.]), torch.tensor([360.]))
+    sector = (torch.tensor([18.]), torch.tensor([324.]))
+
+    # iou inverts: the sector scores higher than the full tile
+    assert (angular_overlap(crop_c, crop_e, *sector, measure="iou")
+            > angular_overlap(crop_c, crop_e, *tile, measure="iou"))
+
+    # circle does not
+    assert (angular_overlap(crop_c, crop_e, *sector, measure="circle")
+            < angular_overlap(crop_c, crop_e, *tile, measure="circle"))
+
+    # and when one arc contains the other, iou and max coincide exactly, which
+    # is why swapping the union for a pairwise max changes nothing that matters
+    contained = (torch.tensor([0.]), torch.tensor([302.]))
+    ea, eb, inter = 360.0, 302.0, 302.0
+    assert abs((ea + eb - inter) - max(ea, eb)) < 1e-9
+    assert torch.allclose(
+        angular_overlap(torch.tensor([0.]), torch.tensor([360.]), *contained, measure="iou"),
+        torch.tensor([[inter / max(ea, eb)]]), atol=1e-6)
+
+
+def test_unknown_overlap_measure_is_rejected():
+    with pytest.raises(ValueError):
+        angular_overlap(torch.tensor([0.]), torch.tensor([360.]),
+                        torch.tensor([0.]), torch.tensor([90.]), measure="jaccard")
+    with pytest.raises(ValueError):
+        PositiveOverlapDistance(scale=0.5, measure="jaccard")
+
+
+def test_containment_ties_the_panorama_and_its_crop_against_the_tile():
+    # The whole point of the switch: RNC reads only the ordering within a row,
+    # so these two entries tying is what turns "demote the crop" into "match
+    # them equally well".
+    positive = PositiveOverlapDistance(scale=0.5, measure="containment")
+    tile = _arc(0, 360)
+
+    to_panorama = positive(tile, _arc(0, 360)).item()
+    to_crop = positive(tile, _arc(137, 302)).item()
+    assert to_panorama == to_crop == 0.0
+
+    # Under IoU they do not tie, which is the behaviour being replaced.
+    iou_positive = PositiveOverlapDistance(scale=0.5, measure="iou")
+    assert iou_positive(tile, _arc(137, 302)).item() > iou_positive(tile, _arc(0, 360)).item()
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +476,99 @@ def test_gradients_flow_and_are_finite():
 
     assert anchor.grad is not None and torch.isfinite(anchor.grad).all()
     assert reference.grad is not None and torch.isfinite(reference.grad).all()
+
+
+def test_exclude_ties_is_identical_when_nothing_ties():
+    """The two rank-set rules must only differ where distances are equal.
+
+    `{k : d_k >= d_j}` and `{j} u {k : d_k > d_j}` are the same set when every
+    distance in the row is distinct, so this pins that the flag is inert
+    outside of ties.
+    """
+    torch.manual_seed(4)
+    anchor, reference = torch.randn(9, 5), torch.randn(7, 5)
+    dist = torch.rand(9, 7)                      # distinct with probability 1
+
+    kept = RankNContrast(temperature=1.5, exclude_ties=False)(anchor, reference, dist)
+    dropped = RankNContrast(temperature=1.5, exclude_ties=True)(anchor, reference, dist)
+    assert torch.allclose(kept, dropped, atol=1e-6)
+
+
+def test_exclude_ties_stays_finite_on_the_farthest_reference():
+    """Regression: `>` alone, without keeping `j`, leaves the farthest
+    reference in every row with an empty rank set. logsumexp over all -inf is
+    -inf, so the loss is -inf even when nothing ties at all."""
+    torch.manual_seed(5)
+    anchor, reference = torch.randn(8, 6), torch.randn(8, 6)
+    dist = torch.rand(8, 8) * 0.5 + 0.5
+    dist.fill_diagonal_(0.0)
+
+    loss = RankNContrast(temperature=2.0, exclude_ties=True)(anchor, reference, dist)
+    assert torch.isfinite(loss), loss
+    assert loss >= 0.0, loss
+
+
+def test_exclude_ties_costs_nothing_when_every_distance_is_equal():
+    """A row with no ordering information should cost 0, not |T| log |T|."""
+    anchor, reference = torch.randn(6, 4), torch.randn(6, 4)
+    dist = torch.ones(6, 6)
+
+    dropped = RankNContrast(temperature=2.0, exclude_ties=True)(anchor, reference, dist)
+    kept = RankNContrast(temperature=2.0, exclude_ties=False)(anchor, reference, dist)
+
+    assert torch.allclose(dropped, torch.zeros_like(dropped), atol=1e-6)
+    # The default cannot descend below log|T| -- that floor is the whole issue.
+    assert kept >= math.log(6) - 1e-4, kept
+
+
+def test_exclude_ties_zeroes_the_tied_groups_own_terms():
+    """What the flag does, stated precisely.
+
+    A tied reference keeps appearing in the denominator of every *strictly
+    closer* reference's term -- that is ordinary contrastive pressure and must
+    survive. What goes away is the tied group's own terms, which under the
+    default put each tied reference in every other's denominator and are
+    minimised only when their similarities are identical.
+    """
+    # one positive, five references tied at the far end
+    dist = torch.cat([torch.zeros(1), torch.ones(5)]).unsqueeze(0)
+    sims = torch.tensor([[0.4, 0.30, 0.10, -0.10, -0.25, -0.35]])
+
+    kept = _rnc_terms(sims, dist, exclude_ties=False)[0]
+    dropped = _rnc_terms(sims, dist, exclude_ties=True)[0]
+
+    # the positive's own term is untouched: its rank set is everything either way
+    assert torch.allclose(kept[0], dropped[0], atol=1e-6)
+
+    # the tied group competes with itself under the default...
+    assert (kept[1:] > 0).all(), kept
+    assert kept[1:].max() >= math.log(5) - 1e-4, kept
+    # ...and costs exactly nothing once ties are excluded
+    assert torch.allclose(dropped[1:], torch.zeros(5), atol=1e-6), dropped
+
+
+def test_exclude_ties_keeps_pressure_from_closer_references():
+    """The tied references must still be pushed away from the anchor."""
+    dist = torch.cat([torch.zeros(1), torch.ones(5)]).unsqueeze(0)
+    sims = torch.tensor([[0.4, 0.30, 0.10, -0.10, -0.25, -0.35]], requires_grad=True)
+
+    _rnc_terms(sims, dist, exclude_ties=True).mean().backward()
+    # positive pulled up, every tied negative pushed down
+    assert sims.grad[0, 0] < 0, sims.grad
+    assert (sims.grad[0, 1:] > 0).all(), sims.grad
+
+
+def _rnc_terms(sims, dist, exclude_ties):
+    """Per-reference terms of RankNContrast, driven from a similarity matrix."""
+    n_ref = sims.shape[1]
+    v = torch.ones_like(sims, dtype=torch.bool)
+    if exclude_ties:
+        ge = (dist.unsqueeze(1) > dist.unsqueeze(2)) & v.unsqueeze(1)
+        ge = ge | (torch.eye(n_ref, dtype=torch.bool).unsqueeze(0) & v.unsqueeze(1))
+    else:
+        ge = (dist.unsqueeze(1) >= dist.unsqueeze(2)) & v.unsqueeze(1)
+    logits = sims.unsqueeze(1).expand(-1, n_ref, -1).masked_fill(~ge, float('-inf'))
+    return torch.logsumexp(logits, dim=-1) - sims
 
 
 def test_chunking_matches_the_unchunked_result():
@@ -755,3 +985,272 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+# ---------------------------------------------------------------------------
+# Satellite-embedding negatives
+# ---------------------------------------------------------------------------
+
+def _embed_table(n=6, dim=8, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return SatelliteEmbeddings({i + 1: torch.randn(dim, generator=g).tolist()
+                                for i in range(n)})
+
+
+def test_embeddings_are_normalised_so_cosine_is_a_matmul():
+    table = _embed_table()
+    norms = table.vectors.norm(dim=1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    ids = torch.tensor([1, 2, 3])
+    cos = table.cosine(ids, ids)
+    assert torch.allclose(cos.diagonal(), torch.ones(3), atol=1e-5)
+    assert torch.allclose(cos, cos.T, atol=1e-6)
+    assert (cos >= -1.0001).all() and (cos <= 1.0001).all()
+
+
+def test_dissimilarity_is_zero_for_a_location_against_itself():
+    table = _embed_table()
+    ids = torch.tensor([2, 5])
+    d = table.dissimilarity(ids, ids)
+    assert torch.allclose(d.diagonal(), torch.zeros(2), atol=1e-5)
+    assert (d >= 0).all() and (d <= 1).all()
+
+
+def test_unknown_id_names_itself_in_the_error():
+    table = _embed_table(n=3)
+    with pytest.raises(KeyError, match="99"):
+        table.cosine(torch.tensor([99]), torch.tensor([1]))
+
+
+def test_embed_tiering_stays_inside_the_negative_band():
+    """Negatives must never reach down into the positive range, or the rank
+    sets would mix same-location and different-location pairs."""
+    table = _embed_table(n=8, dim=16)
+    tiering = NegativeDistanceTiering(mode="embed", floor=0.5, margin=1e-2,
+                                      sat_embeddings=table)
+    ids = torch.arange(1, 9)
+    d = tiering(ids, ids)
+    assert (d >= 0.5 + 1e-2 - 1e-6).all(), d.min()
+    assert (d <= 1.0 + 1e-6).all(), d.max()
+
+
+def test_embed_tiering_orders_by_scene_similarity():
+    """A near-duplicate scene must be labelled closer than an unrelated one."""
+    base = [1.0] + [0.0] * 7
+    near = [0.99, 0.14] + [0.0] * 6      # almost the same direction
+    far = [0.0, 0.0, 1.0] + [0.0] * 5    # orthogonal
+    table = SatelliteEmbeddings({1: base, 2: near, 3: far})
+
+    tiering = NegativeDistanceTiering(mode="embed", floor=0.5, margin=1e-2,
+                                      sat_embeddings=table)
+    d = tiering(torch.tensor([1]), torch.tensor([2, 3]))
+    assert d[0, 0] < d[0, 1], d
+
+
+def test_embed_mode_without_a_table_is_an_error():
+    with pytest.raises(ValueError, match="SatelliteEmbeddings"):
+        NegativeDistanceTiering(mode="embed")
+
+
+def test_embed_negatives_barely_tie():
+    """The whole point over the rank lookup: a dense signal leaves the rank
+    sets with real ordering instead of one big equality constraint."""
+    table = _embed_table(n=32, dim=64, seed=7)
+    tiering = NegativeDistanceTiering(mode="embed", floor=0.5, margin=1e-2,
+                                      sat_embeddings=table)
+    ids = torch.arange(1, 33)
+    d = tiering(ids, ids)
+    n = d.shape[1]
+    ties = sum((d[i].unsqueeze(0) == d[i].unsqueeze(1)).sum().item() - n
+               for i in range(d.shape[0]))
+    assert ties / (d.shape[0] * n * (n - 1)) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Padded FoV crop: the kept block must stay contiguous
+# ---------------------------------------------------------------------------
+
+def _visible_columns(view):
+    """Indices of the columns the crop kept, read off a padded ground view."""
+    return (view[0, 0] != 0).nonzero().flatten()
+
+
+def test_padded_crop_block_is_contiguous():
+    """The kept azimuths must land in one unbroken run of columns.
+
+    The pad path used to write the block at column 0 and then roll it by
+    randint(0, width - 1), which wrapped it around the tensor edge and split the
+    visible arc into two disconnected fragments -- 44.8% of samples at FoV 90,
+    75.7% at 180. ConvNeXt has no circular padding, so those fragments read as
+    two unrelated scenes.
+    """
+    width = 768
+    # Column index as the pixel value, offset by 1 so no real column is 0 and
+    # the fill stays distinguishable from content.
+    x = (torch.arange(width, dtype=torch.float32) + 1).view(1, 1, width).expand(3, 4, width).contiguous()
+
+    for fov in (70, 90, 180, 300):
+        for _ in range(200):
+            out, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True)
+            cols = _visible_columns(out)
+
+            assert len(cols) > 0
+            assert cols.max() - cols.min() + 1 == len(cols), (
+                "FoV {} produced a split block at columns {}".format(fov, cols.tolist()))
+
+
+def test_padded_crop_keeps_full_width_and_arc():
+    """Padding changes which columns hold the arc, never which arc is kept."""
+    width = 768
+    x = (torch.arange(width, dtype=torch.float32) + 1).view(1, 1, width).expand(3, 4, width).contiguous()
+
+    for fov in (70, 90, 180):
+        for angle in (0, 37, 200, 359):
+            padded, c_pad, e_pad = apply_limited_fov(x, fov, angle, pad=True)
+            _, c_raw, e_raw = apply_limited_fov(x, fov, angle, pad=False)
+
+            assert padded.shape[2] == width
+            assert c_pad == pytest.approx(c_raw)
+            assert e_pad == pytest.approx(e_raw)
+
+
+def test_padded_crop_start_offset_varies():
+    """The block still moves around, so its position carries no fixed cue."""
+    width = 768
+    x = (torch.arange(width, dtype=torch.float32) + 1).view(1, 1, width).expand(3, 4, width).contiguous()
+
+    starts = set()
+    for _ in range(200):
+        out, _, _ = apply_limited_fov(x, 90, random.randint(0, 359), pad=True)
+        starts.add(int(_visible_columns(out).min()))
+
+    assert len(starts) > 20, starts
+
+
+# ---------------------------------------------------------------------------
+# Log-uniform FoV sampling
+# ---------------------------------------------------------------------------
+
+def test_fov_floor_ramps_to_the_curriculum_end():
+    from singeo.transforms import get_dynamic_fov_floor
+
+    assert get_dynamic_fov_floor(0, 80, 360.0, 70.0, 0.2) == pytest.approx(360.0)
+    # Reaches the end at 20% of the run and stays there.
+    assert get_dynamic_fov_floor(16, 80, 360.0, 70.0, 0.2) == pytest.approx(70.0)
+    assert get_dynamic_fov_floor(80, 80, 360.0, 70.0, 0.2) == pytest.approx(70.0)
+    # Monotone in between.
+    values = [get_dynamic_fov_floor(e, 80, 360.0, 70.0, 0.2) for e in range(0, 17)]
+    assert all(a >= b for a, b in zip(values, values[1:]))
+
+
+def test_log_uniform_draw_stays_in_range_and_reaches_the_narrow_end():
+    from singeo.transforms import draw_log_uniform_fov
+
+    draws = [draw_log_uniform_fov(70.0) for _ in range(20000)]
+    assert min(draws) >= 70.0 and max(draws) <= 360.0
+
+    # Log-uniform on [70, 360] puts ln(90/70)/ln(360/70) = 15.3% of mass at or
+    # below 90 degrees; a linear-uniform draw would put only 7%.
+    below_90 = sum(1 for d in draws if d <= 90.0) / len(draws)
+    assert 0.13 < below_90 < 0.18, below_90
+
+
+def test_log_uniform_draw_at_full_width_is_a_no_op():
+    from singeo.transforms import draw_log_uniform_fov
+
+    assert draw_log_uniform_fov(360.0) == pytest.approx(360.0)
+
+
+# ---------------------------------------------------------------------------
+# Overlap-gated InfoNCE
+# ---------------------------------------------------------------------------
+
+def _infonce():
+    from singeo.loss import InfoNCE
+    return InfoNCE(loss_function=torch.nn.CrossEntropyLoss(label_smoothing=0.1),
+                   device='cpu')
+
+
+def test_unit_weights_reproduce_plain_infonce():
+    """The gate must be a no-op on the default path, or every ungated run in
+    the logs stops being comparable."""
+    torch.manual_seed(0)
+    f1 = torch.randn(12, 64)
+    f2 = torch.randn(12, 64)
+    loss_fn = _infonce()
+
+    plain = loss_fn(f1, f2, torch.tensor(14.0))
+    weighted = loss_fn(f1, f2, torch.tensor(14.0), weights=torch.ones(12))
+
+    assert weighted.item() == pytest.approx(plain.item(), abs=1e-5)
+
+
+def test_zero_weight_drops_a_pair_as_a_positive():
+    """A pair weighted 0 must not influence the loss at all."""
+    torch.manual_seed(1)
+    f1 = torch.randn(8, 64)
+    f2 = torch.randn(8, 64)
+    loss_fn = _infonce()
+
+    w = torch.ones(8)
+    w[3] = 0.0
+
+    gated = loss_fn(f1, f2, torch.tensor(14.0), weights=w)
+
+    # Moving the dropped pair's own features cannot change the loss through its
+    # positive term -- only through the denominators, which is intended, so
+    # compare against an explicit mean over the surviving rows instead.
+    import torch.nn.functional as F
+    logits = 14.0 * F.normalize(f1, dim=-1) @ F.normalize(f2, dim=-1).T
+    labels = torch.arange(8)
+    per1 = F.cross_entropy(logits, labels, reduction='none', label_smoothing=0.1)
+    per2 = F.cross_entropy(logits.T, labels, reduction='none', label_smoothing=0.1)
+    keep = [i for i in range(8) if i != 3]
+    expected = (per1[keep].mean() + per2[keep].mean()) / 2
+
+    assert gated.item() == pytest.approx(expected.item(), abs=1e-5)
+
+
+def test_gate_is_one_whenever_one_side_is_a_full_view():
+    """Only loss6 may move: every other term pairs against a 360 degree view."""
+    from singeo.trainer import _pair_overlap_gate
+
+    torch.manual_seed(2)
+    batch = 16
+    full = torch.stack([torch.zeros(batch), torch.full((batch,), 360.0)], dim=1)
+    crop = torch.stack([torch.rand(batch) * 360.0, torch.rand(batch) * 200 + 60], dim=1)
+
+    for a, b in ((full, full), (full, crop), (crop, full)):
+        gate = _pair_overlap_gate(a, b)
+        assert torch.allclose(gate, torch.ones(batch), atol=1e-5), gate
+
+
+def test_gate_is_zero_for_disjoint_arcs():
+    from singeo.trainer import _pair_overlap_gate
+
+    # 70 degree ground crop facing north, 90 degree wedge facing south.
+    ground = torch.tensor([[0.0, 70.0]])
+    wedge = torch.tensor([[180.0, 90.0]])
+
+    assert _pair_overlap_gate(ground, wedge).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_gate_is_one_when_the_wedge_contains_the_ground_crop():
+    from singeo.trainer import _pair_overlap_gate
+
+    ground = torch.tensor([[10.0, 70.0]])
+    wedge = torch.tensor([[10.0, 180.0]])
+
+    assert _pair_overlap_gate(ground, wedge).item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_gate_is_the_covered_fraction_on_partial_overlap():
+    from singeo.trainer import _pair_overlap_gate
+
+    # 90 degree crop centred at 0 spans [-45, 45]; 90 degree wedge centred at 45
+    # spans [0, 90]. They share 45 degrees, i.e. half of the narrower view.
+    ground = torch.tensor([[0.0, 90.0]])
+    wedge = torch.tensor([[45.0, 90.0]])
+
+    assert _pair_overlap_gate(ground, wedge).item() == pytest.approx(0.5, abs=1e-6)

@@ -7,24 +7,64 @@ class InfoNCE(nn.Module):
 
     def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu'):
         super().__init__()
-        
+
         self.loss_function = loss_function
         self.device = device
 
-    def forward(self, image_features1, image_features2, logit_scale):
+    def forward(self, image_features1, image_features2, logit_scale, weights=None):
+        """
+        Args:
+            weights: optional `[B]` per-pair weight in [0, 1] scaling how much
+                pair `i` counts *as a positive*. `None` reproduces the plain
+                symmetric InfoNCE exactly.
+
+                This exists because the SinGeo view set can produce pairs that
+                are not positives at all. The aerial sector's heading drifts off
+                the ground crop's by up to +-180 degrees late in the curriculum,
+                so by the final epoch ~31% of (ground crop, aerial wedge) pairs
+                share no azimuth whatsoever -- and the unweighted loss still
+                instructs the model that a view facing north matches a wedge
+                facing south. Weighting by the measured arc overlap lets such a
+                pair contribute nothing as a positive.
+
+                Note it is only removed as a *positive*: the view stays in every
+                other row's denominator, where it is a perfectly valid negative
+                because it belongs to a different location.
+        """
         image_features1 = F.normalize(image_features1, dim=-1)
         image_features2 = F.normalize(image_features2, dim=-1)
-        
-        logits_per_image1 = logit_scale * image_features1 @ image_features2.T
-        
-        logits_per_image2 = logits_per_image1.T
-        
-        labels = torch.arange(len(logits_per_image1), dtype=torch.long, device=self.device)
-        
-        loss = (self.loss_function(logits_per_image1, labels) + self.loss_function(logits_per_image2, labels))/2
 
-        return loss  
- 
+        logits_per_image1 = logit_scale * image_features1 @ image_features2.T
+
+        logits_per_image2 = logits_per_image1.T
+
+        labels = torch.arange(len(logits_per_image1), dtype=torch.long, device=self.device)
+
+        if weights is None:
+            loss = (self.loss_function(logits_per_image1, labels) + self.loss_function(logits_per_image2, labels))/2
+            return loss
+
+        # Row j of the transposed direction describes the same pair as row j of
+        # the first, so one weight vector serves both.
+        label_smoothing = getattr(self.loss_function, 'label_smoothing', 0.0)
+
+        per_sample1 = F.cross_entropy(logits_per_image1, labels, reduction='none',
+                                      label_smoothing=label_smoothing)
+        per_sample2 = F.cross_entropy(logits_per_image2, labels, reduction='none',
+                                      label_smoothing=label_smoothing)
+
+        # Match the *loss* dtype, not the logits': under autocast the logits are
+        # fp16 while cross_entropy returns fp32, and rounding the weights to
+        # fp16 would quantise them for no reason.
+        w = weights.to(per_sample1.dtype).clamp(min=0.0)
+
+        # Weighted mean of each direction, then averaged -- which is what the
+        # unweighted branch above computes when every weight is 1.
+        denominator = w.sum().clamp(min=1e-6)
+        loss = ((w * per_sample1).sum() + (w * per_sample2).sum()) / (2.0 * denominator)
+
+        return loss
+
 
 class RankNContrast(nn.Module):
     """Rank-N-Contrast loss over an arbitrary anchor/reference pair of view sets.

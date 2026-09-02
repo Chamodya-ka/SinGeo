@@ -5,7 +5,8 @@ from .utils import AverageMeter
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
-from .distances import M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT, expand_views, full_arc_like
+from .distances import (M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT,
+                        angular_overlap, expand_views, full_arc_like)
 from .loss import compute_rnc_groups
 
 def train(train_config, model, dataloader, loss_function, optimizer, scheduler=None, scaler=None):
@@ -957,20 +958,80 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
 
 
 
+def _pair_overlap_gate(arc_a, arc_b):
+    """`[B]` weight for each aligned (view a, view b) pair, from their arcs.
+
+    ``"containment"`` -- `inter / min(extent_a, extent_b)` -- is the right
+    measure for a *positive-pair* weight, because it asks "how much of the
+    narrower view does the other one also see". A wedge that fully contains the
+    ground crop scores 1: the two really do show the same scene, and the wider
+    one must not be penalised for being a superset. Disjoint arcs score 0.
+    ``"iou"`` would wrongly discount a contained pair and ``"circle"`` would
+    discount every pair by its own narrowness.
+
+    `angular_overlap` returns the full `[N, M]` cross product; only the diagonal
+    pairs views of the same location, which is what the InfoNCE positives are.
+    """
+    overlap = angular_overlap(arc_a[:, 0], arc_a[:, 1], arc_b[:, 0], arc_b[:, 1],
+                              measure="containment")
+    return overlap.diagonal()
+
+
 def _singeo_infonce_terms(train_config, model, loss_function,
-                          features_q1, features_q2, features_r1, features_r2):
-    """The six InfoNCE terms of `train_contrast_singeo`, and their combination."""
+                          features_q1, features_q2, features_r1, features_r2,
+                          meta=None):
+    """The six InfoNCE terms of `train_contrast_singeo`, and their combination.
+
+    With `meta` and `train_config.overlap_gated_infonce`, each term is weighted
+    by how much of the narrower of its two views the other one actually covers.
+
+    Five of the six are unaffected by construction, which is the point: `q1` and
+    `r1` are always full 360 degree views, so any pair involving one of them is
+    contained outright and scores exactly 1. Only `loss6` -- ground crop against
+    aerial wedge, the one pair where *both* sides are cropped -- can drop below
+    1, and it must: the wedge's heading drifts up to +-180 degrees off the
+    ground crop's, so late in the curriculum the two can point in unrelated
+    directions while the ungated loss still calls them a positive.
+
+    Measured over the curriculum, mean `loss6` weight and the share of pairs it
+    zeroes outright:
+
+        epoch                     8       40      80
+        deterministic FoV       1.000   1.000   0.31 / 30.6% zero
+        log-uniform FoV         0.997   0.945   0.63 /  7.0% zero
+
+    Per-sample FoV sampling already removes most of the damage, because a wide
+    ground crop overlaps almost any wedge; the gate covers what is left.
+    """
     if torch.cuda.device_count() > 1 and len(train_config.gpu_ids) > 1:
         logit_scale = model.module.logit_scale.exp()
     else:
         logit_scale = model.logit_scale.exp()
 
-    loss1 = loss_function(features_q1, features_r1, logit_scale)  # original q1 and original r1
-    loss2 = loss_function(features_q1, features_q2, logit_scale)  # original q1 and auged q2
-    loss3 = loss_function(features_r1, features_r2, logit_scale)  # original r1 and auged&rotted r2
-    loss4 = loss_function(features_r1, features_q2, logit_scale)  # original r1 and auged q2
-    loss5 = loss_function(features_r2, features_q1, logit_scale)  # original q1 and auged&rotted r2
-    loss6 = loss_function(features_r2, features_q2, logit_scale)  # original q2 and auged&rotted r2
+    gate = getattr(train_config, 'overlap_gated_infonce', False) and meta is not None
+
+    if gate:
+        full = full_arc_like(meta[:, 0])
+        arc_q1 = full
+        arc_r1 = full
+        arc_q2 = torch.stack([meta[:, M_GROUND_CENTER], meta[:, M_GROUND_EXTENT]], dim=1)
+        arc_r2 = torch.stack([meta[:, M_SAT_CENTER], meta[:, M_SAT_EXTENT]], dim=1)
+
+        w1 = _pair_overlap_gate(arc_q1, arc_r1)
+        w2 = _pair_overlap_gate(arc_q1, arc_q2)
+        w3 = _pair_overlap_gate(arc_r1, arc_r2)
+        w4 = _pair_overlap_gate(arc_r1, arc_q2)
+        w5 = _pair_overlap_gate(arc_r2, arc_q1)
+        w6 = _pair_overlap_gate(arc_r2, arc_q2)
+    else:
+        w1 = w2 = w3 = w4 = w5 = w6 = None
+
+    loss1 = loss_function(features_q1, features_r1, logit_scale, weights=w1)  # original q1 and original r1
+    loss2 = loss_function(features_q1, features_q2, logit_scale, weights=w2)  # original q1 and auged q2
+    loss3 = loss_function(features_r1, features_r2, logit_scale, weights=w3)  # original r1 and auged&rotted r2
+    loss4 = loss_function(features_r1, features_q2, logit_scale, weights=w4)  # original r1 and auged q2
+    loss5 = loss_function(features_r2, features_q1, logit_scale, weights=w5)  # original q1 and auged&rotted r2
+    loss6 = loss_function(features_r2, features_q2, logit_scale, weights=w6)  # original q2 and auged&rotted r2
 
     total = loss1 + 0.5 * loss2 + 0.5 * loss3 + 0.25 * loss4 + 0.25 * loss5 + 0.25 * loss6
     return total, (loss1, loss2, loss3, loss4, loss5, loss6)
@@ -1048,13 +1109,15 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
 
             features_q1, features_q2, features_r1, features_r2 = model(q1, q2, r1, r2)
 
+            meta_dev = meta.to(train_config.device)
+
             total, terms = _singeo_infonce_terms(train_config, model, loss_function,
-                                                 features_q1, features_q2, features_r1, features_r2)
+                                                 features_q1, features_q2, features_r1, features_r2,
+                                                 meta=meta_dev)
 
             groups = None
             if use_rnc:
                 ids_dev = ids.to(train_config.device)
-                meta_dev = meta.to(train_config.device)
 
                 ids_ground, arcs_ground, ids_aerial, arcs_aerial = _build_rnc_view_sets(
                     ids_dev, meta_dev, enable_aerial_crop)
