@@ -79,6 +79,23 @@ class Configuration:
     # Loss
     label_smoothing: float = 0.1
 
+    # Scales the six-term InfoNCE block, the way `rnc_weight` scales the RNC
+    # block. Exists so the two objectives can be switched off independently:
+    #
+    #   infonce_weight=1, rnc_weight=0.25  both (the standard configuration)
+    #   infonce_weight=1, rnc_weight=0     gated InfoNCE alone
+    #   infonce_weight=0, rnc_weight=0.25  RNC alone
+    #
+    # Setting this to 0 leaves `logit_scale` without gradient, which is
+    # harmless: RNC carries its own temperature (`rnc_tau`) and never reads it.
+    #
+    # Note that switching RNC off must be done with `rnc_weight=0`, NOT
+    # `use_rnc=False`: `use_rnc` also controls whether the dataset emits the
+    # crop arcs (`return_meta`) and whether the aerial wedge exists at all, so
+    # turning it off would silently remove the overlap gate and the aerial crop
+    # along with the RNC term.
+    infonce_weight: float = 1.0
+
     # Rank-N-Contrast (RNC) auxiliary loss
     # Added alongside the six InfoNCE terms, never replacing them.
     use_rnc: bool = True              # master switch for the whole RNC path
@@ -99,7 +116,22 @@ class Configuration:
     # from the first epoch to the last while contributing ~60% of the reported
     # train loss. 0.1 is roughly the scale the InfoNCE head already uses
     # (logit_scale = 1/0.07).
-    rnc_tau: float = 0.1
+    #
+    # SWEPT, full CVUSA, 80 epochs, everything else fixed. FoV 90 R@1 / Avg:
+    #
+    #   tau    0.05     0.1      0.2      0.5      1.0      2.0
+    #   FoV90  66.32    68.43    71.63    75.38    75.24    61.43*
+    #   Avg    75.02    76.29    79.47    82.01    81.83      -
+    #
+    #   * the tau=2.0 runs also predate the ground FoV curriculum, padding-roll
+    #     and eval-seeding fixes, so that point bounds 2.0 from above rather
+    #     than isolating it.
+    #
+    # 0.5 and 1.0 are effectively tied, so the optimum is a broad plateau rather
+    # than a sharp peak; 0.5 is the default as the lower edge of it. This was
+    # the single most valuable knob found -- worth +9.1 R@1 at FoV 90 from the
+    # 0.05 end, and it is what took the branch past the published SinGeo.
+    rnc_tau: float = 0.5
 
     # How equidistant references are treated in each other's rank sets.
     #
@@ -346,6 +378,20 @@ class Configuration:
     # recall incomparable with logs from before the switch -- the eval input
     # changes shape -- so re-baseline rather than reading it against them.
     fov_pad: bool=True
+
+    # Give the uncropped panorama (q1) its own uniform roll in training.
+    #
+    # Without it, q1 and the aerial tile are always in the SAME relative
+    # orientation: the prob_rotate block rotates the tile and rolls the panorama
+    # by the matching amount. Evaluation never does that -- get_transforms_val
+    # rolls the query by random.randint(0, 359) and leaves the north-up tile
+    # alone -- so every test pair carries an arbitrary relative orientation the
+    # model was never trained on. prob_rotate's four discrete offsets do not
+    # cover that, and 25% of samples get no roll at all.
+    #
+    # Only q1 is rolled; it is cyclic over 360 degrees so the rotation is exact.
+    # The RNC arc for q1 stays (0, 360), so distance labels are untouched.
+    ground_roll_q1: bool = False
 
 #-----------------------------------------------------------------------------#
 # Train Config                                                                #
@@ -647,6 +693,7 @@ if __name__ == '__main__':
     # drew), so the padding switch is handed over here rather than baked into
     # the transform pipeline.
     train_dataset.fov_pad = config.fov_pad
+    train_dataset.roll_q1 = config.ground_roll_q1
 
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,

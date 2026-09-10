@@ -377,6 +377,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # narrower tensor. Has to match `fov_pad` on the eval transforms.
         self.fov_pad = False
 
+        # Give the full panorama its own uniform roll, independent of the
+        # paired rotate below. Off by default; see __getitem__ for why.
+        self.roll_q1 = False
+
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         
         self.df = self.df.rename(columns={0: "sat", 1: "ground", 2: "ground_anno"})
@@ -507,6 +511,27 @@ class CVUSADatasetTrainSinGeo(Dataset):
             if q2_is_full:
                 query_img2 = torch.roll(query_img2, shifts=shifts, dims=2)
 
+
+        # Independent uniform roll of the full panorama.
+        #
+        # The block above keeps q1 and r1 *aligned*: it rotates the tile and
+        # rolls the panorama by the matching amount, so their relative
+        # orientation is always 0. Evaluation does not do that. get_transforms_val
+        # applies LimitedFoV, which rolls the query by random.randint(0, 359) and
+        # leaves the north-up tile untouched, so every test pair carries an
+        # arbitrary relative orientation that training never produced. Four
+        # discrete offsets from prob_rotate do not cover a uniform circle either,
+        # and 25% of samples get no roll at all. This closes that gap.
+        #
+        # Only q1 is touched. It spans 360 degrees and is cyclic, so rolling is
+        # an exact rotation with no seam; q2 is a crop and rolling it would split
+        # the scene at an arbitrary column, which is what the guard above avoids.
+        #
+        # The RNC arc for q1 stays (0, 360) and the labels are unchanged: a full
+        # panorama contains every azimuth wherever its seam happens to sit.
+        if self.roll_q1:
+            width = query_img1.shape[2]
+            query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
 
         label = torch.tensor(idx, dtype=torch.long)
 

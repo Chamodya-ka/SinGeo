@@ -1081,6 +1081,13 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
 
     use_rnc = rnc_loss is not None and distance_builder is not None
     rnc_weight = getattr(train_config, 'rnc_weight', 1.0)
+    # Scales the six-term InfoNCE block. 0.0 trains on RNC alone, which is the
+    # only way to ask what the ranking objective delivers by itself -- the two
+    # losses are otherwise always summed. Under AdamW a constant multiplier on
+    # the whole loss is nearly a no-op (the optimiser normalises by gradient
+    # magnitude), so this is a genuine on/off rather than a learning-rate
+    # change in disguise.
+    infonce_weight = getattr(train_config, 'infonce_weight', 1.0)
     group_weights = getattr(train_config, 'rnc_group_weights', (1.0, 1.0, 1.0, 1.0))
     group_weights = dict(zip(('g2a', 'g2g', 'a2g', 'a2a'), group_weights))
     enable_aerial_crop = getattr(train_config, 'enable_aerial_crop', True)
@@ -1134,7 +1141,7 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
                                             arcs_ground, arcs_aerial)
 
                 rnc_total = sum(group_weights[k] * v for k, v in groups.items())
-                total = total + rnc_weight * rnc_total
+                total = infonce_weight * total + rnc_weight * rnc_total
 
             return total, terms, groups
 
