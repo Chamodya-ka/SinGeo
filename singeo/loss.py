@@ -221,7 +221,8 @@ def rnc_same_domain_mask(batch_size, device=None):
 
 
 def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
-                       ids_ground, ids_aerial, arcs_ground, arcs_aerial):
+                       ids_ground, ids_aerial, arcs_ground, arcs_aerial,
+                       positives_only=False):
     """Run RNC separately for the four anchor/reference groups.
 
     The groups are kept apart on purpose. Same-domain and cross-domain
@@ -237,6 +238,26 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_aerial: `[N_a, D]` stacked aerial views.
         ids_ground, ids_aerial: `[N_g]` / `[N_a]` location ids.
         arcs_ground, arcs_aerial: `[N_g, 2]` / `[N_a, 2]` (center, extent).
+        positives_only: restrict every group to views of the SAME location, so
+            RNC ranks a location's own views against each other and nothing
+            else. Different-location pairs leave both the numerator and every
+            denominator.
+
+            The rationale is that ranking one positive against one unrelated
+            negative asks a question the overlap labels cannot answer: the arcs
+            say how much two views of one place share, and there is no
+            meaningful sense in which a view of Kansas is "0.83 far" from a view
+            of Oregon. Under this flag RNC becomes purely a view-overlap
+            ordering term and all positive-vs-negative discrimination is left to
+            InfoNCE, which is what that loss is for.
+
+            Two consequences worth knowing. `negative_tiering` stops being read
+            at all, so no geographic or satellite-embedding table is needed. And
+            with two views per domain the same-domain groups go to exactly zero:
+            the only same-location reference for anchor `q1_i` in `g2g` is
+            `q2_i` (the diagonal is already dropped), its rank set is itself, and
+            `logsumexp({s}) - s = 0`. Only `g2a` and `a2g` carry signal, one
+            non-zero term per row.
 
     Returns:
         Dict with keys ``g2a``, ``g2g``, ``a2g``, ``a2a`` holding the four raw
@@ -255,6 +276,16 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
     n_a = features_aerial.shape[0]
     device = features_ground.device
 
+    def scope(ids_a, ids_b, drop_diagonal):
+        """`valid` mask for one group: which references may take part at all."""
+        mask = None
+        if positives_only:
+            mask = ids_a.unsqueeze(1) == ids_b.unsqueeze(0)
+        if drop_diagonal:
+            no_self = rnc_same_domain_mask(ids_a.shape[0], device=device)
+            mask = no_self if mask is None else (mask & no_self)
+        return mask
+
     groups = {}
 
     # (a) ground anchors -> aerial references
@@ -262,6 +293,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_ground, features_aerial,
         builder(ids_ground, arcs_ground, ids_aerial, arcs_aerial,
                 hardness=hardness(features_ground, features_aerial)),
+        valid=scope(ids_ground, ids_aerial, False),
     )
 
     # (b) ground anchors -> ground references (self-pairs dropped)
@@ -269,7 +301,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_ground, features_ground,
         builder(ids_ground, arcs_ground, ids_ground, arcs_ground,
                 hardness=hardness(features_ground, features_ground)),
-        valid=rnc_same_domain_mask(n_g, device=device),
+        valid=scope(ids_ground, ids_ground, True),
     )
 
     # (c) aerial anchors -> ground references
@@ -277,6 +309,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_aerial, features_ground,
         builder(ids_aerial, arcs_aerial, ids_ground, arcs_ground,
                 hardness=hardness(features_aerial, features_ground)),
+        valid=scope(ids_aerial, ids_ground, False),
     )
 
     # (d) aerial anchors -> aerial references (self-pairs dropped)
@@ -284,7 +317,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_aerial, features_aerial,
         builder(ids_aerial, arcs_aerial, ids_aerial, arcs_aerial,
                 hardness=hardness(features_aerial, features_aerial)),
-        valid=rnc_same_domain_mask(n_a, device=device),
+        valid=scope(ids_aerial, ids_aerial, True),
     )
 
     return groups

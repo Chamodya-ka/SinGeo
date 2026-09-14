@@ -377,6 +377,11 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # narrower tensor. Has to match `fov_pad` on the eval transforms.
         self.fov_pad = False
 
+        # Placement of the padded block. False pins it to column 0 so its start
+        # and end are fixed by the FoV alone -- an ablation of the positional
+        # randomisation, see `apply_limited_fov`.
+        self.pad_random_start = True
+
         # Give the full panorama its own uniform roll, independent of the
         # paired rotate below. Off by default; see __getitem__ for why.
         self.roll_q1 = False
@@ -447,7 +452,8 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
             angle = random.randint(0, 359)
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
-                                                               pad=self.fov_pad)
+                                                               pad=self.fov_pad,
+                                                               pad_random_start=self.pad_random_start)
             meta[M_GROUND_CENTER] = g_center
             meta[M_GROUND_EXTENT] = g_extent
 

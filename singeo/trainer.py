@@ -1091,6 +1091,7 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     group_weights = getattr(train_config, 'rnc_group_weights', (1.0, 1.0, 1.0, 1.0))
     group_weights = dict(zip(('g2a', 'g2g', 'a2g', 'a2a'), group_weights))
     enable_aerial_crop = getattr(train_config, 'enable_aerial_crop', True)
+    rnc_positives_only = getattr(train_config, 'rnc_positives_only', False)
 
     # wait before starting progress bar
     time.sleep(0.1)
@@ -1138,7 +1139,8 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
                 groups = compute_rnc_groups(rnc_loss, distance_builder,
                                             features_ground, features_aerial,
                                             ids_ground, ids_aerial,
-                                            arcs_ground, arcs_aerial)
+                                            arcs_ground, arcs_aerial,
+                                            positives_only=rnc_positives_only)
 
                 rnc_total = sum(group_weights[k] * v for k, v in groups.items())
                 total = infonce_weight * total + rnc_weight * rnc_total

@@ -19,6 +19,7 @@ from singeo.distances import (  # noqa: E402
     M_GROUND_EXTENT,
     M_SAT_CENTER,
     M_SAT_EXTENT,
+    GeoCoordinates,
     GeoNeighbourRanks,
     NegativeDistanceTiering,
     PositiveOverlapDistance,
@@ -1254,3 +1255,80 @@ def test_gate_is_the_covered_fraction_on_partial_overlap():
     wedge = torch.tensor([[45.0, 90.0]])
 
     assert _pair_overlap_gate(ground, wedge).item() == pytest.approx(0.5, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# positives-only scoping
+# ---------------------------------------------------------------------------
+
+def _views(B=4, D=32, seed=0):
+    """The trainer's view sets: 2 ground + 2 aerial views per location."""
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.arange(100, 100 + B)
+    meta = torch.zeros(B, M_SAT_EXTENT + 1)
+    meta[:, M_GROUND_CENTER] = torch.rand(B, generator=g) * 360
+    meta[:, M_GROUND_EXTENT] = 180.0
+    meta[:, M_SAT_CENTER] = (meta[:, M_GROUND_CENTER] + 40) % 360
+    meta[:, M_SAT_EXTENT] = 270.0
+    from singeo.trainer import _build_rnc_view_sets
+    idg, arg, ida, ara = _build_rnc_view_sets(ids, meta, True)
+    fg = torch.randn(2 * B, D, generator=g)
+    fa = torch.randn(2 * B, D, generator=g)
+    return fg, fa, idg, ida, arg, ara
+
+
+def test_positives_only_ignores_the_negative_tiering_entirely():
+    """If different-location pairs are masked out, whatever fills them cannot
+    change the answer -- which is what makes the GEE table unnecessary."""
+    fg, fa, idg, ida, arg, ara = _views()
+    rnc = RankNContrast(temperature=0.5)
+
+    losses = []
+    for tiering in ("none", "geo"):
+        kw = {"geo_max_km": None}
+        if tiering == "geo":
+            kw["geo_coords"] = GeoCoordinates({int(i): (float(i) * 0.7, float(i) * 1.3)
+                                               for i in idg.unique().tolist()})
+        b = RnCDistanceBuilder(positive_scale=0.5, negative_tiering=tiering,
+                               positive_overlap="circle", **kw)
+        g = compute_rnc_groups(rnc, b, fg, fa, idg, ida, arg, ara, positives_only=True)
+        losses.append(sum(v.item() for v in g.values()))
+    assert abs(losses[0] - losses[1]) < 1e-9, losses
+
+
+def test_positives_only_zeroes_the_same_domain_groups():
+    """With two views per domain, g2g/a2a have a single same-location reference
+    whose rank set is itself, so they contribute exactly 0."""
+    fg, fa, idg, ida, arg, ara = _views()
+    b = RnCDistanceBuilder(positive_scale=0.5, negative_tiering="none",
+                           positive_overlap="circle")
+    g = compute_rnc_groups(RankNContrast(temperature=0.5), b,
+                           fg, fa, idg, ida, arg, ara, positives_only=True)
+    assert abs(g['g2g'].item()) < 1e-9, g['g2g']
+    assert abs(g['a2a'].item()) < 1e-9, g['a2a']
+    assert g['g2a'].item() > 0 and g['a2g'].item() > 0, g
+
+
+def test_positives_only_changes_the_answer_vs_all_pairs():
+    """Sanity: the flag is not a no-op on the cross-domain groups."""
+    fg, fa, idg, ida, arg, ara = _views()
+    b = RnCDistanceBuilder(positive_scale=0.5, negative_tiering="none",
+                           positive_overlap="circle")
+    rnc = RankNContrast(temperature=0.5)
+    scoped = compute_rnc_groups(rnc, b, fg, fa, idg, ida, arg, ara, positives_only=True)
+    everything = compute_rnc_groups(rnc, b, fg, fa, idg, ida, arg, ara, positives_only=False)
+    assert scoped['g2a'].item() != everything['g2a'].item()
+
+
+def test_positives_only_still_ranks_the_semi_positives_correctly():
+    """The surviving signal: for a ground anchor the full aerial tile must beat
+    the wedge, which is exactly the ordering the arcs encode."""
+    fg, fa, idg, ida, arg, ara = _views()
+    b = RnCDistanceBuilder(positive_scale=0.5, negative_tiering="none",
+                           positive_overlap="circle")
+    d = b(idg, arg, ida, ara)
+    same = idg.unsqueeze(1) == ida.unsqueeze(0)
+    B = idg.shape[0] // 2
+    for i in range(B):
+        assert d[i, i] <= d[i, i + B] + 1e-6      # pano: tile <= wedge
+    assert (d[same] <= 0.5 + 1e-6).all()

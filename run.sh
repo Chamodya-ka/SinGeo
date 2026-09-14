@@ -17,7 +17,8 @@
 #   round3   160-epoch primary + tau=0.2 probe            [full data] 3a DIED, 3b BEST
 #   round4   bracket the tau optimum: 0.5 vs 1.0          [full data, 80 ep] DONE tau=0.5 BEST
 #   round5   loss decomposition: InfoNCE-only vs RnC-only [full data, 80 ep] DONE
-#   round6   rnc_weight sweep: 0.5 vs 1.0                 [full data, 80 ep]
+#   round6   rnc_weight sweep: 0.5 vs 1.0                 [full data, 80 ep] DONE
+#   round9   q1roll+padding vs padding-with-fixed-offset  [full data, 80 ep]
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -577,6 +578,71 @@ READING IT, against round7a:
 
 Everything else identical to round7a: wedge ON, gate ON, rnc_weight 0.0, tau 0.5,
 fov_pad OFF, deterministic ground FoV, batch 16, 80 epochs, num_workers 2.'
+    ;;
+
+round9)
+    echo "Round 9 - is padding's RANDOM block offset the thing that prevents the collapse?"
+    echo "  collapse at ep16 seen in every unpadded, no-q1-roll run:"
+    echo "    old log.txt 14.04->3.08   round7a 15.66->3.61   round8a 18.49->6.99"
+    echo "  prevented by EITHER padding (230514, round1a, round4a) OR q1-roll (round8b)"
+    launch round9a-q1roll-pad \
+        SINGEO_FOV_PAD=true SINGEO_GROUND_ROLL_Q1=true \
+        SINGEO_FOV_SAMPLING=deterministic SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE="round8b plus padding. Single variable vs round8b: fov_pad False -> True.
+
+round8b (q1-roll, no padding) never dipped at epoch 16 where round7a and round8a
+both did, so the q1 roll alone is sufficient to prevent the collapse. This asks
+whether the two protections COMPOUND or merely overlap.
+
+They are suspected to work by the same mechanism -- denying the model an
+absolute column-position cue. Padding randomises WHERE content sits in the
+768-wide tensor; the q1 roll randomises WHICH azimuth the panorama starts at.
+If that is right the two are redundant and this should land close to round8b
+plus whatever padding is independently worth at narrow FoV.
+
+There is a second thing to read here. Padding and no-padding have opposite
+FoV profiles: round8a (no padding) reaches 96.78 at FoV 360, the best of any run
+and level with the paper's 96.8, while padded runs peak at 94.92 and 230514 even
+scored FoV 360 BELOW its own FoV 180 (81.61 vs 85.75). The cause is that the pad
+branch never fires at FoV 360 (fov_index == width), so a padded model sees a
+fill-free panorama in only 1.26% of samples. This run has padding AND the q1
+roll, so it says whether the roll recovers the wide-FoV end that padding costs.
+
+Everything else identical to round8b: wedge ON, gate ON, rnc_weight 0.0,
+tau 0.5, deterministic ground FoV, batch 16, 80 epochs, num_workers 2."
+
+    launch round9b-pad-fixedstart \
+        SINGEO_FOV_PAD=true SINGEO_FOV_PAD_RANDOM_START=false \
+        SINGEO_FOV_SAMPLING=deterministic SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE="THE DECISIVE TEST. Padding ON but the block pinned to column 0, so its
+start and end are fixed by the FoV alone instead of being drawn at random.
+
+This is round7a -- which collapsed at epoch 16, FoV 90 15.66 -> 3.61 -- with
+padding added in its fixed-offset form. No q1 roll, so the other protection is
+absent and cannot mask the result.
+
+WHY IT SEPARATES THE TWO CANDIDATE MECHANISMS. Padding changes two things at
+once: it makes every ground tensor a constant 768 columns wide in training and
+at evaluation, and it places the visible arc at a uniformly random column. Fixed
+start keeps the first and removes the second.
+
+  collapses at epoch 16  -> the random offset is what protects. Padding works by
+      forcing positional invariance, which is the same thing the q1 roll buys
+      from the other direction, and the constant tensor width is incidental.
+  stays smooth           -> the constant train/eval tensor width is what
+      protects, positional randomisation is incidental, and the q1 roll must
+      then be helping by some other route.
+
+Measured for reference: at FoV 90 the padded tensor is 75.0% mean-colour fill
+whichever way the block is placed, so fill fraction is held constant between
+this run and a normal padded one. With random offsets the block start takes 168
+distinct values over 200 draws; pinned it takes exactly 1.
+
+Everything else identical to round7a: wedge ON, gate ON, rnc_weight 0.0,
+tau 0.5, deterministic ground FoV, no q1 roll, batch 16, 80 epochs,
+num_workers 2."
     ;;
 
 list)

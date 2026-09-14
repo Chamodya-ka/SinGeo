@@ -395,7 +395,7 @@ class Zoomin(ImageOnlyTransform):
         
         return resized_tensor   
 
-def apply_limited_fov(x, fov, angle, pad=False):
+def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True):
     """Ground FoV crop that also reports the azimuth arc it kept.
 
     Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
@@ -474,7 +474,13 @@ def apply_limited_fov(x, fov, angle, pad=False):
         # Random start, but bounded so the block never wraps the tensor edge:
         # the kept azimuths stay one contiguous run of columns. See `pad` above
         # for why the previous torch.roll was both harmful and ineffective.
-        start = random.randint(0, width - fov_index)
+        #
+        # `pad_random_start=False` pins the block to column 0, so its start AND
+        # end are fixed by the FoV alone. That is an ablation, not a setting to
+        # train with: it removes the positional randomisation that is the
+        # suspected reason padding prevents the mid-run collapse. Set it the
+        # same way for training and evaluation.
+        start = random.randint(0, width - fov_index) if pad_random_start else 0
         filled[:, :, start:start + fov_index] = cropped
 
         cropped = filled
@@ -616,16 +622,18 @@ class LimitedFoVPad(ImageOnlyTransform):
     `fov=361.0` is a sentinel for "draw a fresh FoV in [180, 360] per sample".
     """
 
-    def __init__(self, fov=360.):
+    def __init__(self, fov=360., pad_random_start=True):
         super(LimitedFoVPad, self).__init__(fov)
         self.fov = fov
+        self.pad_random_start = pad_random_start
 
     def apply(self, x, **params):
         if self.fov <= 0:
             return x
 
         fov = random.randint(180, 360) if self.fov == 361.0 else self.fov
-        padded, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True)
+        padded, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True,
+                                         pad_random_start=self.pad_random_start)
         return padded
 
 
@@ -718,7 +726,8 @@ def get_transforms_val(image_size_sat,
                        fov=0.0,
                        rotate=False,
                        mask_ratio=0.0,
-                       fov_pad=False):
+                       fov_pad=False,
+                       fov_pad_random_start=True):
 
 
 
@@ -735,8 +744,10 @@ def get_transforms_val(image_size_sat,
                                    A.Normalize(mean, std),
                                    ToTensorV2(),
                                    # Must match the training crop: whichever of
-                                   # the two is used here has to be used there.
-                                   LimitedFoVPad(fov=fov) if fov_pad else LimitedFoV(fov=fov),
+                                   # the two is used here has to be used there,
+                                   # `pad_random_start` included.
+                                   LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start)
+                                   if fov_pad else LimitedFoV(fov=fov),
                                   ])
             
                

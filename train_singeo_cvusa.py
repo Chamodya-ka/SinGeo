@@ -146,6 +146,24 @@ class Configuration:
     # The reported RNC group losses drop on this switch simply because those
     # zeros are averaged in, so they are not comparable across the flag.
     rnc_exclude_ties: bool = False
+    # Restrict RNC to views of the SAME location, so it ranks a location's own
+    # views against each other and never against another location's.
+    #
+    # Ranking one positive against one unrelated negative asks a question the
+    # overlap labels cannot answer. The arcs measure how much two views of one
+    # place share; there is no meaningful sense in which a view of Kansas is
+    # "0.83 far" from a view of Oregon, so any number put there is invented and
+    # RNC then spends most of its budget ordering invented distances. With this
+    # on, RNC is purely a view-overlap ordering term and every
+    # positive-vs-negative decision is left to InfoNCE.
+    #
+    # Two consequences. `negative_tiering` is never read, so no GPS table and no
+    # satellite-embedding CSV are loaded. And with two views per domain the
+    # same-domain groups are exactly zero: anchor q1_i's only same-location
+    # reference in g2g is q2_i (the diagonal is already dropped), its rank set is
+    # itself, and logsumexp({s}) - s = 0. Only g2a and a2g carry signal.
+    rnc_positives_only: bool = True
+
     rnc_similarity: str = "cosine"     # "cosine" | "l2"
     # Per-group weights, ordered (ground->aerial, ground->ground,
     # aerial->ground, aerial->aerial). The four groups are always computed and
@@ -379,6 +397,25 @@ class Configuration:
     # changes shape -- so re-baseline rather than reading it against them.
     fov_pad: bool=True
 
+    # Where the padded block sits inside the full-width ground tensor.
+    #
+    # True places it at a uniformly random non-wrapping column offset, so the
+    # azimuth a view shows and the columns it occupies are independent. False
+    # pins it to column 0, fixing both its start and its end from the FoV alone.
+    #
+    # This is an ABLATION, not a tuning knob. Padding and the q1 roll each
+    # independently prevent the mid-run collapse seen in every unpadded run
+    # (old log.txt 14.04 -> 3.08, round7a 15.66 -> 3.61, round8a 18.49 -> 6.99
+    # at FoV 90), while 230514/round1a/round4a with padding and round8b with the
+    # q1 roll are all smooth. The hypothesis is that both work by denying the
+    # model an absolute column-position cue -- padding by randomising where
+    # content sits, the roll by randomising which azimuth the panorama starts
+    # at. Setting this False keeps padding's constant 768-wide tensor but
+    # removes the positional randomisation, so it separates the two.
+    #
+    # Applies to training and evaluation together, like `fov_pad` itself.
+    fov_pad_random_start: bool=True
+
     # Give the uncropped panorama (q1) its own uniform roll in training.
     #
     # Without it, q1 and the aerial tile are always in the SAME relative
@@ -476,6 +513,13 @@ def write_run_info(path, cfg, run_name, note, overrides):
     rnc_on = cfg.use_rnc and cfg.rnc_weight != 0
     gee_on = rnc_on and cfg.negative_tiering == "embed"
 
+    # The wedge's existence is decided by `use_rnc and enable_aerial_crop` at
+    # dataset construction -- rnc_weight only scales the loss term. Reporting it
+    # off whenever rnc_weight==0 mislabelled every InfoNCE-only run that still
+    # had the wedge active (round5a, round7a, round8b), which is exactly the
+    # kind of run where knowing matters.
+    wedge_on = cfg.use_rnc and cfg.enable_aerial_crop
+
     lines = []
     lines.append("Run:      {}".format(run_name or "(unnamed)"))
     lines.append("Started:  {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
@@ -518,8 +562,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
     lines.append("Aerial wedge crop: {}".format(
         "ON  (sector {} -> {} deg, tile rotation up to +-{} deg)".format(
             cfg.aerial_arc_start, cfg.aerial_arc_end, cfg.aerial_rot_max)
-        if (rnc_on and cfg.enable_aerial_crop) else "OFF"))
-    if rnc_on and cfg.enable_aerial_crop:
+        if wedge_on else "OFF"))
+    if wedge_on:
         lines.append("InfoNCE overlap gating: {}".format(
             "ON  - each positive weighted by the containment overlap of the two views' arcs,"
             if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
@@ -693,6 +737,7 @@ if __name__ == '__main__':
     # drew), so the padding switch is handed over here rather than baked into
     # the transform pipeline.
     train_dataset.fov_pad = config.fov_pad
+    train_dataset.pad_random_start = config.fov_pad_random_start
     train_dataset.roll_q1 = config.ground_roll_q1
 
     train_dataloader = DataLoader(train_dataset,
@@ -709,6 +754,7 @@ if __name__ == '__main__':
                                                                std=std,
                                                                fov=fov,
                                                                fov_pad=config.fov_pad,
+                                                               fov_pad_random_start=config.fov_pad_random_start,
                                                                )
 
 
@@ -735,6 +781,7 @@ if __name__ == '__main__':
                                                            std=std,
                                                            fov=extra_fov,
                                                            fov_pad=config.fov_pad,
+                                                           fov_pad_random_start=config.fov_pad_random_start,
                                                            )
         query_dataset_test_extra = CVUSADatasetEval(data_folder=config.data_folder ,
                                           split="test",
@@ -784,7 +831,7 @@ if __name__ == '__main__':
     geo_ranks = None
     geo_coords = None
     sat_embeddings = None
-    if config.use_rnc and config.negative_tiering == "embed":
+    if config.use_rnc and config.negative_tiering == "embed" and not config.rnc_positives_only:
         df_split = pd.read_csv(f"{config.data_folder}/splits/train-19zl.csv", header=None)
         train_ids = df_split[0].map(lambda x: int(x.split("/")[-1].split(".")[0])).values
         sat_embeddings = SatelliteEmbeddings.from_csv(config.sat_embedding_csv, ids=train_ids)
@@ -877,8 +924,13 @@ if __name__ == '__main__':
         rnc_loss = RankNContrast(temperature=config.rnc_tau,
                                  similarity=config.rnc_similarity,
                                  exclude_ties=config.rnc_exclude_ties)
+        # With positives-only scoping the negative block is masked out of every
+        # rank set, so whatever tiering would have filled it is never read.
+        # Force the no-op source rather than letting a stale 'embed'/'geo'
+        # setting demand a table that was deliberately not loaded.
+        effective_tiering = "none" if config.rnc_positives_only else config.negative_tiering
         distance_builder = RnCDistanceBuilder(positive_scale=config.rnc_positive_scale,
-                                              negative_tiering=config.negative_tiering,
+                                              negative_tiering=effective_tiering,
                                               negative_margin=config.rnc_negative_margin,
                                               geo_ranks=geo_ranks,
                                               geo_coords=geo_coords,
@@ -886,7 +938,14 @@ if __name__ == '__main__':
                                               positive_overlap=config.rnc_positive_overlap,
                                               sat_embeddings=sat_embeddings)
         print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
-            config.rnc_weight, config.rnc_tau, config.negative_tiering))
+            config.rnc_weight, config.rnc_tau, effective_tiering))
+        if config.rnc_positives_only:
+            print("RNC scope: POSITIVES ONLY - only views of the same location are ranked; "
+                  "negative pairs leave every rank set, negative_tiering is unused "
+                  "(requested {!r}), and the same-domain groups g2g/a2a are exactly 0 "
+                  "with two views per domain".format(config.negative_tiering))
+        else:
+            print("RNC scope: all pairs (positives ranked against negatives)")
         print("RNC positive overlap:", config.rnc_positive_overlap)
         print("RNC tie handling:", "ties excluded from rank sets"
               if config.rnc_exclude_ties else "ties compete (original RnC)")
@@ -905,6 +964,14 @@ if __name__ == '__main__':
         config.fov_sampling, config.fov_curriculum_end,
         ", ramp {:.0%} of run".format(config.fov_ramp_frac)
         if config.fov_sampling == "loguniform" else ""))
+    if not config.fov_pad_random_start and not config.use_rnc:
+        # get_transforms_train_singeo_rot does the crop on the no-RNC path and
+        # does not take pad_random_start, so training would keep the random
+        # offset while evaluation used the fixed one. Refuse rather than desync.
+        raise ValueError(
+            "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
+            "on the dataset path, which return_meta enables).")
+
     if config.fov_sampling == "loguniform" and not config.use_rnc:
         # The per-sample draw lives in the dataset, which only crops when it is
         # recording arcs for RNC. Without RNC the crop stays in the transform
@@ -1069,6 +1136,7 @@ if __name__ == '__main__':
                                                         std=std,
                                                         fov=fov_dynamic,
                                                         fov_pad=config.fov_pad,
+                                                        fov_pad_random_start=config.fov_pad_random_start,
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
