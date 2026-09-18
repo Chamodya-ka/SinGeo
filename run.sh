@@ -645,6 +645,119 @@ tau 0.5, deterministic ground FoV, no q1 roll, batch 16, 80 epochs,
 num_workers 2."
     ;;
 
+round10)
+    echo "Round 10 - mask-aware encoding of the wedged aerial view, on round8b's config"
+    echo "  10a gated convs + masked pool   10b masked pool only   (round8b = stock control, Avg 66.05)"
+    launch round10a-mask-gated \
+        SINGEO_AERIAL_MASK_MODE=gated \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=deterministic SINGEO_GROUND_ROLL_Q1=true \
+        SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='Mask-aware encoding, GATED. round8b plus SINGEO_AERIAL_MASK_MODE=gated; nothing else changes.
+
+WHY. The aerial wedge blanks part of r2, and the stock global average pool mixes the encoder
+response to that blank region into the descriptor, so InfoNCE is asked to match a partly junk
+vector to the ground view. Motivated by round8a vs round8b: unpadded runs with the wedge
+converge lower (round8b, Avg 66.05) than without it (round8a, Avg 77.69).
+
+WHAT GATED DOES. Multiplies the input of every spatial op of the ConvNeXt (stem, three
+downsample convs, 36 depthwise convs) by the wedge mask at that resolution, then pools only the
+valid stage-4 cells. Blank content never reaches a valid cell. Measured on pretrained
+convnext_base with a 180 degree wedge: descriptor dependence on the blank fill 0.000 (stock
+0.318, pooling only 0.297); cosine to the full-tile embedding 0.887 (stock 0.860).
+
+READING, against round8b (stock) and round10b (pool only), noise about 3 points:
+  10a > 10b = 8b    gating the convs is what matters, pooling alone captures little
+  10a = 10b > 8b    masked pooling suffices once the model trains with it
+  10a near 77.69    the destructive wedge signal is essentially removed
+  neither beats 8b  blank contamination is not what limits round8b
+
+Everything else identical to round8b: wedge ON with its curriculum, overlap gate ON,
+rnc_weight 0.0 (positives-only scope, inert at weight 0), tau 0.5, fov_pad OFF,
+deterministic ground FoV, q1 roll ON, batch 16, 80 epochs, num_workers 2.'
+
+    launch round10b-mask-pool \
+        SINGEO_AERIAL_MASK_MODE=pool \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=deterministic SINGEO_GROUND_ROLL_Q1=true \
+        SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='Mask-aware encoding, POOL ONLY. round8b plus SINGEO_AERIAL_MASK_MODE=pool; nothing else changes.
+
+The paired control for round10a. Replaces the global average pool with a masked average over
+the valid stage-4 cells; every conv is stock, so blank content still spreads into valid cells
+through the receptive field. Measured on pretrained convnext_base: descriptor dependence on the
+blank fill 0.297 (stock 0.318, gated 0.000), and fully-valid cells four or more cells from the
+wedge edge are still 0.465 dependent, so the leakage is not confined to the boundary.
+
+This is what the original spec proposed, on the premise that pooling alone captures most of the
+benefit. Reading round10b against round8b and round10a tests that premise in training.
+
+Everything else identical to round8b and round10a.'
+    ;;
+
+round11)
+    echo "Round 11 - is the wedge penalty the CROP or the ROTATION? (round8b = control, Avg 66.05)"
+    echo "  11a wedge kept, rotation discrete +-90 exact, no disc   11b wedge off entirely"
+    launch round11a-wedge-discrete-rot \
+        SINGEO_AERIAL_ROTATION=discrete SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=deterministic SINGEO_GROUND_ROLL_Q1=true \
+        SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='Wedge KEPT, rotation made exact. round8b plus aerial_rotation=discrete and aerial_circular_mask=False.
+
+WHY. enable_aerial_crop=True bundles three changes, not one: (1) the sector mask, (2) continuous
+tile rotation up to +-180 deg via interpolating TF.rotate plus a disc mask that blanks 21.5 pct of
+the tile from epoch 1, and (3) the discrete +-90 rotation schedule switched off. Round 10 masked
+blank pixels out of the encoder and tracked round8b within +-1.25 Avg at every eval, so blank
+contamination is not the limit -- but round 10 only addressed (1).
+
+The obvious explanation, missing content, does not survive scrutiny: at the end of training the
+ground crop keeps 19.4 pct of columns and the wedge keeps 39.3 pct of pixels, yet ground cropping
+works. What differs is the rotation. Reorienting a panorama is a roll along a cyclic axis, an exact
+pixel permutation a CNN with global pooling is nearly invariant to for free. Rotating a square tile
+by an arbitrary angle interpolates, creates blank corners, and must be learned.
+
+SinGeo supplementary Tab. 1 measured exactly this for its satellite branch, FoV 360 / 180 / 90:
+continuous T1 89.2 / 77.5 / 63.7, discrete T3 96.8 / 91.8 / 70.1. The wedge swapped T3 for a
+T1-style rotation. round8a minus round8b is +5.3 / +11.4 / +15.8 against SinGeo T3 minus T1 of
++7.6 / +14.3 / +6.4, the same shape at 360 and 180.
+
+WHAT CHANGES. The sector mask and its heading drift are untouched. The tile is rotated by 0 or +-90
+only, via torch.rot90, drawn with the no-wedge schedule (keep 1.0 -> 0.25). The disc mask is off,
+since 90 deg rotations lose no corners. Verified on real tiles: 0.0 pct blank pixels and 100 pct
+exact permutations, against 21.5 pct and 0 pct for the round8b path. The recorded arc still matches
+the content kept, which the loss6 overlap gate reads.
+
+READING, with round11b (wedge off) and round8b (control), noise about 3 points:
+  11a near 11b, well above 8b   the rotation was the whole penalty; the crop is harmless
+  11a between 8b and 11b        both the rotation and the crop cost something
+  11a near 8b                   rotation exonerated; the crop itself is the problem
+
+Everything else identical to round8b: overlap gate ON, rnc_weight 0.0, tau 0.5, fov_pad OFF,
+deterministic ground FoV, q1 roll ON, batch 16, 80 epochs, num_workers 2.'
+
+    launch round11b-nowedge-q1roll \
+        SINGEO_ENABLE_AERIAL_CROP=false \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=deterministic SINGEO_GROUND_ROLL_Q1=true \
+        SINGEO_RNC_TAU=0.5 SINGEO_RNC_WEIGHT=0.0 SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='Wedge OFF entirely. round8b plus enable_aerial_crop=False; nothing else changes.
+
+The single-variable test that round8a could never be. round8a (no wedge, Avg 77.69) vs round8b
+(wedge, Avg 66.05) is confounded: 8a also lacks the q1 roll. This run keeps the roll and removes
+only the wedge, so round11b minus round8b is the full cost of the wedge bundle with nothing else
+varying.
+
+With the wedge off, r2 becomes the full tile under the discrete +-90 schedule (SinGeo T3) and the
+overlap gate goes inert, since every r2 spans 360 deg.
+
+Paired with round11a, which keeps the wedge but makes its rotation exact. Then:
+  11b minus 8b    cost of the whole wedge bundle
+  11a minus 8b    cost of continuous rotation plus disc mask
+  11b minus 11a   cost of the sector crop alone
+
+If round11b also lands near round8a, the q1 roll was not what separated 8a from 8b.
+
+Everything else identical to round8b: rnc_weight 0.0, tau 0.5, fov_pad OFF, deterministic ground
+FoV, q1 roll ON, batch 16, 80 epochs, num_workers 2.'
+    ;;
+
 list)
     screen -list || echo "no sessions"
     echo

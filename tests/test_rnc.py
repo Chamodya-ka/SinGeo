@@ -1332,3 +1332,86 @@ def test_positives_only_still_ranks_the_semi_positives_correctly():
     for i in range(B):
         assert d[i, i] <= d[i, i + B] + 1e-6      # pano: tile <= wedge
     assert (d[same] <= 0.5 + 1e-6).all()
+
+
+# ---------------------------------------------------------------------------
+# Discrete aerial wedge rotation (round 11a)
+# ---------------------------------------------------------------------------
+
+def _bearing_tile(size=64):
+    """A tile whose every pixel stores its own compass bearing + 1, so content
+    can be traced back to the world azimuth it came from (0 stays free as the
+    mask value)."""
+    from singeo.transforms import _bearing_grid
+    return (_bearing_grid(size, size, "cpu") + 1.0).unsqueeze(0).repeat(3, 1, 1)
+
+
+@pytest.mark.parametrize("rot", [90.0, -90.0, 180.0])
+def test_rot90_path_matches_tf_rotate(rot):
+    """The exact path must place content exactly where TF.rotate would, or
+    every recorded sector arc would silently point at the wrong content."""
+    import torchvision.transforms.functional as TF
+    torch.manual_seed(0)
+    x = torch.randn(3, 64, 64)
+    expected = TF.rotate(x.unsqueeze(0), rot).squeeze(0)
+    got = apply_aerial_sector(x, rot, arc_center=0.0, arc_extent=360.0, circular_mask=False)
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("rot", [0.0, 90.0, -90.0])
+@pytest.mark.parametrize("center", [0.0, 45.0, 200.0, 315.0])
+def test_discrete_rotation_keeps_the_recorded_world_arc(rot, center):
+    """Under a +-90 rotation the kept pixels must still be the ones whose
+    ORIGINAL world bearing lies inside the recorded arc -- that arc is what
+    the loss6 overlap gate reads."""
+    extent = 120.0
+    tile = _bearing_tile()
+    out = apply_aerial_sector(tile, rot, center, extent, circular_mask=False)
+
+    # Undo the rotation to read back each kept pixel's original bearing.
+    back = torch.rot90(out, k=-int(rot // 90), dims=(1, 2))
+    kept = back[0][back[0] != 0] - 1.0
+    assert kept.numel() > 0
+
+    delta = torch.remainder(kept - center, 360.0)
+    delta = torch.minimum(delta, 360.0 - delta)
+    # One-pixel quantisation slack at the sector edge.
+    assert delta.max().item() <= extent / 2.0 + 3.0
+
+
+def test_discrete_rotation_without_disc_blanks_nothing_outside_the_sector():
+    """A 90-degree rotation loses no corners, so with the disc off a full-arc
+    wedge must keep every pixel -- unlike continuous rotation."""
+    x = torch.rand(3, 64, 64) + 0.1
+    out = apply_aerial_sector(x, 90.0, 0.0, 360.0, circular_mask=False)
+    assert (out == 0).sum().item() == 0
+
+    import torchvision.transforms.functional as TF
+    cont = TF.rotate(x.unsqueeze(0), 37.0).squeeze(0)
+    assert (cont == 0).float().mean().item() > 0.1
+
+
+@pytest.mark.parametrize("keep", [1.0, 0.4, 0.25])
+def test_discrete_draw_follows_the_keep_prob_schedule(keep):
+    """No rotation w.p. keep, else +-90 evenly -- the no-wedge path's schedule."""
+    import collections
+    from singeo.transforms import draw_discrete_aerial_rotation
+
+    random.seed(0)
+    n = 20000
+    counts = collections.Counter(draw_discrete_aerial_rotation(keep) for _ in range(n))
+    assert set(counts) <= {0.0, 90.0, -90.0}
+    assert abs(counts[0.0] / n - keep) < 0.02
+    assert abs(counts[90.0] / n - (1.0 - keep) / 2.0) < 0.02
+    assert abs(counts[-90.0] / n - (1.0 - keep) / 2.0) < 0.02
+
+
+def test_non_multiple_of_90_still_uses_the_interpolating_path():
+    """The default continuous mode must be untouched by the new branch."""
+    import torchvision.transforms.functional as TF
+    torch.manual_seed(1)
+    x = torch.randn(3, 64, 64)
+    for rot in (37.0, -123.5, 1.0):
+        expected = TF.rotate(x.unsqueeze(0), rot).squeeze(0)
+        got = apply_aerial_sector(x, rot, 0.0, 360.0, circular_mask=False)
+        assert torch.equal(got, expected), rot

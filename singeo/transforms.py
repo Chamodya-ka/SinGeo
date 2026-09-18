@@ -514,7 +514,22 @@ def _bearing_grid(height, width, device):
     return _ANGLE_GRID_CACHE[key]
 
 
-def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True):
+def draw_discrete_aerial_rotation(keep_prob):
+    """A wedge-tile rotation in {0, -90, +90} degrees.
+
+    Mirrors DynamicRandomRotate, the discrete schedule the no-wedge path uses:
+    no rotation with probability `keep_prob`, otherwise +-90 with equal
+    probability. Returned in TF.rotate's counter-clockwise convention.
+    """
+    u = random.random()
+    if u < keep_prob:
+        return 0.0
+    if u < keep_prob + (1.0 - keep_prob) / 2.0:
+        return -90.0
+    return 90.0
+
+
+def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False):
     """Aerial analogue of the ground FoV crop: rotate the tile, keep a wedge.
 
     The aerial branch's counterpart to a limited ground FoV is a limited
@@ -536,17 +551,29 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True):
             keeps the whole tile.
         circular_mask: also mask the tile to its inscribed disc, matching
             `CircularMask` in the existing continuous-rotation pipeline.
+        return_mask: also return the `[1, H, W]` hard keep-mask (sector and
+            disc, in the rotated frame), for mask-aware encoding of this view.
 
     Returns:
-        `[C, H, W]` tensor, same shape as the input.
+        `[C, H, W]` tensor, same shape as the input; with `return_mask`, the
+        pair `(tensor, mask)`.
     """
     import torchvision.transforms.functional as TF
 
     if rot_deg != 0.0:
-        x = TF.rotate(x.unsqueeze(0), float(rot_deg)).squeeze(0)
+        if float(rot_deg) % 90.0 == 0.0:
+            # A multiple of 90 degrees is an exact pixel permutation: no
+            # interpolation and no blank corners. torch.rot90 with k = rot/90
+            # matches TF.rotate's counter-clockwise convention exactly, so the
+            # sector placement below is unchanged. TF.rotate happens to be
+            # exact here too on the current torchvision; rot90 makes that a
+            # property of this code rather than of the library version.
+            x = torch.rot90(x, k=int(float(rot_deg) // 90.0), dims=(1, 2))
+        else:
+            x = TF.rotate(x.unsqueeze(0), float(rot_deg)).squeeze(0)
 
     if arc_extent >= 360.0 and not circular_mask:
-        return x
+        return (x, torch.ones_like(x[:1])) if return_mask else x
 
     height, width = x.shape[1], x.shape[2]
     bearing = _bearing_grid(height, width, x.device)
@@ -569,7 +596,10 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True):
         dist = ((ys - (height - 1) / 2.0) ** 2 + (xs - (width - 1) / 2.0) ** 2).sqrt()
         mask &= dist <= radius
 
-    return x * mask.unsqueeze(0).to(x.dtype)
+    keep = mask.unsqueeze(0).to(x.dtype)
+    if return_mask:
+        return x * keep, keep
+    return x * keep
 
 
 class LimitedFoV(ImageOnlyTransform):

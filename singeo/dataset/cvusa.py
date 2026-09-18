@@ -9,7 +9,8 @@ from tqdm import tqdm
 import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
-from singeo.transforms import apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov
+from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
+                               draw_discrete_aerial_rotation)
 
 class CVUSADatasetTrain(Dataset):
     
@@ -377,6 +378,18 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # narrower tensor. Has to match `fov_pad` on the eval transforms.
         self.fov_pad = False
 
+        # How the aerial wedge's tile is rotated. "continuous" draws uniformly in
+        # +-sat_rot_max and interpolates (SinGeo's T1-style variant). "discrete"
+        # rotates by 0 or +-90 only, an exact pixel permutation, with the
+        # probability of rotating set per epoch through `aerial_rotate_keep_prob`
+        # -- SinGeo's T3 variant. The sector's heading drift is unaffected: it
+        # still follows sat_rot_max either way.
+        self.aerial_rotation = "continuous"
+        self.aerial_rotate_keep_prob = 1.0
+        # Mask the wedge view to the tile's inscribed disc. Only needed to hide
+        # the blank corners that continuous rotation creates.
+        self.aerial_circular_mask = True
+
         # Placement of the padded block. False pins it to column 0 so its start
         # and end are fixed by the FoV alone -- an ablation of the positional
         # randomisation, see `apply_limited_fov`.
@@ -385,6 +398,11 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # Give the full panorama its own uniform roll, independent of the
         # paired rotate below. Off by default; see __getitem__ for why.
         self.roll_q1 = False
+
+        # Also emit the aerial wedge's keep-mask and its coverage, so the encoder
+        # can exclude blank positions (singeo.masked_encoder). Off by default: the
+        # returned tuple and every random draw stay exactly as before.
+        self.return_aerial_mask = False
 
         self.df = pd.read_csv(f'{data_folder}/splits/train-19zl.csv', header=None) #, nrows=10000)
         
@@ -440,6 +458,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
         # RNC crops: drawn here so the parameters survive into the batch.
         meta = None
+        aerial_mask = None
         if self.return_meta:
             meta = torch.zeros(META_DIM, dtype=torch.float32)
 
@@ -460,7 +479,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
             if self.enable_aerial_crop:
                 # Aerial sector crop: continuous rotation of the tile plus an
                 # azimuth wedge, the aerial counterpart of the ground FoV crop.
-                rot = random.uniform(-self.sat_rot_max, self.sat_rot_max)
+                if self.aerial_rotation == "discrete":
+                    rot = draw_discrete_aerial_rotation(self.aerial_rotate_keep_prob)
+                else:
+                    rot = random.uniform(-self.sat_rot_max, self.sat_rot_max)
 
                 # The sector is anchored to the ground crop's heading and then
                 # allowed to drift off it. `sat_rot_max` bounds the drift and
@@ -473,7 +495,13 @@ class CVUSADatasetTrainSinGeo(Dataset):
                 deviation = random.uniform(-self.sat_rot_max, self.sat_rot_max)
                 s_center = (g_center + deviation) % 360.0
 
-                reference_img2 = apply_aerial_sector(reference_img2, rot, s_center, self.sat_arc)
+                if self.return_aerial_mask:
+                    reference_img2, aerial_mask = apply_aerial_sector(
+                        reference_img2, rot, s_center, self.sat_arc,
+                        circular_mask=self.aerial_circular_mask, return_mask=True)
+                else:
+                    reference_img2 = apply_aerial_sector(reference_img2, rot, s_center, self.sat_arc,
+                                                         circular_mask=self.aerial_circular_mask)
                 meta[M_SAT_CENTER] = s_center
                 meta[M_SAT_EXTENT] = self.sat_arc
             else:
@@ -540,6 +568,16 @@ class CVUSADatasetTrainSinGeo(Dataset):
             query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
 
         label = torch.tensor(idx, dtype=torch.long)
+
+        if self.return_aerial_mask:
+            if not self.return_meta:
+                raise ValueError("return_aerial_mask needs return_meta=True: the wedge only "
+                                 "exists on the dataset's RNC crop path")
+            if aerial_mask is None:
+                # No wedge on this path (enable_aerial_crop off): the whole tile is valid.
+                aerial_mask = torch.ones_like(reference_img2[:1])
+            return (query_img1, query_img2, reference_img1, reference_img2, label, meta,
+                    aerial_mask, float(aerial_mask.mean()))
 
         if self.return_meta:
             return query_img1, query_img2, reference_img1, reference_img2, label, meta

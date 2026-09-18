@@ -185,13 +185,25 @@ class TimmModel_SinGeo(nn.Module):
     def set_grad_checkpointing(self, enable=True):
         self.model.set_grad_checkpointing(enable)
 
-    def forward(self, imgq1, imgq2=None, imgr1=None, imgr2=None):
+    def encode(self, x, mask=None, mode="gated"):
+        """Embed one view, mask-aware when `mask` is given.
+
+        `mask=None` is the stock path, bit-identical to `self.model(x)`. With a
+        mask, blank positions are excluded from the descriptor; `mode` is
+        "pool" or "gated" -- see `singeo.masked_encoder`.
+        """
+        from .masked_encoder import encode as masked_encode
+        return masked_encode(self.model, x, mask=mask, mode=mode)
+
+    def forward(self, imgq1, imgq2=None, imgr1=None, imgr2=None, mask_r2=None, mask_mode="gated"):
+        # `mask_r2` routes only the wedged aerial view through `encode`; the
+        # ground views and the full tile always take the stock path.
         if imgq2 is not None and imgr1 is not None and imgr2 is not None: # for datasets containing panorama, e.g., CVUSA, CVACT, VIGOR.
             if self.random_fov == False: 
                 image_featuresq1 = self.model(imgq1)     
                 image_featuresq2 = self.model(imgq2)
                 image_featuresr1 = self.model(imgr1)
-                image_featuresr2 = self.model(imgr2)
+                image_featuresr2 = self.model(imgr2) if mask_r2 is None else self.encode(imgr2, mask_r2, mask_mode)
                 return image_featuresq1, image_featuresq2, image_featuresr1, image_featuresr2           
             else: # enable random FoV testing.
                 random_fov = random.randint(int(imgq2.size(-1)*7/36), imgq2.size(-1))
@@ -199,7 +211,7 @@ class TimmModel_SinGeo(nn.Module):
                 image_featuresq1 = self.model(imgq1)     
                 image_featuresq2 = self.model(imgq2)
                 image_featuresr1 = self.model(imgr1)
-                image_featuresr2 = self.model(imgr2)
+                image_featuresr2 = self.model(imgr2) if mask_r2 is None else self.encode(imgr2, mask_r2, mask_mode)
                 return image_featuresq1, image_featuresq2, image_featuresr1,  image_featuresr2         
         elif imgq2 is None and imgr1 is not None and imgr2 is not None:  # for datasets without panorama, e.g., University-1652. 
             image_featuresq1 = self.model(imgq1)

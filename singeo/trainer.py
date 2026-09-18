@@ -1092,6 +1092,10 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     group_weights = dict(zip(('g2a', 'g2g', 'a2g', 'a2a'), group_weights))
     enable_aerial_crop = getattr(train_config, 'enable_aerial_crop', True)
     rnc_positives_only = getattr(train_config, 'rnc_positives_only', False)
+    # "pool" / "gated" send the wedged aerial view through the mask-aware encoder
+    # (singeo.masked_encoder). Its mask arrives as an extra batch element only when
+    # the dataset was built to emit one.
+    aerial_mask_mode = getattr(train_config, 'aerial_mask_mode', 'off')
 
     # wait before starting progress bar
     time.sleep(0.1)
@@ -1107,7 +1111,14 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
         bar = dataloader
 
     # for loop over one epoch
-    for query1, query2, reference1, reference2, ids, meta in bar:
+    for batch in bar:
+        query1, query2, reference1, reference2, ids, meta = batch[:6]
+        # Present only when the dataset emits it. batch[7], the wedge coverage, is
+        # carried for later loss work and not used here.
+        aerial_mask = batch[6] if len(batch) > 6 else None
+        if aerial_mask is not None and aerial_mask_mode not in ('pool', 'gated'):
+            raise ValueError("batch carries an aerial mask but aerial_mask_mode is {!r}"
+                             .format(aerial_mask_mode))
 
         def forward_and_loss():
             q1 = query1.to(train_config.device)
@@ -1115,7 +1126,12 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
             r1 = reference1.to(train_config.device)
             r2 = reference2.to(train_config.device)
 
-            features_q1, features_q2, features_r1, features_r2 = model(q1, q2, r1, r2)
+            if aerial_mask is None:
+                features_q1, features_q2, features_r1, features_r2 = model(q1, q2, r1, r2)
+            else:
+                features_q1, features_q2, features_r1, features_r2 = model(
+                    q1, q2, r1, r2, mask_r2=aerial_mask.to(train_config.device),
+                    mask_mode=aerial_mask_mode)
 
             meta_dev = meta.to(train_config.device)
 

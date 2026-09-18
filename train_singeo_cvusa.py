@@ -272,6 +272,27 @@ class Configuration:
     # the last eval alone) while train recall sat saturated at 99.9.
     aerial_ramp_frac: float = 1.0
 
+    # How the wedge view's tile is rotated, and whether it is disc-masked.
+    #
+    #   "continuous" - uniform in +-aerial_rot_max, interpolated, with the disc
+    #                  mask hiding the blank corners that creates. Original.
+    #   "discrete"   - 0 or +-90 only, an exact pixel permutation, rotating with
+    #                  the same per-epoch probability schedule the no-wedge path
+    #                  uses (get_dynamic_rotate_prob, keep 1.0 -> 0.25). Pair with
+    #                  aerial_circular_mask=False: 90-degree rotations lose no
+    #                  corners, so the disc would only blank 21.5% of the tile.
+    #
+    # SinGeo's supplementary Tab. 1 compares these for the satellite branch
+    # (FoV 360 / 180 / 90): continuous 89.2 / 77.5 / 63.7, discrete 96.8 / 91.8 /
+    # 70.1. Turning the wedge on had swapped the discrete schedule for the
+    # continuous rotation, so 'the wedge' bundled that change with the crop.
+    # "discrete" keeps the crop and undoes only the rotation.
+    #
+    # Only the tile's rotation changes. The sector's heading drift off the
+    # ground crop still follows aerial_rot_max in both modes.
+    aerial_rotation: str = "continuous"
+    aerial_circular_mask: bool = True
+
     # Weight each InfoNCE positive by how much of the narrower of its two views
     # the other one actually covers (the containment overlap of their azimuth
     # arcs).
@@ -430,6 +451,22 @@ class Configuration:
     # The RNC arc for q1 stays (0, 360), so distance labels are untouched.
     ground_roll_q1: bool = False
 
+    # Mask-aware encoding of the wedged aerial view (r2), see singeo.masked_encoder.
+    #
+    # The wedge blanks part of the tile, and timm's global average pool then mixes
+    # the encoder's response to that blank region into the descriptor that InfoNCE
+    # asks to match the ground view.
+    #
+    #   "off"   stock encoder; the batch and every random draw are unchanged.
+    #   "pool"  masked global average pool over the valid stage-4 cells only.
+    #   "gated" also multiply the input of every spatial conv (stem, downsample,
+    #           depthwise) by the mask, so blank content never reaches a valid cell.
+    #           On pretrained convnext_base, pooling alone leaves the descriptor
+    #           29.7% dependent on the blank fill (stock 31.8%); gating makes it 0.
+    #
+    # Needs the wedge (use_rnc and enable_aerial_crop) and no grad checkpointing.
+    aerial_mask_mode: str = "off"
+
 #-----------------------------------------------------------------------------#
 # Train Config                                                                #
 #-----------------------------------------------------------------------------#
@@ -560,10 +597,15 @@ def write_run_info(path, cfg, run_name, note, overrides):
     lines.append("")
 
     lines.append("Aerial wedge crop: {}".format(
-        "ON  (sector {} -> {} deg, tile rotation up to +-{} deg)".format(
+        "ON  (sector {} -> {} deg, heading drift up to +-{} deg)".format(
             cfg.aerial_arc_start, cfg.aerial_arc_end, cfg.aerial_rot_max)
         if wedge_on else "OFF"))
     if wedge_on:
+        lines.append("  tile rotation: {}{}".format(
+            "discrete 0/+-90 (exact), schedule keep 1.0 -> 0.25"
+            if cfg.aerial_rotation == "discrete"
+            else "continuous up to +-{} deg (interpolated)".format(cfg.aerial_rot_max),
+            ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
         lines.append("InfoNCE overlap gating: {}".format(
             "ON  - each positive weighted by the containment overlap of the two views' arcs,"
             if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
@@ -737,8 +779,11 @@ if __name__ == '__main__':
     # drew), so the padding switch is handed over here rather than baked into
     # the transform pipeline.
     train_dataset.fov_pad = config.fov_pad
+    train_dataset.aerial_rotation = config.aerial_rotation
+    train_dataset.aerial_circular_mask = config.aerial_circular_mask
     train_dataset.pad_random_start = config.fov_pad_random_start
     train_dataset.roll_q1 = config.ground_roll_q1
+    train_dataset.return_aerial_mask = config.aerial_mask_mode != "off"
 
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
@@ -960,6 +1005,24 @@ if __name__ == '__main__':
         print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
     else:
         print("InfoNCE overlap gating: off")
+    if config.aerial_rotation not in ("continuous", "discrete"):
+        raise ValueError("aerial_rotation must be 'continuous' or 'discrete', got {!r}".format(
+            config.aerial_rotation))
+    if config.aerial_mask_mode not in ("off", "pool", "gated"):
+        raise ValueError("aerial_mask_mode must be 'off', 'pool' or 'gated', got {!r}".format(
+            config.aerial_mask_mode))
+    if config.aerial_mask_mode != "off":
+        if not (config.use_rnc and config.enable_aerial_crop):
+            raise ValueError("aerial_mask_mode={!r} needs the aerial wedge "
+                             "(use_rnc=True and enable_aerial_crop=True)".format(config.aerial_mask_mode))
+        if config.grad_checkpointing:
+            raise ValueError("aerial_mask_mode={!r} is incompatible with grad_checkpointing".format(
+                config.aerial_mask_mode))
+    print("Aerial mask mode: {}".format({
+        "off": "off (stock encoder)",
+        "pool": "pool (masked global pool on the wedged view)",
+        "gated": "gated (spatial convs gated + masked pool on the wedged view)",
+    }[config.aerial_mask_mode]))
     print("Ground FoV sampling: {} (curriculum end {:.1f} deg{})".format(
         config.fov_sampling, config.fov_curriculum_end,
         ", ramp {:.0%} of run".format(config.fov_ramp_frac)
@@ -1085,10 +1148,17 @@ if __name__ == '__main__':
         
         # modulate the ratation prob of the satellite branch
         if config.use_rnc and config.enable_aerial_crop:
-            # The aerial sector crop applies its own continuous rotation with a
-            # recorded angle, so the discrete +-90 rotation is switched off here
-            # (keep_prob=1.0) rather than stacking two unrelated rotations.
+            # The aerial sector crop applies its own rotation with a recorded
+            # angle, so the albumentations +-90 rotation is switched off here
+            # (keep_prob=1.0) rather than stacking two unrelated rotations. In
+            # "discrete" mode the same +-90 schedule moves into the dataset,
+            # where the angle is known and the sector is placed consistently.
             rotate_prob = 1.0
+            wedge_keep_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25)
+            train_dataloader.dataset.aerial_rotate_keep_prob = wedge_keep_prob
+            if config.aerial_rotation == "discrete":
+                print(f"For Epoch {epoch}: Aerial wedge rotation = discrete +-90, "
+                      f"keep_prob = {wedge_keep_prob:.4f}, disc mask = {config.aerial_circular_mask}")
         else:
             rotate_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25) # the prob not to rotate
         sat_transforms_dynamic = build_satellite_dynamic_transforms(
