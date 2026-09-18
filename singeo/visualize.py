@@ -17,6 +17,7 @@ Typical use from a training script::
 """
 
 import os
+import random
 
 import numpy as np
 import torch
@@ -154,6 +155,24 @@ class RnCSampleVisualizer:
         os.makedirs(self.output_dir, exist_ok=True)
 
         n = min(self.num_samples, len(dataset))
+
+        # Pull the samples behind a saved RNG state. `dataset[i]` draws from the
+        # global random / numpy streams for every augmentation it applies, so
+        # capturing a collage would otherwise shift the augmentations the rest of
+        # the epoch sees -- a monitoring tool must not change the run it watches.
+        # Step across batches when the FoV is drawn per batch, otherwise every
+        # row would land in batch 0 and share one FoV -- the collage would show
+        # a single crop width where the run sees many.
+        stride = getattr(dataset, "fov_batch_size", None) or 1
+        idxs = [(row * stride) % len(dataset) for row in range(n)]
+
+        py_state, np_state = random.getstate(), np.random.get_state()
+        try:
+            samples = [dataset[i] for i in idxs]
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+
         fig, axes = plt.subplots(n, 5, figsize=(20, 2.9 * n), squeeze=False)
 
         # The arc panel needs polar axes, which `subplots` cannot mix in.
@@ -164,7 +183,7 @@ class RnCSampleVisualizer:
             polar_axes.append(fig.add_subplot(spec, projection="polar"))
 
         for row in range(n):
-            q1, q2, r1, r2, label, meta = dataset[row]
+            q1, q2, r1, r2, label, meta = samples[row]
 
             arcs = self._arcs(meta)
             scores = self.scores(meta)
@@ -193,12 +212,24 @@ class RnCSampleVisualizer:
             summary = "\n".join("   ".join(entries[i:i + 2]) for i in range(0, len(entries), 2))
             polar_axes[row].set_title("id {}\n{}".format(int(label), summary), fontsize=7)
 
+        floor = getattr(dataset, "ground_fov_floor", None)
+        if floor is None:
+            ground = "ground FoV {:.1f}deg".format(getattr(dataset, "ground_fov", float("nan")))
+        else:
+            # Under log-uniform sampling there is no single ground FoV: each
+            # panel title carries the arc that sample actually got.
+            ground = "ground FoV ~ logU[{:.1f}, 360]{}".format(
+                floor, " per batch" if getattr(dataset, "fov_batch_size", None) else " per sample")
+        rot = getattr(dataset, "aerial_rotation", "continuous")
+        rot_desc = ("tile rotation {}".format(
+            "90*k uniform" if rot == "quarter" else
+            "0/+-90 scheduled" if rot == "discrete" else
+            "continuous up to +-{:.0f}deg".format(getattr(dataset, "sat_rot_max", float("nan")))))
         fig.suptitle(
-            "Epoch {} - ground FoV {:.1f}deg, aerial sector {:.1f}deg, max tile rotation {:.1f}deg".format(
-                epoch,
-                getattr(dataset, "ground_fov", float("nan")),
-                getattr(dataset, "sat_arc", float("nan")),
-                getattr(dataset, "sat_rot_max", float("nan")),
+            "Epoch {} - {}, aerial sector {:.1f}deg, {}, disc mask {}".format(
+                epoch, ground,
+                getattr(dataset, "sat_arc", float("nan")), rot_desc,
+                "on" if getattr(dataset, "aerial_circular_mask", True) else "off",
             ),
             fontsize=12,
         )
@@ -208,15 +239,19 @@ class RnCSampleVisualizer:
         fig.savefig(path, dpi=110)
         plt.close(fig)
 
-        print("Saved RNC sample visualization:", path)
-        self._print_scores(dataset, n, epoch)
+        print("Saved input collage:", path)
+        self._print_scores(samples, epoch)
         return path
 
-    def _print_scores(self, dataset, n, epoch):
-        """Also log the numbers, so they survive without opening the PNG."""
-        print("  epoch {} overlap scores (IoU -> RNC distance):".format(epoch))
-        for row in range(n):
-            meta = dataset[row][5]
+    def _print_scores(self, samples, epoch):
+        """Also log the numbers, so they survive without opening the PNG.
+
+        Reads the samples already captured rather than drawing new ones, which
+        both keeps the log consistent with the image and avoids touching the RNG.
+        """
+        print("  epoch {} overlap scores (overlap -> RNC distance):".format(epoch))
+        for row, sample in enumerate(samples):
+            meta = sample[5]
             scores = self.scores(meta)
             print("    sample {}: {}".format(row, "  ".join(
                 "{} {:.3f}->{:.3f}".format(k, ov, d) for k, (ov, d) in scores.items())))

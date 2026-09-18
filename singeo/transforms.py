@@ -89,17 +89,22 @@ def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_
     return fov_start * (fov_end / fov_start) ** progress
 
 
-def draw_log_uniform_fov(floor, fov_max=360.0):
+def draw_log_uniform_fov(floor, fov_max=360.0, rng=None):
     """A single FoV drawn log-uniformly from `[floor, fov_max]`.
 
     Log-uniform rather than uniform so the narrow end is not under-sampled: on
     `[70, 360]` a uniform draw puts only 7% of samples at or below 90 degrees,
     a log-uniform one puts 15%.
+
+    `rng` is any `random.Random`; the module-global stream is used when it is
+    None. Pass one to make the draw reproducible from a batch index, which is
+    how the per-batch mode keeps every sample in a batch on the same FoV.
     """
     lo = min(max(float(floor), 1e-3), float(fov_max))
     if lo >= fov_max:
         return float(fov_max)
-    return math.exp(random.uniform(math.log(lo), math.log(float(fov_max))))
+    source = rng if rng is not None else random
+    return math.exp(source.uniform(math.log(lo), math.log(float(fov_max))))
 
 def get_dynamic_rotate_prob_random(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
     return random.uniform(min_prob, max_prob)
@@ -527,6 +532,19 @@ def draw_discrete_aerial_rotation(keep_prob):
     if u < keep_prob + (1.0 - keep_prob) / 2.0:
         return -90.0
     return 90.0
+
+
+def draw_quarter_rotation(rng=None):
+    """A tile rotation drawn uniformly from {0, 90, 180, 270} degrees.
+
+    Every value is an exact pixel permutation, so no interpolation happens, no
+    corners leave the frame and no blank wedge rotates in -- which is what lets
+    the inscribed-disc mask be switched off. Contrast
+    `draw_discrete_aerial_rotation`, which mirrors the upstream +-90 schedule and
+    never produces 180.
+    """
+    source = rng if rng is not None else random
+    return 90.0 * source.randint(0, 3)
 
 
 def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False):

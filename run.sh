@@ -19,6 +19,7 @@
 #   round5   loss decomposition: InfoNCE-only vs RnC-only [full data, 80 ep] DONE
 #   round6   rnc_weight sweep: 0.5 vs 1.0                 [full data, 80 ep] DONE
 #   round9   q1roll+padding vs padding-with-fixed-offset  [full data, 80 ep]
+#   round4aB  unpadded per-batch loguniform: no-wedge vs wedge+RnC [full data, 80 ep]
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -756,6 +757,100 @@ If round11b also lands near round8a, the q1 roll was not what separated 8a from 
 
 Everything else identical to round8b: rnc_weight 0.0, tau 0.5, fov_pad OFF, deterministic ground
 FoV, q1 roll ON, batch 16, 80 epochs, num_workers 2.'
+    ;;
+
+round4aB)
+    echo "Round 4aB - can we reach round4a WITHOUT padding? [full data, 80 ep]"
+    echo "  reference points:  4a padded 82.01   |   8a unpadded no-wedge 77.69"
+    echo "  both arms are UNPADDED and use the new per-batch log-uniform FoV"
+    launch round4aB1-nopad-logubatch \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_ENABLE_AERIAL_CROP=false SINGEO_RNC_WEIGHT=0.0 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_RNC_TAU=0.5 SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='B1. Unpadded, per-batch log-uniform FoV, NO wedge, InfoNCE only.
+Single variable vs round8a (Avg 77.69): the FoV sampling.
+
+WHY THIS EXISTS. round4a reaches 82.01 and round8a 77.69, but the two differ in
+four ways at once, and one of them is forced rather than chosen: per-sample
+log-uniform draws give every sample a different crop width, unpadded crops of
+different widths cannot be stacked by default_collate, so every log-uniform run
+had to be padded. Padding may therefore be scaffolding for the sampling rather
+than a benefit in itself.
+
+The deterministic schedule round8a had to use spends 0.1 pct of the LR-weighted
+budget at FoV <= 90 deg, the geometry it is scored on. Log-uniform spends 10.2
+pct. That is the largest known handicap of the whole unpadded family.
+
+WHAT IS NEW. fov_sampling=loguniform_batch draws ONE FoV per batch instead of
+per sample, so widths are uniform inside a batch and unpadded batches collate.
+Verified end to end: per-sample unpadded raises in default_collate, per-batch
+gives widths 182 / 422 / 236 / 464 across batches with exactly 1 distinct FoV
+inside each. Across batches the distribution matches the per-sample draw to
+within 2 pct at both the 90 and 180 deg thresholds.
+
+A second property matters for the padding argument: InfoNCE discriminates
+sample i from sample j INSIDE a batch, so a FoV shared by the whole batch
+cannot serve as a cue at all. Any FoV shortcut is removed by construction.
+
+READING IT, against round8a 77.69, noise about 3 points:
+  well above 77.69  the sampling was the handicap, and padding was only ever
+      the thing that made the sampling possible
+  near 77.69        log-uniform does not transfer unpadded, and padding is
+      doing something of its own
+
+r2 is rotated by a uniform 90*k, k in {0,1,2,3}, with the disc mask off. Every
+such rotation is an exact pixel permutation, so no interpolation happens, no
+corners leave the frame and the edge pixels are kept -- which is why the
+inscribed disc, whose only job is hiding the blank corners continuous rotation
+creates, is no longer needed. It costs 21.46 pct of every tile and buys nothing
+here. The draw happens in the dataset rather than in albumentations so that B1
+and B2 share one rotation scheme and differ only in the wedge.
+
+Matched to round8a deliberately: no q1 roll, no wedge, rnc_weight 0. That means
+it carries round8a-s collapse risk at epoch 16, which round8a survived and
+recovered from. Everything else default: tau 0.5, batch 16, 80 epochs.'
+
+    launch round4aB2-nopad-wedge-rnc \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='B2. B1 plus the aerial wedge and RnC. THE THESIS RUN.
+
+Single variable vs round4aB1: aerial sector supervision. This is the control the
+project has never had. Of 20 runs only two had the wedge off, and both were in
+the unpadded deterministic family, so the best result on record (round4a, 82.01)
+has never been compared against an otherwise identical run without the wedge.
+
+Note the wedge and RnC cannot be separated here, and that is structural rather
+than sloppy: with enable_aerial_crop=False the aerial side has a single view, so
+RnC has nothing to rank against and the g2a and a2a groups are exactly 0
+(measured: g2a 0.7375 with the wedge, 0.0000 without). Aerial sector supervision
+is what gives RnC anything to order. B2 minus B1 is therefore the combined
+contribution of wedge plus RnC, which is the contribution being claimed.
+
+RnC is set to match round4a rather than the current defaults, since the target
+is reproducing 82.01 without padding: rnc_positives_only=false and
+negative_tiering=embed, the all-pairs GEE-embedding form round4a used. The
+positives-only form added later is about 15x smaller in magnitude and would need
+rnc_weight retuned before it is a fair comparison.
+
+READING IT:
+  B2 > B1 and near 82.01   aerial sector supervision helps AND the result holds
+      without padding anywhere, in training or at evaluation. That is the claim.
+  B2 > B1 but below 82.01  the wedge helps but padding still contributes
+      something of its own
+  B2 = B1                  the wedge contributes nothing in the configuration
+      that actually performs, and the earlier negative results were not an
+      artefact of the unpadded deterministic family
+
+r2 rotation is the same uniform 90*k as B1, disc mask off, drawn in the dataset
+so the only difference between the two arms is the wedge itself.
+
+Everything else identical to B1: unpadded, per-batch log-uniform, no q1 roll,
+tau 0.5, batch 16, 80 epochs.'
     ;;
 
 list)

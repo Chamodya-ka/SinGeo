@@ -10,7 +10,7 @@ import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
-                               draw_discrete_aerial_rotation)
+                               draw_discrete_aerial_rotation, draw_quarter_rotation)
 
 class CVUSADatasetTrain(Dataset):
     
@@ -367,6 +367,26 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # `get_dynamic_fov_floor` for why the range beats the point.
         self.ground_fov_floor = None
 
+        # Per-BATCH FoV instead of per-sample. `None` keeps the per-sample draw.
+        #
+        # A per-sample draw gives every sample in the batch a different crop
+        # width, and unpadded crops of different widths cannot be stacked --
+        # default_collate raises. That is the only reason log-uniform sampling
+        # has always been run with padding. Drawing once per batch keeps widths
+        # uniform inside the batch, so unpadded log-uniform batches fine, while
+        # the distribution across batches is unchanged.
+        #
+        # It also removes FoV as a cue: InfoNCE discriminates within a batch,
+        # and if every sample there shares one FoV, FoV cannot tell sample i
+        # from sample j. The shortcut is gone by construction rather than by
+        # hoping the model ignores it.
+        #
+        # Batches are contiguous slices of `self.samples` -- the loader runs
+        # with shuffle=False under custom sampling and the shuffle drops the
+        # ragged tail -- so `index // fov_batch_size` names the batch.
+        self.fov_batch_size = None
+        self.fov_epoch = 0
+
         self.sat_arc = 360.0           # aerial sector width in degrees
         # Bounds two things, both widening over the curriculum: the tile's
         # continuous rotation, and how far the aerial sector's heading may
@@ -466,6 +486,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
             # this mode so the crop is not applied twice.
             if self.ground_fov_floor is None:
                 fov = self.ground_fov
+            elif self.fov_batch_size:
+                batch = index // self.fov_batch_size
+                seed = (self.fov_epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+                fov = draw_log_uniform_fov(self.ground_fov_floor, rng=random.Random(seed))
             else:
                 fov = draw_log_uniform_fov(self.ground_fov_floor)
 
@@ -476,13 +500,22 @@ class CVUSADatasetTrainSinGeo(Dataset):
             meta[M_GROUND_CENTER] = g_center
             meta[M_GROUND_EXTENT] = g_extent
 
+            # r2's rotation. Drawn for every discrete mode, wedge or not, so a
+            # wedge-on and a wedge-off run differ ONLY in the wedge: with the
+            # wedge off the albumentations DynamicRandomRotate would otherwise
+            # supply a different scheme (+-90 on a schedule, never 180), making
+            # the pair differ in two things at once. The trainer switches that
+            # transform off whenever this path is active.
+            if self.aerial_rotation == "quarter":
+                rot = draw_quarter_rotation()
+            elif self.aerial_rotation == "discrete":
+                rot = draw_discrete_aerial_rotation(self.aerial_rotate_keep_prob)
+            else:
+                rot = random.uniform(-self.sat_rot_max, self.sat_rot_max)
+
             if self.enable_aerial_crop:
-                # Aerial sector crop: continuous rotation of the tile plus an
-                # azimuth wedge, the aerial counterpart of the ground FoV crop.
-                if self.aerial_rotation == "discrete":
-                    rot = draw_discrete_aerial_rotation(self.aerial_rotate_keep_prob)
-                else:
-                    rot = random.uniform(-self.sat_rot_max, self.sat_rot_max)
+                # Aerial sector crop: the azimuth wedge, the aerial counterpart
+                # of the ground FoV crop.
 
                 # The sector is anchored to the ground crop's heading and then
                 # allowed to drift off it. `sat_rot_max` bounds the drift and
@@ -507,6 +540,11 @@ class CVUSADatasetTrainSinGeo(Dataset):
             else:
                 # No aerial crop view exists; the trainer drops it from the RNC
                 # groups, but record a full arc so the meta layout stays fixed.
+                # A discrete rotation still applies here, so both arms of a
+                # wedge on/off pair share one augmentation scheme. rot90 is
+                # exact, and rotating a full tile leaves its arc at 360.
+                if self.aerial_rotation in ("quarter", "discrete") and rot != 0.0:
+                    reference_img2 = torch.rot90(reference_img2, k=int(rot // 90), dims=(1, 2))
                 meta[M_SAT_CENTER] = 0.0
                 meta[M_SAT_EXTENT] = 360.0
 

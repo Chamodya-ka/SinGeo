@@ -23,6 +23,7 @@ from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
 from singeo.loss import InfoNCE, RankNContrast
 from singeo.distances import GeoNeighbourRanks, GeoCoordinates, SatelliteEmbeddings, RnCDistanceBuilder
 from singeo.model import TimmModel_SinGeo
+from singeo.visualize import RnCSampleVisualizer
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 from singeo.transforms import get_dynamic_rotation_angle
 
@@ -290,6 +291,11 @@ class Configuration:
     #
     # Only the tile's rotation changes. The sector's heading drift off the
     # ground crop still follows aerial_rot_max in both modes.
+    #   "quarter"    - uniform over {0, 90, 180, 270}, every one an exact pixel
+    #                  permutation. Unlike "discrete" it includes 180 and has no
+    #                  probability schedule. Applied to r2 whether or not the
+    #                  wedge is on, so a wedge-on/wedge-off pair differs only in
+    #                  the wedge rather than also in the rotation scheme.
     aerial_rotation: str = "continuous"
     aerial_circular_mask: bool = True
 
@@ -340,7 +346,19 @@ class Configuration:
     # Sampling a range instead of a point also keeps wide-FoV examples in every
     # batch, which is what makes one model robust across 360/180/90/70 rather
     # than specialised at the curriculum's endpoint.
-    fov_sampling: str = "loguniform"   # "loguniform" | "deterministic"
+    #   "loguniform_batch" - the same draw, but ONE FoV per batch instead of per
+    #                        sample. This is the only log-uniform mode that
+    #                        works UNPADDED: per-sample draws give each sample a
+    #                        different crop width and default_collate cannot
+    #                        stack them, which is why every log-uniform run so
+    #                        far has been padded. Across batches the FoV
+    #                        distribution is identical to "loguniform".
+    #
+    #                        It also removes FoV as a within-batch cue: InfoNCE
+    #                        discriminates sample i from sample j inside one
+    #                        batch, and if they share a FoV it cannot be used to
+    #                        tell them apart.
+    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "deterministic"
     fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
     fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
 
@@ -466,6 +484,16 @@ class Configuration:
     #
     # Needs the wedge (use_rnc and enable_aerial_crop) and no grad checkpointing.
     aerial_mask_mode: str = "off"
+
+    # Save a collage of the four training views (q1, q2, r1, r2) into the run's
+    # own output directory every N epochs, plus epoch 1 -- the epoch where a
+    # miswired crop or rotation is cheapest to catch. 0 disables it.
+    #
+    # Each panel is labelled with the arc that sample actually received, so the
+    # curriculum can be checked by eye rather than inferred from the loss. Needs
+    # use_rnc=True, since the crop windows only exist on that path.
+    input_collage_every: int = 10
+    input_collage_samples: int = 4
 
 #-----------------------------------------------------------------------------#
 # Train Config                                                                #
@@ -693,6 +721,21 @@ if __name__ == '__main__':
     else:
         print("Config overrides from environment: none")
 
+    collage = None
+    if config.input_collage_every and config.use_rnc:
+        # Epoch 1 as well as every Nth: the first epoch is when a geometry bug
+        # is most visible and least expensive to have found.
+        epochs = sorted({1} | set(range(config.input_collage_every,
+                                        config.epochs + 1, config.input_collage_every)))
+        collage = RnCSampleVisualizer(
+            model_path, mean=None, std=None,
+            num_samples=config.input_collage_samples, epochs=epochs,
+            positive_scale=config.rnc_positive_scale,
+            positive_overlap=config.rnc_positive_overlap)
+        print("Input collages -> {} at epochs {}".format(model_path, epochs))
+    elif config.input_collage_every:
+        print("Input collages: off (needs use_rnc=True for the crop windows)")
+
     setup_system(seed=config.seed,
                  cudnn_benchmark=config.cudnn_benchmark,
                  cudnn_deterministic=config.cudnn_deterministic)
@@ -739,6 +782,9 @@ if __name__ == '__main__':
             
     # Model to device   
     model = model.to(config.device)
+
+    if collage is not None:
+        collage.mean, collage.std = mean, std
 
     print("\nImage Size Sat:", image_size_sat)
     print("Image Size Ground:", img_size_ground)
@@ -1005,9 +1051,13 @@ if __name__ == '__main__':
         print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
     else:
         print("InfoNCE overlap gating: off")
-    if config.aerial_rotation not in ("continuous", "discrete"):
-        raise ValueError("aerial_rotation must be 'continuous' or 'discrete', got {!r}".format(
-            config.aerial_rotation))
+    if config.aerial_rotation not in ("continuous", "discrete", "quarter"):
+        raise ValueError("aerial_rotation must be 'continuous', 'discrete' or 'quarter', "
+                         "got {!r}".format(config.aerial_rotation))
+    if config.aerial_rotation != "continuous" and not config.use_rnc:
+        raise ValueError(
+            "aerial_rotation={!r} is applied in the dataset, which only runs when use_rnc=True "
+            "(return_meta). Use 'continuous' without RNC.".format(config.aerial_rotation))
     if config.aerial_mask_mode not in ("off", "pool", "gated"):
         raise ValueError("aerial_mask_mode must be 'off', 'pool' or 'gated', got {!r}".format(
             config.aerial_mask_mode))
@@ -1026,7 +1076,7 @@ if __name__ == '__main__':
     print("Ground FoV sampling: {} (curriculum end {:.1f} deg{})".format(
         config.fov_sampling, config.fov_curriculum_end,
         ", ramp {:.0%} of run".format(config.fov_ramp_frac)
-        if config.fov_sampling == "loguniform" else ""))
+        if config.fov_sampling.startswith("loguniform") else ""))
     if not config.fov_pad_random_start and not config.use_rnc:
         # get_transforms_train_singeo_rot does the crop on the no-RNC path and
         # does not take pad_random_start, so training would keep the random
@@ -1035,7 +1085,15 @@ if __name__ == '__main__':
             "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
             "on the dataset path, which return_meta enables).")
 
-    if config.fov_sampling == "loguniform" and not config.use_rnc:
+    if config.fov_sampling not in ("loguniform", "loguniform_batch", "deterministic"):
+        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch' or "
+                         "'deterministic', got {!r}".format(config.fov_sampling))
+    if config.fov_sampling == "loguniform" and not config.fov_pad:
+        raise ValueError(
+            "fov_sampling='loguniform' needs fov_pad=True: per-sample draws give each sample a "
+            "different crop width and default_collate cannot stack them. Use "
+            "'loguniform_batch' to run log-uniform unpadded.")
+    if config.fov_sampling.startswith("loguniform") and not config.use_rnc:
         # The per-sample draw lives in the dataset, which only crops when it is
         # recording arcs for RNC. Without RNC the crop stays in the transform
         # pipeline, where LimitedFoVPad takes one fixed FoV per epoch. Say so
@@ -1147,7 +1205,8 @@ if __name__ == '__main__':
     for epoch in range(1, config.epochs+1):
         
         # modulate the ratation prob of the satellite branch
-        if config.use_rnc and config.enable_aerial_crop:
+        dataset_rotates_r2 = config.use_rnc and config.aerial_rotation != "continuous"
+        if (config.use_rnc and config.enable_aerial_crop) or dataset_rotates_r2:
             # The aerial sector crop applies its own rotation with a recorded
             # angle, so the albumentations +-90 rotation is switched off here
             # (keep_prob=1.0) rather than stacking two unrelated rotations. In
@@ -1174,20 +1233,17 @@ if __name__ == '__main__':
         # representative value used for the sim-sampling loader (which needs one
         # fixed FoV to rank with) and for logging. The geometric mean of the
         # draw is the honest representative, so use that.
-        if config.fov_sampling == "loguniform":
+        if config.fov_sampling.startswith("loguniform"):
             fov_floor = get_dynamic_fov_floor(epoch, config.epochs,
                                               fov_start=360.0,
                                               fov_end=config.fov_curriculum_end,
                                               ramp_frac=config.fov_ramp_frac)
             fov_dynamic = math.sqrt(fov_floor * 360.0)
-        elif config.fov_sampling == "deterministic":
+        else:
             fov_floor = None
             fov_dynamic = get_dynamic_fov(epoch, config.epochs,
                                           fov_start=360,
                                           fov_end=config.fov_curriculum_end)
-        else:
-            raise ValueError("fov_sampling must be 'loguniform' or 'deterministic', got {!r}".format(
-                config.fov_sampling))
         # With RNC the crop moves into the dataset (which records its window),
         # so the transform pipeline is built without one.
         fov_for_transform = 0.0 if config.use_rnc else fov_dynamic
@@ -1224,6 +1280,11 @@ if __name__ == '__main__':
             # schedulers as the ground branch rather than introducing new ones.
             train_dataloader.dataset.ground_fov = fov_dynamic
             train_dataloader.dataset.ground_fov_floor = fov_floor
+            # Per-batch mode needs the batch width and the epoch so the draw is
+            # reproducible from the batch index in every worker.
+            train_dataloader.dataset.fov_batch_size = (
+                config.batch_size if config.fov_sampling == "loguniform_batch" else None)
+            train_dataloader.dataset.fov_epoch = epoch
 
             if config.enable_aerial_crop:
                 # `aerial_ramp_frac < 1` compresses both aerial schedules into
@@ -1249,6 +1310,11 @@ if __name__ == '__main__':
                 train_dataloader.dataset.sat_rot_max = sat_rot_max
                 print(f"For Epoch {epoch}: Aerial sector = {sat_arc_dynamic:.4f}, "
                       f"max rotation = {sat_rot_max:.4f}")
+
+        # After the epoch's curriculum state is set, so the collage shows exactly
+        # what this epoch will train on.
+        if collage is not None:
+            collage.capture(train_dataloader.dataset, epoch)
 
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
 
