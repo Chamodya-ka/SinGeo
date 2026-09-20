@@ -1415,3 +1415,159 @@ def test_non_multiple_of_90_still_uses_the_interpolating_path():
         expected = TF.rotate(x.unsqueeze(0), rot).squeeze(0)
         got = apply_aerial_sector(x, rot, 0.0, 360.0, circular_mask=False)
         assert torch.equal(got, expected), rot
+
+
+# ---------------------------------------------------------------------------
+# Per-batch log-uniform FoV (round 4aB)
+# ---------------------------------------------------------------------------
+
+def test_per_batch_draw_is_constant_within_a_batch():
+    """Every index in one batch must yield the same FoV, or unpadded crops
+    cannot be collated."""
+    from singeo.transforms import draw_log_uniform_fov
+    bs = 16
+    for batch in range(5):
+        seed = (7 * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+        vals = {draw_log_uniform_fov(70.0, rng=random.Random(seed)) for _ in range(bs)}
+        assert len(vals) == 1, vals
+
+
+def test_per_batch_draw_varies_across_batches_and_epochs():
+    from singeo.transforms import draw_log_uniform_fov
+    def draw(epoch, batch):
+        seed = (epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+        return draw_log_uniform_fov(70.0, rng=random.Random(seed))
+    across_batches = {round(draw(1, b), 6) for b in range(200)}
+    across_epochs = {round(draw(e, 0), 6) for e in range(200)}
+    assert len(across_batches) > 190, len(across_batches)
+    assert len(across_epochs) > 190, len(across_epochs)
+
+
+def test_per_batch_keeps_the_log_uniform_distribution():
+    """Across batches the FoV distribution must match the per-sample draw."""
+    from singeo.transforms import draw_log_uniform_fov
+    def frac_below(vals, t):
+        return sum(1 for v in vals if v <= t) / len(vals)
+    per_batch = [draw_log_uniform_fov(70.0, rng=random.Random(
+        (3 * 1_000_003 + b * 2_654_435_761) % (2 ** 63))) for b in range(20000)]
+    random.seed(0)
+    per_sample = [draw_log_uniform_fov(70.0) for _ in range(20000)]
+    for t in (90.0, 180.0):
+        assert abs(frac_below(per_batch, t) - frac_below(per_sample, t)) < 0.02, t
+
+
+def test_rng_argument_leaves_the_global_stream_untouched():
+    """Seeding per batch must not perturb the other augmentations."""
+    from singeo.transforms import draw_log_uniform_fov
+    random.seed(11)
+    expected = [random.random() for _ in range(5)]
+    random.seed(11)
+    got = []
+    for _ in range(5):
+        draw_log_uniform_fov(70.0, rng=random.Random(123))
+        got.append(random.random())
+    assert got == expected
+
+
+def test_ground_arc_is_recorded_as_a_compass_bearing():
+    """meta's ground centre is where the crop's pixels face, in compass bearings.
+
+    CVUSA panoramas face north at the centre column, so a crop centred on
+    panorama column c looks toward bearing c / W * 360 + 180. Deterministic
+    transforms make q2 an exact slice of q1, so the slice's position gives the
+    crop's true panorama-frame centre, independent of the dataset's bookkeeping.
+    The paired horizontal flip must not change the relation.
+    """
+    if not os.path.isdir(CVUSA_FOLDER):
+        print("   (skipped: CVUSA data folder not present)")
+        return
+
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    from singeo.transforms import get_transforms_val
+
+    sat_tf, ground_tf = get_transforms_val((96, 96), (35, 192), fov=0.0)
+
+    for prob_flip in (0.0, 1.0):
+        ds = CVUSADatasetTrainSinGeo(data_folder=CVUSA_FOLDER,
+                                     transforms_query1=ground_tf, transforms_query2=ground_tf,
+                                     transforms_reference1=sat_tf, transforms_reference2=sat_tf,
+                                     prob_flip=prob_flip, prob_rotate=0.0,
+                                     shuffle_batch_size=4,
+                                     return_meta=True, enable_aerial_crop=True)
+        ds.ground_fov = 90.0
+        ds.sat_arc = 120.0
+        ds.sat_rot_max = 0.0
+
+        random.seed(7)
+        for i in range(8):
+            q1, q2, _, _, _, meta = ds[i]
+            width, kept = q1.shape[2], q2.shape[2]
+
+            starts = [s for s in range(width)
+                      if torch.equal(torch.roll(q1, -s, dims=2)[:, :, :kept], q2)]
+            assert len(starts) == 1, (prob_flip, i, starts)
+
+            pano_centre = (starts[0] + kept / 2.0) / width * 360.0
+            # 180 is a measured property of the data (see CVUSA_PANO_COL0_BEARING),
+            # written out so that changing the constant fails here.
+            expected = (pano_centre + 180.0) % 360.0
+            assert _circular_delta(float(meta[M_GROUND_CENTER]), expected) <= 360.0 / width, \
+                (prob_flip, i, float(meta[M_GROUND_CENTER]), expected)
+
+            # With no drift the wedge is centred on that same compass bearing.
+            assert _circular_delta(float(meta[M_SAT_CENTER]), float(meta[M_GROUND_CENTER])) < 1e-4
+
+
+def _infonce_term_fixture(weights=None):
+    """Six-term InfoNCE over fixed random features, optionally reweighted."""
+    from singeo.loss import InfoNCE
+    from singeo.trainer import _singeo_infonce_terms
+
+    class _Cfg:
+        gpu_ids = (0,)
+        overlap_gated_infonce = False
+
+    class _Model:
+        logit_scale = torch.log(torch.tensor(1 / 0.07))
+
+    cfg = _Cfg()
+    if weights is not None:
+        cfg.infonce_term_weights = weights
+
+    torch.manual_seed(0)
+    feats = [torch.randn(8, 32) for _ in range(4)]
+    loss_fn = InfoNCE(loss_function=torch.nn.CrossEntropyLoss(label_smoothing=0.1),
+                      device='cpu')
+    return _singeo_infonce_terms(cfg, _Model(), loss_fn, *feats)
+
+
+def test_default_infonce_term_weights_reproduce_the_original_sum():
+    """The default must be the original expression bit for bit."""
+    total_absent, terms = _infonce_term_fixture()
+    total_default, _ = _infonce_term_fixture((1.0, 0.5, 0.5, 0.25, 0.25, 0.25))
+
+    l1, l2, l3, l4, l5, l6 = terms
+    original = l1 + 0.5 * l2 + 0.5 * l3 + 0.25 * l4 + 0.25 * l5 + 0.25 * l6
+
+    assert torch.equal(total_absent, original), (total_absent.item(), original.item())
+    assert torch.equal(total_default, original), (total_default.item(), original.item())
+
+
+def test_zeroed_infonce_terms_leave_the_total_but_are_still_reported():
+    """`(1, .5, 0, .25, 0, 0)` drops exactly the three wedge hard-positive terms."""
+    weights = (1.0, 0.5, 0.0, 0.25, 0.0, 0.0)
+    total, terms = _infonce_term_fixture(weights)
+    l1, l2, l3, l4, l5, l6 = terms
+
+    assert torch.equal(total, l1 + 0.5 * l2 + 0.25 * l4)
+
+    # The dropped terms are still computed, so the logs keep showing them.
+    for dropped in (l3, l5, l6):
+        assert torch.isfinite(dropped) and dropped > 0
+
+
+def test_infonce_term_weights_must_have_six_entries():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="6 entries"):
+        _infonce_term_fixture((1.0, 0.5, 0.5))
