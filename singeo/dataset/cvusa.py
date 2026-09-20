@@ -12,6 +12,27 @@ from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_C
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
                                draw_discrete_aerial_rotation, draw_quarter_rotation)
 
+# Compass bearing that column 0 of a CVUSA panorama faces.
+#
+# CVUSA convention: the panorama's horizontal middle faces north, and the aerial
+# tile's top-middle is north. So column W/2 is bearing 0 and column 0 is 180.
+#
+# `apply_limited_fov` reports its arc in the panorama's own frame (column c ->
+# c / W * 360, increasing left to right), while the aerial wedge is placed in
+# compass bearings (0 = up/north on the tile, clockwise). The two only agree if
+# column 0 faces north, and in CVUSA it does not: the centre column faces north,
+# so column 0 faces south. Measured 2026-09-19 on the val split -- colour
+# profiles around 600 panoramas and their tiles peak at +180 deg (237 pairs vs
+# 122 at 0), and round8a, which never saw a wedge, scores the wedge at +180 deg
+# as the best match for 341 of 800 ground crops against 26 at 0. The handedness
+# already agrees (a mirrored fit is 4-5x weaker), so a constant offset suffices,
+# and the paired horizontal flip preserves it.
+#
+# Before this existed every wedge run centred r2 on the opposite side of the tile
+# from what q2 sees, the loss6 overlap gate favoured the mismatched pairs, and the
+# RnC q2 <-> r2 distances were wrong. Evaluation uses no arcs and was unaffected.
+CVUSA_PANO_COL0_BEARING = 180.0
+
 class CVUSADatasetTrain(Dataset):
     
     def __init__(self,
@@ -497,6 +518,9 @@ class CVUSADatasetTrainSinGeo(Dataset):
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                pad=self.fov_pad,
                                                                pad_random_start=self.pad_random_start)
+            # Panorama frame -> compass bearing, the frame the wedge is placed in
+            # and every arc comparison assumes. See CVUSA_PANO_COL0_BEARING.
+            g_center = (g_center + CVUSA_PANO_COL0_BEARING) % 360.0
             meta[M_GROUND_CENTER] = g_center
             meta[M_GROUND_EXTENT] = g_extent
 

@@ -97,6 +97,19 @@ class Configuration:
     # along with the RNC term.
     infonce_weight: float = 1.0
 
+    # Per-term weights inside the InfoNCE block, in the order
+    #   (loss1 q1-r1, loss2 q1-q2, loss3 r1-r2, loss4 r1-q2, loss5 r2-q1, loss6 r2-q2)
+    # The default reproduces the original expression exactly, bit for bit.
+    #
+    # The reason this is a knob: loss3, loss5 and loss6 are the three terms that
+    # hold the aerial wedge as a HARD positive, i.e. they instruct the model that
+    # a view which is up to 60% blank pixels must be identical to a clean one.
+    # `(1.0, 0.5, 0.0, 0.25, 0.0, 0.0)` removes exactly those three and leaves the
+    # wedge out of InfoNCE's positives altogether, so the wedge can be carried by
+    # RNC instead, which ranks it as a partial match below the full tile rather
+    # than forcing equality. The remaining terms are blank-free without padding.
+    infonce_term_weights: tuple = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+
     # Rank-N-Contrast (RNC) auxiliary loss
     # Added alongside the six InfoNCE terms, never replacing them.
     use_rnc: bool = True              # master switch for the whole RNC path
@@ -641,6 +654,14 @@ def write_run_info(path, cfg, run_name, note, overrides):
             "so a wedge pointing away from the ground crop cannot assert a false positive."
             if cfg.overlap_gated_infonce
             else "including the ~31% that share no azimuth at all late in the curriculum."))
+    default_terms = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+    if tuple(cfg.infonce_term_weights) != default_terms:
+        names = ("q1-r1", "q1-q2", "r1-r2", "r1-q2", "r2-q1", "r2-q2")
+        lines.append("InfoNCE term weights: {}".format(", ".join(
+            "{} {}".format(n, w) for n, w in zip(names, cfg.infonce_term_weights))))
+        dropped = [n for n, w in zip(names, cfg.infonce_term_weights) if w == 0]
+        if dropped:
+            lines.append("  DROPPED as hard positives: {}".format(", ".join(dropped)))
     lines.append("")
 
     lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))

@@ -32,9 +32,87 @@ verified upstream reproduction (config diffed against commit `298b156`; only
 paths, `num_workers` and the checkpoint-selection FoV differ) and lands within
 ~1 point at three of four FoVs.
 
-**The wedge problem in one line:** in the unpadded family the wedge costs
-**−11.64 Avg** (8a → 8b). Everything below is an attempt to find out why, and
-whether it can be reversed.
+**The wedge problem, as it first appeared:** in the unpadded family, 8a → 8b
+costs **−11.64 Avg**, and that gap was read as "aerial wedging is destructive".
+
+**Corrected:** 8b also carries the q1 roll, and **the roll, not the wedge,
+accounts for 91% of the gap** (next section). Isolated, the wedge costs 0.45
+Avg — noise.
+
+---
+
+## The key result: the q1 roll caps FoV 180, not the wedge
+
+**Every run with `ground_roll_q1=True` plateaus at FoV 180 ≈ 79–83. Every run
+without it reaches ≈ 90.7.** Nothing else varied across these runs moved the
+ceiling — not the wedge, not padding, not mask-aware encoding, not the rotation
+scheme.
+
+| run | q1 roll | latest FoV 180 | gain from e40 |
+|---|---|---|---|
+| **8a** | no | **90.72** (e80) | +9.20 |
+| **9b** | no | **90.77** (e52) | +2.50 |
+| 8b | yes | 79.32 (e80) | **+0.53 over 40 epochs** |
+| 9a | yes | 82.71 (e52) | +2.36 |
+| 10a | yes | 80.97 (e68) | +1.81 |
+| 10b | yes | 80.14 (e68) | +0.79 |
+| 11a | yes | 81.09 (e56) | +1.98 |
+| 11b | yes | 80.90 (e56) | +3.02 |
+
+Six roll-on runs spanning wedge on/off, padding on/off, three mask modes and two
+rotation schemes all land at 79–83. 8b is the starkest: 78.79 at e40, 79.32 at
+e80, and it *fell* from 81.11 at e64.
+
+### Decomposing the original "wedge is destructive" gap
+
+8b had the roll **and** the wedge; 8a had neither. `round11b` (roll, no wedge)
+splits them. At **epoch 56**, the deepest point 11b has reached:
+
+| | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** |
+|---|---|---|---|---|---|
+| total gap (8b − 8a) | −4.33 | −7.49 | +4.81 | −11.89 | **−4.72** |
+| **q1 roll alone** (11b − 8a) | −4.11 | −7.00 | +5.03 | −11.03 | **−4.28** |
+| **wedge, given the roll** (8b − 11b) | −0.23 | −0.48 | −0.23 | −0.86 | **−0.45** |
+
+**The roll explains 91% of the gap. The wedge — the full bundle, continuous
+rotation and disc mask included — accounts for 0.45 Avg, under a point at every
+FoV.** The evidence that aerial wedging is destructive was the q1 roll, bundled
+into 8b and never separated until 11b existed.
+
+### Why the roll costs
+
+Without it, q1 and r1 sit at relative orientation **0 in 300/300** training
+samples: `prob_rotate` rotates the tile and rolls the panorama *together*, a
+label-preserving augmentation inherited from Sample4Geo. That alignment is the
+dataset's free lunch. The roll makes the relative orientation uniform, which
+damages `loss1(q1, r1)` — the single highest-weighted term (1.0). It does not
+touch `loss2`: the q1↔q2 offset is already uniform without it, because the crop
+azimuth is drawn uniformly per sample.
+
+The alignment is not a test-time shortcut. Every evaluation here rolls the query
+uniformly against a north-up tile, even at FoV 360, so the north cue is never
+available at eval. Training on geometrically consistent pairs simply learns
+better features, and forcing invariance on q1 costs discriminative power.
+
+### What the roll was for, and what replaces it
+
+Its only benefit is preventing the epoch-16 collapse — +14.41 Avg at e16 (8b vs 8a), when
+8a's FoV 90 fell 18.49 → 6.99. That benefit is available elsewhere: padding
+prevented the collapse in 9b with no roll at all, and 8a survived the collapse
+and still finished at 77.69. **So there is no remaining reason to use the roll.**
+
+### Caveats
+
+- **Epoch 56, not 80.** 8a surged +10.15 Avg over epochs 56–80 and 11b has not
+  entered that window. If 11b plateaus like every other roll-on run — its FoV 180
+  already sits at the ~80 ceiling — the roll will explain the final −11.64 too.
+  Likely, not yet confirmed.
+- **FoV 90 is the exception** (roll +5.03). That is timing, not benefit: the
+  deterministic schedule first reaches ≤90° at epoch 74, and 8a's FoV 90 is only
+  42.49 at e56 before surging to 69.26.
+- **Rounds 8b–11 all ran under this ceiling.** Comparisons *within* them stay
+  valid, since both arms share the roll, but every one was measured against a
+  capped FoV 180.
 
 ---
 
@@ -55,28 +133,30 @@ is why the early comparisons were uninterpretable.
 
 ## Clean single-variable results
 
-Every row below changes exactly one thing. Avg at **epoch 48**, the deepest
-point the in-flight runs share.
+Every row changes exactly one thing. Avg at **epoch 56** where the runs reach
+it; the padding rows stop at **epoch 48** because 9a/9b were stopped at e52.
 
 | comparison | isolates | Δ Avg | verdict |
 |---|---|---|---|
-| 11a − 11b (62.55 vs 60.95) | **wedge on/off**, rotation exact, roll matched | **+1.60** | wedge is **not** destructive once rotation is fixed |
-| 11a − 8b (62.55 vs 61.97) | **exact vs continuous rotation** | +0.58 | inconclusive so far |
-| 11b − 8a (60.95 vs 63.90) | **q1 roll** | −2.95 | roll costs, but prevents the e16 collapse |
-| 10a − 8b (62.62 vs 61.97) | **mask-aware encoding** of the wedge | +0.64 | no effect |
-| 9a − 8b (64.72 vs 61.97) | **padding** | +2.75 | padding helps the wedge |
-| 9b (69.08) vs 8a (63.90) | wedge + padding, no roll | +5.18 | **wedge + padding beats no-wedge** |
+| **11b − 8a** (63.26 vs 67.54) | **q1 roll** | **−4.28** | **destructive, widening every eval since e40** |
+| 11a − 11b (63.79 vs 63.26) | wedge on/off, exact rotation, roll matched | +0.52 | wedge neutral |
+| 8b − 11b (62.82 vs 63.26) | wedge bundle, given the roll | −0.45 | wedge neutral |
+| 11a − 8b (63.79 vs 62.82) | exact vs continuous rotation | +0.97 | rotation minor |
+| 10a − 8b (63.95 vs 62.82) | mask-aware encoding | +1.13 | no effect |
+| 9a − 8b @ e48 (64.72 vs 61.97) | padding | +2.75 | padding helps |
+| 9b vs 8a @ e48 (69.08 vs 63.90) | wedge + padding, no roll | +5.18 | wedge + padding beats no-wedge |
 
-**The headline for your question:** with the rotation made exact, the wedge is
-currently **ahead** of no-wedge (+1.60), and with padding it is well ahead
-(+5.18). The −11.64 that started this investigation is looking like the
-*rotation*, not the crop.
+**The headline:** the q1 roll is the one destructive ingredient, and every
+wedge-related change measured so far — the wedge itself, exact vs continuous
+rotation, mask-aware encoding — is within noise once the roll is held fixed.
 
-**Caveat, and it is a big one.** The 8a/8b gap is almost entirely a late-run
-effect — at epoch 48 it is only −1.93, and it opens to −11.64 by epoch 80,
-because 8a surges +13.79 over that window while 8b gains +4.07. The rounds 10
-and 11 runs have not reached that window. **Nothing above is settled until
-epoch 80.**
+*Corrected from an earlier version of this file,* which attributed the −11.64 to
+the *rotation*. With 11b available, rotation accounts for about one point; the
+roll accounts for the rest.
+
+**Caveat.** Most of the 8a/8b gap opens late — 8a surges +10.15 from e56 to e80
+while 8b gains +3.23. The rounds 10 and 11 runs have not all reached that window,
+so the final attribution waits on epoch 80.
 
 ---
 
@@ -112,7 +192,12 @@ satellite branch:
 
 Their stated reason: discrete 90° steps are *"exact pixel permutations"* that
 *"avoid introducing additional padding boundaries"*. The wedge swapped T3ₛ for a
-T1ₛ-style rotation. **round11a undoes exactly that** and is the run to watch.
+T1ₛ-style rotation, and round11a undoes exactly that.
+
+**Measured so far it matters little here:** 11a − 8b is +0.97 Avg at e56, well
+inside noise. Rotation is no longer the leading explanation for anything — the
+q1 roll is. It remains a sound choice on its own merits, since exact rotations
+keep the tile's edge pixels and avoid the 21.46% the disc mask discards.
 
 **The loss asks for identity, not partial similarity.** The overlap gate
 multiplies the per-sample cross-entropy:
@@ -287,18 +372,25 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 ## Next experiments, in priority order
 
-1. **Let round11a/11b reach epoch 80.** The entire 8a/8b gap lives in epochs
-   48–80 and neither has entered it. Everything else is provisional until then.
-2. **Soft targets on `loss6`** — replace the importance weight with a target
+1. **Let round11b reach epoch 80.** It is now the run that confirms the
+   roll attribution: if its final Avg lands near 8b's 66.05 rather than 8a's
+   77.69, the roll explains the whole −11.64. 11a is lower priority — against
+   11b it measures the wedge under a capped FoV 180.
+2. **Keep `ground_roll_q1=False` from here on.** It is the default, and
+   round4aB (item 4) already runs with it off.
+3. **Soft targets on `loss6`** — replace the importance weight with a target
    similarity equal to the overlap fraction. The cheapest change that expresses
    "only part of the tile matches", and it reuses the arc overlap already
    computed.
-3. **Unpadded + per-batch log-uniform FoV.** Removes the largest known handicap
-   of the whole unpadded family without touching padding.
-4. **Positives-only RnC with ≥3 aerial views**, as the graded ordering prior
-   alongside (2). Needs `rnc_weight` retuned — positives-only is ~15× smaller
+4. **round4aB — unpadded + per-batch log-uniform FoV. Built, not launched.**
+   Removes the largest known handicap of the unpadded family without touching
+   padding. B1 (no wedge) vs B2 (wedge + all-pairs RnC) is the **first wedge
+   comparison without the roll's FoV 180 ceiling**, so it is the cleanest test
+   yet of whether the wedge helps.
+5. **Positives-only RnC with ≥3 aerial views**, as the graded ordering prior
+   alongside (3). Needs `rnc_weight` retuned — positives-only is ~15× smaller
    than the all-pairs term 0.25 was tuned for. Costs ~1.6× memory.
-5. **`prob_rotate=0`** — keep q1 fixed entirely, the strongest form of the
+6. **`prob_rotate=0`** — keep q1 fixed entirely, the strongest form of the
    alignment thesis. One env var. Pair it with `fov=0.0` in the eval set to see
    the north-aligned protocol too.
 

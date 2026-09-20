@@ -1033,8 +1033,21 @@ def _singeo_infonce_terms(train_config, model, loss_function,
     loss5 = loss_function(features_r2, features_q1, logit_scale, weights=w5)  # original q1 and auged&rotted r2
     loss6 = loss_function(features_r2, features_q2, logit_scale, weights=w6)  # original q2 and auged&rotted r2
 
-    total = loss1 + 0.5 * loss2 + 0.5 * loss3 + 0.25 * loss4 + 0.25 * loss5 + 0.25 * loss6
-    return total, (loss1, loss2, loss3, loss4, loss5, loss6)
+    terms = (loss1, loss2, loss3, loss4, loss5, loss6)
+
+    # Per-term weights, default (1, 0.5, 0.5, 0.25, 0.25, 0.25). Summing left to
+    # right over that default is the original expression term for term, so the
+    # default path stays bit-identical; `tests/test_rnc.py` pins that. Zeroed
+    # terms are still computed (they are 16x16 matmuls) so the per-term logging
+    # keeps reporting what the dropped pairs would have cost.
+    weights = getattr(train_config, 'infonce_term_weights',
+                      (1.0, 0.5, 0.5, 0.25, 0.25, 0.25))
+    if len(weights) != 6:
+        raise ValueError("infonce_term_weights needs 6 entries (loss1..loss6), got {}"
+                         .format(len(weights)))
+
+    total = sum(w * t for w, t in zip(weights, terms))
+    return total, terms
 
 
 def _build_rnc_view_sets(ids, meta, enable_aerial_crop):

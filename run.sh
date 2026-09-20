@@ -20,6 +20,8 @@
 #   round6   rnc_weight sweep: 0.5 vs 1.0                 [full data, 80 ep] DONE
 #   round9   q1roll+padding vs padding-with-fixed-offset  [full data, 80 ep]
 #   round4aB  unpadded per-batch loguniform: no-wedge vs wedge+RnC [full data, 80 ep]
+#   round4aB2fix  B2 with the ground-heading fix (wedge on the side q2 sees) [full data, 80 ep]
+#   round4aB3  B2fix minus the wedge hard positives; RnC carries the wedge [full data, 80 ep]
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -37,6 +39,12 @@ mkdir -p "$LOGS"
 
 launch() {
     local name="$1"; shift
+    # ONLY=<prefix> starts just the matching slot(s) of a round,
+    # e.g. `ONLY=round4aB2 ./run.sh round4aB`.
+    if [[ -n "${ONLY:-}" && "$name" != ${ONLY}* ]]; then
+        echo "   skipped '$name' (ONLY=$ONLY)"
+        return 0
+    fi
     if screen -list | grep -q "\.${name}[[:space:]]"; then
         echo "!! session '$name' already running -- stop it first ('./run.sh stop $name')"
         return 1
@@ -851,6 +859,83 @@ so the only difference between the two arms is the wedge itself.
 
 Everything else identical to B1: unpadded, per-batch log-uniform, no q1 roll,
 tau 0.5, batch 16, 80 epochs.'
+    ;;
+
+round4aB2fix)
+    echo "Round 4aB2fix - B2 with the ground-heading fix [full data, 80 ep]"
+    echo "  runs alongside round4aB2 (same config, pre-fix wedge)"
+    launch round4aB2fix-nopad-wedge-rnc \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='B2 WITH THE GROUND HEADING FIX. Every setting is identical to
+round4aB2; the only difference is the dataset code (CVUSA_PANO_COL0_BEARING in
+singeo/dataset/cvusa.py, added 2026-09-19).
+
+THE BUG. The ground crop arc was recorded in the panorama frame, which assumed
+column 0 faces north. In CVUSA the horizontal middle of the panorama faces north
+and the top-middle of the aerial tile is north, so column 0 faces SOUTH. Measured
+on val: colour profiles peak at +180 deg (237 of 600 pairs vs 122 at 0), and
+round8a, which never saw a wedge, picks the wedge at +180 deg as the best match
+for 341 of 800 crops vs 26 at 0. Consequences in every earlier wedge run: r2 was
+centred on the opposite side of the tile from what q2 sees, the loss6 overlap
+gate favoured the mismatched pairs, and the RnC q2-r2 distances were wrong.
+Evaluation uses no arcs and was never affected.
+
+THE FIX. The dataset converts the crop centre to a compass bearing (+180) before
+placing the wedge and writing meta. Checked end to end with round8a: the dataset
+r2 now beats the opposite wedge for 176 of 200 crops (174 with the flip).
+
+READING IT, against round4aB2 (pre-fix wedge, same config, running alongside):
+  fixed clearly above   the misalignment was hurting, and this is the first
+      run of the wedge as designed
+  fixed about equal     wedge direction mattered little at these settings
+Against round4aB1 (no wedge, launched later): whether a correctly aligned wedge
+helps at all. Unpadded, per-batch log-uniform, no q1 roll, tau 0.5, batch 16,
+80 epochs.'
+    ;;
+
+round4aB3)
+    echo "Round 4aB3 - wedge as a GRADED positive, not a hard one [full data, 80 ep]"
+    echo "  single variable vs round4aB2fix: infonce_term_weights drops loss3, loss5, loss6"
+    launch round4aB3-wedge-graded \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.0, 0.25, 0.0, 0.0)' \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='B3. THE THESIS RUN. Single variable vs round4aB2fix: the three InfoNCE
+terms that hold the aerial wedge as a HARD positive are removed. The weights
+(1.0, 0.5, 0.0, 0.25, 0.0, 0.0) drop loss3 (r1-r2), loss5 (r2-q1) and loss6
+(r2-q2). What survives -- loss1 (q1-r1), loss2 (q1-q2), loss4 (r1-q2) -- is
+blank free even without padding.
+
+WHY. At epoch 40, adding the wedge and RnC costs 9.31 Avg against round4aB1
+(66.34 vs 75.65), and that is with the wedge geometry finally correct. The
+suspected mechanism is that loss3, loss5 and loss6 instruct the model that a
+view which is up to 60 pct blank pixels must be IDENTICAL to a clean one. RnC is
+not the suspect: its four group losses sat near 2.53 for the whole run, barely
+below their random feature value, so it is not what moved the model.
+
+WHAT CARRIES THE WEDGE INSTEAD. All pairs RnC, unchanged at weight 0.25 and tau
+0.5. It ranks r2 as a partial match: closer to its own location than to any
+other location, yet never closer than the full tile. Positives only RnC was the
+original plan and is wrong here. With the wedge terms gone it leaves r2 with a
+repulsion only signal: measured over one gradient step, cos(q1_i, r2_i) FALLS
+under positives only and RISES under all pairs, because the only same location
+reference positives only leaves is the full tile it must rank behind.
+
+READING IT:
+  near or above round4aB1   the wedge stops being destructive once it enters as
+      a graded positive rather than a hard one. That is the claim of the work.
+  still far below B1        the wedge costs whatever role it is given
+  below round4aB2fix        the hard positives were doing useful work after all
+
+Everything else identical to round4aB2fix: unpadded, per batch log uniform FoV,
+quarter turn r2 with the disc mask off, no q1 roll, tau 0.5, batch 16, 80 ep.'
     ;;
 
 list)
