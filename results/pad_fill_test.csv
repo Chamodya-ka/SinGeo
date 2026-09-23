@@ -1,0 +1,8 @@
+test,fov,margin,fill,canvas,r1
+fill,90.0,0,none,192,48.75
+fill,90.0,64,mean,320,75.27
+fill,90.0,64,const:1.0,320,74.09
+fill,90.0,64,const:-1.0,320,74.36
+fill,90.0,64,noise,320,57.22
+fill,90.0,64,reflect,320,45.59
+fill,90.0,64,replicate,320,27.13

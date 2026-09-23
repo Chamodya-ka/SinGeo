@@ -34,6 +34,7 @@ once and reused; only the query side is re-encoded.
 """
 
 import argparse
+import csv
 import os
 import random
 import sys
@@ -45,6 +46,7 @@ from torch.utils.data import DataLoader
 from singeo.dataset.cvusa import CVUSADatasetEval
 from singeo.evaluate.cvusa_and_cvact import calculate_scores
 from singeo.model import TimmModel_SinGeo
+from singeo.padding_probe import make_canvas
 from singeo.transforms import apply_limited_fov, get_transforms_val
 
 try:
@@ -69,13 +71,14 @@ class LimitedFoVCanvas(ImageOnlyTransform):
     only in what surrounds them.
     """
 
-    def __init__(self, fov=90.0, width_mode="full", start=None):
+    def __init__(self, fov=90.0, width_mode="full", start=None, fill="mean"):
         super(LimitedFoVCanvas, self).__init__(always_apply=True, p=1.0)
         self.fov = float(fov)
         self.width_mode = width_mode
         # None places the crop at a random column, as training does; an int pins
         # its left edge there (clipped to the canvas), for the sliding test.
         self.start = start
+        self.fill = fill
 
     def apply(self, x, **params):
         full = x.shape[2]
@@ -90,18 +93,13 @@ class LimitedFoVCanvas(ImageOnlyTransform):
             # Strictly narrower than a full panorama, as wide as the crop at least.
             width = random.randint(content, full - 1)
         else:
-            width = max(content, min(full, int(self.width_mode)))
+            width = max(content, int(self.width_mode))
 
         if width == content:
             return cropped
 
-        canvas = torch.zeros(x.shape[0], x.shape[1], width, dtype=x.dtype)
-        if self.start is None:
-            start = random.randint(0, width - content)
-        else:
-            start = max(0, min(width - content, int(self.start)))
-        canvas[:, :, start:start + content] = cropped
-        return canvas
+        start = random.randint(0, width - content) if self.start is None else self.start
+        return make_canvas(cropped, width, start=start, fill=self.fill)[0]
 
 
 def resolve_checkpoint(path):
@@ -145,6 +143,25 @@ def main(argv=None):
     parser.add_argument("--starts", type=int, nargs="+", default=None,
                         help="crop start columns for --slide (default: a sweep that is dense "
                              "near both edges)")
+    parser.add_argument("--fills", nargs="+", default=None,
+                        help="fill-value test: margin contents to compare at --fill-margin, e.g. "
+                             "mean const:1.0 noise reflect replicate (0 margin = 'none')")
+    parser.add_argument("--fill-margin", type=int, default=64,
+                        help="margin, in columns per side, for the fill-value test")
+    parser.add_argument("--margins", type=int, nargs="+", default=None,
+                        help="margin sweep: blank columns added on each side, at every --fovs")
+    parser.add_argument("--fovs", type=float, nargs="+", default=[360.0, 180.0, 90.0, 70.0],
+                        help="FoVs for the margin sweep")
+    parser.add_argument("--csv", default=None, help="write the results table here")
+    parser.add_argument("--padding-mode-scope", default="all",
+                        choices=("all", "first", "last", "stage0", "stage1", "stage2", "stage3"),
+                        help="which padding convolutions the mode applies to; the rest stay "
+                             "'zeros'. 'first' is stages.0.blocks.0.conv_dw -- note the stem "
+                             "does not pad at all, so it has no mode to change")
+    parser.add_argument("--padding-mode", default="zeros",
+                        choices=("zeros", "replicate", "reflect", "circular"),
+                        help="what the 36 depthwise 7x7 convolutions invent at the tensor border; "
+                             "the weights are unchanged, only the border values")
     args = parser.parse_args(argv)
 
     checkpoint = resolve_checkpoint(args.checkpoint)
@@ -155,6 +172,27 @@ def main(argv=None):
     state = {k[len("module."):] if k.startswith("module.") else k: v
              for k, v in state.get("state_dict", state).items()}
     print("load:", model.load_state_dict(state, strict=False), flush=True)
+    if args.padding_mode != "zeros":
+        # Swapping the mode post hoc is safe: Conv2d keeps the pad widths in
+        # _reversed_padding_repeated_twice and only reads padding_mode to decide
+        # what to fill with. The trained weights are untouched.
+        padders = [(name, mod) for name, mod in model.named_modules()
+                   if isinstance(mod, torch.nn.Conv2d) and tuple(mod.padding) != (0, 0)]
+        scope = args.padding_mode_scope
+        if scope == "all":
+            chosen = padders
+        elif scope == "first":
+            chosen = padders[:1]
+        elif scope == "last":
+            chosen = padders[-1:]
+        else:
+            chosen = [(n, m) for n, m in padders if ".{}.".format(scope[-1]) in n.split("blocks")[0]]
+        for _, module in chosen:
+            module.padding_mode = args.padding_mode
+        print("border padding: {} of {} convolutions switched to {!r} ({})".format(
+            len(chosen), len(padders), args.padding_mode,
+            ", ".join(n for n, _ in chosen[:3]) + (" ..." if len(chosen) > 3 else "")), flush=True)
+
     model = model.to(args.device).eval()
 
     ground_size = (args.img_size_ground[0], args.img_size_ground[1])
@@ -173,12 +211,14 @@ def main(argv=None):
     content = int(args.fov / 360.0 * ground_size[1])
     print("\ncrop is {} of {} columns ({:.0f} deg)".format(content, ground_size[1], args.fov))
 
-    def score(mode, start=None):
+    def score(mode, start=None, fill="mean", fov=None):
         """R@1 with every query crop placed on the given canvas."""
+        fov = args.fov if fov is None else fov
         # `base_ground` ends with the val pipeline's own FoV transform; replace it.
         transforms = get_transforms_val(sat_size, ground_size, mean=IMAGENET_MEAN,
                                         std=IMAGENET_STD, fov=0.0, fov_pad=False)[1]
-        transforms.transforms[-1] = LimitedFoVCanvas(fov=args.fov, width_mode=mode, start=start)
+        transforms.transforms[-1] = LimitedFoVCanvas(fov=fov, width_mode=mode, start=start,
+                                                    fill=fill)
 
         query_dataset = CVUSADatasetEval(data_folder=args.data_folder, split="test",
                                          img_type="query", transforms=transforms,
@@ -193,6 +233,61 @@ def main(argv=None):
         recalls = calculate_scores(q_features, ref_features, q_labels, ref_labels, ranks=[1, 5, 10])
         # calculate_scores prints R@1/R@5/R@10 itself and returns R@1.
         return recalls if isinstance(recalls, (int, float)) else recalls[0]
+
+    rows = []
+
+    def save(header_note=""):
+        if not args.csv:
+            return
+        path = os.path.abspath(args.csv)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print("\nwrote {}{}".format(path, header_note), flush=True)
+
+    if args.fills:
+        # One margin width, several margin contents. "none" is the unpadded
+        # reference; everything else keeps the crop identical and changes only
+        # what surrounds it.
+        margin = args.fill_margin
+        width = content + 2 * margin
+        print("\ncrop {} px, margin {} px per side (canvas {} px)".format(
+            content, margin, width))
+        header = "{:<12} {:>8}".format("fill", "R@1")
+        print("\n" + header + "\n" + "-" * len(header), flush=True)
+        for fill in args.fills:
+            if fill in ("none", "flush"):
+                r1 = score("content")
+            else:
+                r1 = score(str(width), start=margin, fill=fill)
+            rows.append(dict(test="fill", fov=args.fov, margin=0 if fill in ("none", "flush")
+                             else margin, fill=fill, canvas=content if fill in ("none", "flush")
+                             else width, r1=round(r1, 2)))
+            print("{:<12} {:>8.2f}".format(fill, r1), flush=True)
+        save()
+        return 0
+
+    if args.margins:
+        # A constant blank margin, at every FoV: the deployment fix, which needs
+        # to help at narrow FoV without hurting FoV 360, where training always
+        # had the panorama touching both edges.
+        header = "{:>7} {:>8} {:>8} {:>8}".format("FoV", "margin", "canvas", "R@1")
+        print("\n" + header + "\n" + "-" * len(header), flush=True)
+        for fov in args.fovs:
+            fov_content = int(fov / 360.0 * ground_size[1])
+            for margin in args.margins:
+                width = fov_content + 2 * margin
+                r1 = (score("content", fov=fov) if margin == 0
+                      else score(str(width), start=margin, fov=fov))
+                rows.append(dict(test="margin", fov=fov, margin=margin, fill="mean",
+                             padding_mode=args.padding_mode,
+                                 canvas=fov_content if margin == 0 else width, r1=round(r1, 2)))
+                print("{:>7.0f} {:>6} px {:>6} px {:>8.2f}".format(fov, margin, width, r1),
+                      flush=True)
+        save()
+        return 0
 
     if args.slide:
         # Fixed canvas, fixed crop; only the crop's column changes. Touching the

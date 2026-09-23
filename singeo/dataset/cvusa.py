@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from torch.utils.data import Dataset
+from torch.utils.data.dataloader import default_collate
 import pandas as pd
 import random
 import copy
@@ -407,6 +408,11 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # ragged tail -- so `index // fov_batch_size` names the batch.
         self.fov_batch_size = None
         self.fov_epoch = 0
+        # Upper end of the per-sample draw. None keeps it at 360, the original
+        # behaviour; the trainer lowers it over the curriculum so late epochs
+        # stop spending batch slots on near-panoramic crops. See
+        # `get_dynamic_fov_ceiling`.
+        self.ground_fov_ceiling = None
 
         self.sat_arc = 360.0           # aerial sector width in degrees
         # Bounds two things, both widening over the curriculum: the tile's
@@ -505,14 +511,16 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
+            ceiling = 360.0 if self.ground_fov_ceiling is None else float(self.ground_fov_ceiling)
             if self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
                 batch = index // self.fov_batch_size
                 seed = (self.fov_epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
-                fov = draw_log_uniform_fov(self.ground_fov_floor, rng=random.Random(seed))
+                fov = draw_log_uniform_fov(self.ground_fov_floor, fov_max=ceiling,
+                                           rng=random.Random(seed))
             else:
-                fov = draw_log_uniform_fov(self.ground_fov_floor)
+                fov = draw_log_uniform_fov(self.ground_fov_floor, fov_max=ceiling)
 
             angle = random.randint(0, 359)
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
@@ -757,3 +765,37 @@ class CVUSADatasetTrainSinGeo(Dataset):
             print("Break Counter:", break_counter)
             print("Pairs left out of last batch to avoid creating noise:", len(self.train_ids) - len(self.samples))
             print("First Element ID: {} - Last Element ID: {}".format(self.samples[0], self.samples[-1]))
+
+
+def collate_pad_ground_to_batch_max(batch):
+    """Stack a batch whose ground crops have different widths.
+
+    Per-sample FoV sampling is the point of this collate: it lets one batch hold
+    a 70 degree crop next to a 300 degree one, which `default_collate` cannot
+    stack and which per-batch sampling avoids by giving every sample the same
+    FoV. Each `q2` is padded on both sides to the widest crop in the batch, with
+    zeros -- the dataset mean after Normalize, the same filler `fov_pad` uses.
+
+    Padding to the batch maximum rather than to the panorama's full width keeps
+    the tensor as small as the batch allows, and it means the margin a sample
+    gets is incidental rather than a function of its own FoV.
+
+    Note what this does to the widest sample in each batch: it gets no padding
+    at all, so a few percent of training samples still have the scene running to
+    the tensor edge. Everything else in the sample is untouched -- `q1` is always
+    the full panorama, and the aerial views are fixed size.
+    """
+    widths = [sample[1].shape[2] for sample in batch]
+    target = max(widths)
+
+    padded = []
+    for sample in batch:
+        q2 = sample[1]
+        if q2.shape[2] < target:
+            canvas = torch.zeros(q2.shape[0], q2.shape[1], target, dtype=q2.dtype)
+            start = (target - q2.shape[2]) // 2
+            canvas[:, :, start:start + q2.shape[2]] = q2
+            q2 = canvas
+        padded.append((sample[0], q2) + tuple(sample[2:]))
+
+    return default_collate(padded)

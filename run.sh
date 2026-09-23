@@ -22,6 +22,7 @@
 #   round4aB  unpadded per-batch loguniform: no-wedge vs wedge+RnC [full data, 80 ep]
 #   round4aB2fix  B2 with the ground-heading fix (wedge on the side q2 sees) [full data, 80 ep]
 #   round4aB3  B2fix minus the wedge hard positives; RnC carries the wedge [full data, 80 ep]
+#   round12   wedge + per-sample FoV with batch-max padding: new vs old schedule [full data, 80 ep]
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -938,6 +939,64 @@ Everything else identical to round4aB2fix: unpadded, per batch log uniform FoV,
 quarter turn r2 with the disc mask off, no q1 roll, tau 0.5, batch 16, 80 ep.'
     ;;
 
+round12)
+    echo "Round 12 - wedge + per-sample FoV mixing inside a batch [full data, 80 ep]"
+    echo "  everything matches round4aB2fix except the FoV sampling (and the schedule in arm a)"
+    echo "  references: round4aB2fix Avg 73.18   |   round4aB1 Avg 79.23   (both unpadded eval)"
+    launch round12a-wedge-batchmax-newsched \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batchmax \
+        SINGEO_FOV_RAMP_FRAC=0.5 \
+        SINGEO_FOV_CEILING_END=120.0 SINGEO_FOV_CEILING_RAMP_FRAC=0.7875 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='A. round4aB2fix plus per-sample FoV mixing, plus a narrowed sampling range.
+
+EVERYTHING ELSE MATCHES round4aB2fix: aerial wedge on with the ground heading fix,
+quarter turn r2, disc mask off, all pairs RnC at weight 0.25 and tau 0.5 with
+embedding tiered negatives, overlap gating on, no q1 roll, unpadded evaluation,
+batch 16, 80 epochs.
+
+WHAT CHANGES, AND WHY. B2fix drew ONE FoV per batch, so every in batch negative
+shared the query geometry and InfoNCE never had to tell a narrow view from a wide
+one. fov_sampling=loguniform_batchmax draws a fresh FoV per sample, keeps crops
+unpadded, and lets the collate pad each crop to the widest crop in ITS OWN batch.
+Nothing is padded to 768 unless a batch happens to hold a near panoramic crop. The
+margin a sample receives therefore depends on its batch, not on its own FoV, and
+the widest sample in each batch gets no margin at all.
+
+THE SCHEDULE, arm a only. The floor ramps 360 to 70 across half the run instead of
+a fifth, and the ceiling ramps 360 to 120 by epoch 63. From there the range is
+logU[70, 120]: 46.6 pct of crops sit at or below 90 deg against 15.3 pct under the
+old schedule, and the widest crop in a batch is about 248 px instead of about 700.
+q1 is still the full 360 deg panorama throughout, so loss1 and loss2 keep wide
+views in the objective.
+
+READING IT:
+  above round4aB1 79.23     the wedge finally pays, and FoV mixing is why
+  above round4aB2fix 73.18  FoV mixing helps, wedge still behind the no wedge run
+  near round4aB2fix         batch composition was not what padded runs were buying'
+
+    launch round12b-wedge-batchmax-oldsched \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batchmax \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=2 \
+        SINGEO_RUN_NOTE='B. CONTROL for round12a: same wedge, same RnC, same per-sample FoV mixing
+and batch max padding, but round4aB2fix sampling schedule -- floor ramping 360 to
+70 over the first fifth of the run and the ceiling pinned at 360.
+
+Single variable against round12a: the schedule.
+Single variable against round4aB2fix: per-sample instead of per-batch FoV draws.
+
+Expect this arm to run slower. With the ceiling at 360 the widest crop in a batch
+averages about 700 px, so the collate pads close to full panorama width, where arm
+a settles near 248 px late in the run.
+
+Unpadded evaluation, as in arm a.'
+    ;;
 list)
     screen -list || echo "no sessions"
     echo

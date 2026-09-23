@@ -89,6 +89,39 @@ def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_
     return fov_start * (fov_end / fov_start) ** progress
 
 
+def get_dynamic_fov_ceiling(epoch, max_epoch, fov_start=360.0, fov_end=180.0, ramp_frac=0.8):
+    """The *upper* end of the sampling range, mirroring `get_dynamic_fov_floor`.
+
+    The floor decides when narrow views become available; this decides when wide
+    ones stop being drawn. Ramping it down concentrates late training on the
+    geometries the model is scored at (70, 90, 180) instead of spending a third
+    of every batch near 360, where recall is already above 95.
+
+    The full panorama does not disappear from training when this drops: `q1` is
+    always the whole 360 degrees, so `loss1` and `loss2` keep training on it.
+    What narrows is only the *crop* distribution.
+
+    `fov_end=360` (the default elsewhere) leaves the ceiling pinned at 360, i.e.
+    the original behaviour.
+
+    Args:
+        epoch: 1-based epoch number.
+        max_epoch: total epochs in the run.
+        fov_start: ceiling before the ramp begins.
+        fov_end: ceiling once the ramp completes.
+        ramp_frac: fraction of the run over which the ceiling descends; 0.8 of
+            80 epochs reaches `fov_end` at epoch 64.
+
+    Returns:
+        The ceiling in degrees, in `[fov_end, fov_start]`.
+    """
+    if ramp_frac <= 0:
+        return fov_end
+
+    progress = min(1.0, max(0.0, epoch / (max_epoch * ramp_frac)))
+    return fov_start * (fov_end / fov_start) ** progress
+
+
 def draw_log_uniform_fov(floor, fov_max=360.0, rng=None):
     """A single FoV drawn log-uniformly from `[floor, fov_max]`.
 

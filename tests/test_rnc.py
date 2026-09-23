@@ -1571,3 +1571,62 @@ def test_infonce_term_weights_must_have_six_entries():
 
     with _pytest.raises(ValueError, match="6 entries"):
         _infonce_term_fixture((1.0, 0.5, 0.5))
+
+
+def test_fov_ceiling_ramps_and_defaults_to_no_change():
+    """The ceiling descends geometrically and reaches its end at ramp_frac."""
+    from singeo.transforms import get_dynamic_fov_ceiling
+
+    # Pinned at 360 unless an end below it is asked for.
+    assert get_dynamic_fov_ceiling(40, 80, fov_end=360.0) == pytest.approx(360.0)
+
+    # 360 -> 180 over 80% of 80 epochs: 180 at epoch 64, and flat after.
+    assert get_dynamic_fov_ceiling(64, 80, fov_end=180.0, ramp_frac=0.8) == pytest.approx(180.0)
+    assert get_dynamic_fov_ceiling(80, 80, fov_end=180.0, ramp_frac=0.8) == pytest.approx(180.0)
+
+    # Monotone, and strictly between the ends in the middle of the ramp.
+    values = [get_dynamic_fov_ceiling(e, 80, fov_end=180.0, ramp_frac=0.8) for e in range(1, 65)]
+    assert all(a >= b for a, b in zip(values, values[1:]))
+    assert 180.0 < values[31] < 360.0
+
+
+def test_log_uniform_draw_respects_a_lowered_ceiling():
+    from singeo.transforms import draw_log_uniform_fov
+
+    draws = [draw_log_uniform_fov(70.0, fov_max=180.0) for _ in range(500)]
+    assert max(draws) <= 180.0 + 1e-9 and min(draws) >= 70.0 - 1e-9
+    # A floor at or above the ceiling degenerates to the ceiling.
+    assert draw_log_uniform_fov(200.0, fov_max=180.0) == pytest.approx(180.0)
+
+
+def test_batch_max_collate_pads_only_the_ground_crop():
+    """Ground crops are padded to the batch's widest; nothing else moves."""
+    from singeo.dataset.cvusa import collate_pad_ground_to_batch_max
+
+    widths = [149, 192, 384]
+    batch = []
+    for i, width in enumerate(widths):
+        q1 = torch.full((3, 140, 768), float(i))
+        q2 = torch.full((3, 140, width), float(i) + 1.0)
+        r1 = torch.full((3, 384, 384), float(i))
+        r2 = torch.full((3, 384, 384), float(i))
+        meta = torch.tensor([float(i), 90.0, float(i), 180.0])
+        batch.append((q1, q2, r1, r2, torch.tensor(i), meta))
+
+    q1, q2, r1, r2, ids, meta = collate_pad_ground_to_batch_max(batch)
+
+    assert q2.shape == (3, 3, 140, max(widths))
+    assert q1.shape == (3, 3, 140, 768) and r1.shape == (3, 3, 384, 384)
+    assert ids.tolist() == [0, 1, 2]
+
+    for row, width in enumerate(widths):
+        content = (q2[row].abs().sum(0).sum(0) > 0).nonzero().flatten()
+        # The crop survives intact, centred, and the rest is the zero fill.
+        assert int(content.max() - content.min()) + 1 == width
+        start = (max(widths) - width) // 2
+        assert int(content.min()) == start
+        assert torch.equal(q2[row][:, :, start:start + width],
+                           torch.full((3, 140, width), float(row) + 1.0))
+
+    # The widest sample is untouched, i.e. it keeps a flush tensor edge.
+    assert (q2[2] != 0).all()

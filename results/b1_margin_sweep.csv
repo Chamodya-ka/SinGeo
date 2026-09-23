@@ -1,0 +1,13 @@
+test,fov,margin,fill,canvas,r1
+margin,360.0,0,mean,768,96.21
+margin,360.0,16,mean,800,96.34
+margin,360.0,64,mean,896,96.26
+margin,180.0,0,mean,384,90.51
+margin,180.0,16,mean,416,89.77
+margin,180.0,64,mean,512,89.14
+margin,90.0,0,mean,192,70.82
+margin,90.0,16,mean,224,66.01
+margin,90.0,64,mean,320,62.83
+margin,70.0,0,mean,149,59.56
+margin,70.0,16,mean,181,54.1
+margin,70.0,64,mean,277,49.0

@@ -13,10 +13,11 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from singeo.dataset.cvusa import CVUSADatasetEval, CVUSADatasetTrainSinGeo
+from singeo.dataset.cvusa import (CVUSADatasetEval, CVUSADatasetTrainSinGeo,
+                                  collate_pad_ground_to_batch_max)
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor
+from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor, get_dynamic_fov_ceiling
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
@@ -371,7 +372,20 @@ class Configuration:
     #                        discriminates sample i from sample j inside one
     #                        batch, and if they share a FoV it cannot be used to
     #                        tell them apart.
-    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "deterministic"
+    #   "loguniform_batchmax" - per-sample draws again, but the crops stay
+    #                        unpadded and the COLLATE pads each one to the widest
+    #                        crop in its batch. That restores the within-batch FoV
+    #                        mixture without padding everything to 768: a batch of
+    #                        narrow crops stays a narrow tensor. The widest sample
+    #                        in each batch gets no padding at all.
+    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "loguniform_batchmax" | "deterministic"
+
+    # Upper end of the per-sample FoV draw, and how long it takes to get there.
+    # 360 leaves it pinned at the panorama, which is the original behaviour.
+    # Lowering it concentrates late training on the geometries that are scored,
+    # while `q1` keeps the full panorama in the loss throughout.
+    fov_ceiling_end: float = 360.0
+    fov_ceiling_ramp_frac: float = 0.8
     fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
     fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
 
@@ -852,10 +866,16 @@ if __name__ == '__main__':
     train_dataset.roll_q1 = config.ground_roll_q1
     train_dataset.return_aerial_mask = config.aerial_mask_mode != "off"
 
+    # Per-sample FoV with unpadded crops means a batch holds several widths,
+    # which default_collate cannot stack; this collate pads each batch to its own
+    # widest crop. Every other mode keeps the default.
+    train_collate = (collate_pad_ground_to_batch_max
+                     if config.fov_sampling == "loguniform_batchmax" else None)
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
+                                  collate_fn=train_collate,
                                   pin_memory=True)
 
 
@@ -1106,9 +1126,16 @@ if __name__ == '__main__':
             "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
             "on the dataset path, which return_meta enables).")
 
-    if config.fov_sampling not in ("loguniform", "loguniform_batch", "deterministic"):
-        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch' or "
+    if config.fov_sampling not in ("loguniform", "loguniform_batch", "loguniform_batchmax",
+                                   "deterministic"):
+        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch', "
+                         "'loguniform_batchmax' or "
                          "'deterministic', got {!r}".format(config.fov_sampling))
+    if config.fov_sampling == "loguniform_batchmax" and config.fov_pad:
+        raise ValueError(
+            "fov_sampling='loguniform_batchmax' needs fov_pad=False: the crops must come out of "
+            "the dataset unpadded so the collate can pad each batch to its own widest crop. "
+            "With fov_pad=True every crop is already 768 wide and the mode does nothing.")
     if config.fov_sampling == "loguniform" and not config.fov_pad:
         raise ValueError(
             "fov_sampling='loguniform' needs fov_pad=True: per-sample draws give each sample a "
@@ -1259,9 +1286,15 @@ if __name__ == '__main__':
                                               fov_start=360.0,
                                               fov_end=config.fov_curriculum_end,
                                               ramp_frac=config.fov_ramp_frac)
-            fov_dynamic = math.sqrt(fov_floor * 360.0)
+            fov_ceiling = get_dynamic_fov_ceiling(epoch, config.epochs,
+                                                  fov_start=360.0,
+                                                  fov_end=config.fov_ceiling_end,
+                                                  ramp_frac=config.fov_ceiling_ramp_frac)
+            fov_floor = min(fov_floor, fov_ceiling)
+            fov_dynamic = math.sqrt(fov_floor * fov_ceiling)
         else:
             fov_floor = None
+            fov_ceiling = 360.0
             fov_dynamic = get_dynamic_fov(epoch, config.epochs,
                                           fov_start=360,
                                           fov_end=config.fov_curriculum_end)
@@ -1291,9 +1324,10 @@ if __name__ == '__main__':
             print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
                   f"{' (padded to full width)' if config.fov_pad else ''}")
         else:
-            print(f"For Epoch {epoch}: Ground FOV ~ logU[{fov_floor:.4f}, 360] "
+            print(f"For Epoch {epoch}: Ground FOV ~ logU[{fov_floor:.4f}, {fov_ceiling:.4f}] "
                   f"(geo-mean {fov_dynamic:.4f})"
-                  f"{', padded to full width' if config.fov_pad else ''}")
+                  f"{', padded to full width' if config.fov_pad else ''}"
+                  f"{', padded to batch max' if config.fov_sampling == 'loguniform_batchmax' else ''}")
 
         if config.use_rnc:
             # Hand the curriculum state to the dataset, which now performs the
@@ -1303,6 +1337,7 @@ if __name__ == '__main__':
             train_dataloader.dataset.ground_fov_floor = fov_floor
             # Per-batch mode needs the batch width and the epoch so the draw is
             # reproducible from the batch index in every worker.
+            train_dataloader.dataset.ground_fov_ceiling = fov_ceiling
             train_dataloader.dataset.fov_batch_size = (
                 config.batch_size if config.fov_sampling == "loguniform_batch" else None)
             train_dataloader.dataset.fov_epoch = epoch

@@ -1,0 +1,2 @@
+checkpoint,fov_pad,fov_360,fov_180,fov_90,fov_70,avg
+/home/71/25021871/data/data/singeo/checkpoint/convnext_base.fb_in22k_ft_in1k_384/round4a-tau05_20260830-235624/weights_e80_75.3827.pth,True,94.66456551103106,92.17694732102657,75.38271049076992,66.11886537595679,82.08577217469607
