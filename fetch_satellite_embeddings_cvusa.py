@@ -41,7 +41,7 @@ COLLECTION = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
 BANDS = ["A{:02d}".format(i) for i in range(64)]
 NATIVE_SCALE_M = 10
 
-DATA_ROOT = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+DATA_ROOT = "/home/71/25021871/data/chamodya/CVPR_subset"
 
 
 # ---------------------------------------------------------------------------

@@ -52,7 +52,11 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    gps_dict_path: str = "/home/71/25021871/Workspace/SinGeo-1/data/CVUSA/gps_dict.pkl"   # path to pre-computed distances
+    # Pre-computed GPS neighbours (calc_distance_cvusa.py). Kept inside the repo at
+    # data/CVUSA/CVPR_subset/, resolved against this file so the run does not depend
+    # on the working directory it was launched from.
+    gps_dict_path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "data", "CVUSA", "CVPR_subset", "gps_dict.pkl")
     
     
     # Eval
@@ -71,10 +75,14 @@ class Configuration:
     #   off      20.31 GiB    1.59 steps/s
     #   on        4.99 GiB    1.26 steps/s   (-21%)
     #
-    # Off: two concurrent runs need 2 x 20.3 = 40.6 GiB of the A40's 45 GiB
-    # usable, which fits, and the GPU is compute-bound rather than
-    # memory-bound at this batch size -- checkpointing was costing 21%
-    # throughput for headroom that went unused.
+    # Off. On the H100 (95 GiB) a run holds every activation in ~23 GiB, so two
+    # concurrent runs sit at ~45 GiB and there is nothing to save; on the old A40
+    # (45 GiB usable) two runs needed 2 x 20.3 GiB and still fit. Either way the
+    # GPU is compute-bound at this batch size, and checkpointing cost 21%
+    # throughput for headroom that went unused. Turn it on only to push the batch
+    # size well past 16, which no experiment here does.
+    #
+    # Note `aerial_mask_mode` != "off" refuses to run with it (see below).
     grad_checkpointing: bool = False
     
     # Loss
@@ -233,7 +241,7 @@ class Configuration:
 
     # Embeddings CSV for negative_tiering="embed". Restricted to the ids in the
     # training split at load time.
-    sat_embedding_csv: str = "/home/71/25021871/data/data/cvusa/CVPR_subset/satellite_embeddings_2024.csv"
+    sat_embedding_csv: str = "/home/71/25021871/data/chamodya/CVPR_subset/satellite_embeddings_2024.csv"
 
     # Where "geo" tiering gets its separations from:
     #   "coords" - haversine computed on demand from the raw (lat, lon) table
@@ -244,7 +252,7 @@ class Configuration:
     #              ties at 1.0 -- which, under similarity sampling, is ~99.7% of
     #              the pairs in a batch. Kept only for comparison.
     rnc_geo_source: str = "coords"    # "coords" | "ranks"
-    gps_coords_csv: str = "/home/71/25021871/data/data/cvusa/CVPR_subset/all.csv"
+    gps_coords_csv: str = "/home/71/25021871/data/chamodya/CVPR_subset/all.csv"
 
     # Separation at which negatives reach the maximum distance label; pairs
     # beyond it tie at 1.0. RNC reads only the *ordering* within a row, so the
@@ -396,7 +404,7 @@ class Configuration:
     lr_end: float = 0.0001             #  only for "polynomial"
     
     # Dataset
-    data_folder = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+    data_folder = "/home/71/25021871/data/chamodya/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
@@ -404,7 +412,7 @@ class Configuration:
     
     # Savepath for model checkpoints. On /data (2 TB, ~1.6 TB free), not the
     # 193 GB root filesystem -- `data/data` is a symlink to `/data`.
-    model_path: str = "/home/71/25021871/data/data/singeo/checkpoint"
+    model_path: str = "/home/71/25021871/data/chamodya/Singeo_data"
     
     # Eval before training
     zero_shot: bool = False
@@ -447,6 +455,22 @@ class Configuration:
     # only swaps the shortcut for a geometry mismatch. Note this makes test
     # recall incomparable with logs from before the switch -- the eval input
     # changes shape -- so re-baseline rather than reading it against them.
+    # A fixed blank border (columns each side) around the ground crop, as an
+    # alternative to fov_pad. Padding fills out to the full panorama width; this
+    # keeps the crop narrow and only lifts it off the tensor edge.
+    #
+    # Why it might matter: a crop flush against the tensor border loses ~12 R@1
+    # per touching edge (measured on round4a at FoV 90: 75.71 centred on a full
+    # width canvas, 63.61 and 63.80 with one edge touching, 48.75 with both).
+    # At the border the convolutions substitute their own zero padding, which is
+    # not the blank-fill pattern the scene's edge columns were trained beside.
+    # 4 px already recovers 10.5 of those 12 points; 64 px recovers all of it.
+    #
+    # Unlike fov_pad it does not force a fixed tensor width, so the per-batch FoV
+    # draw still collates, and it reveals nothing about the FoV that the crop's
+    # own width does not already reveal.
+    fov_border_px: int = 0
+
     fov_pad: bool=True
 
     # Where the padded block sits inside the full-width ground tensor.
@@ -673,6 +697,9 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    if cfg.fov_border_px:
+        lines.append("Ground crop border: {} px of blank on each side, train and eval".format(
+            cfg.fov_border_px))
     lines.append("Ground padding (fov_pad): {}".format(
         "ON  - crops keep the panorama's full width, dropped azimuths filled"
         if cfg.fov_pad else "OFF - crops return a narrower tensor (stock SinGeo)"))
@@ -846,6 +873,7 @@ if __name__ == '__main__':
     # drew), so the padding switch is handed over here rather than baked into
     # the transform pipeline.
     train_dataset.fov_pad = config.fov_pad
+    train_dataset.fov_border_px = config.fov_border_px
     train_dataset.aerial_rotation = config.aerial_rotation
     train_dataset.aerial_circular_mask = config.aerial_circular_mask
     train_dataset.pad_random_start = config.fov_pad_random_start
@@ -867,6 +895,7 @@ if __name__ == '__main__':
                                                                fov=fov,
                                                                fov_pad=config.fov_pad,
                                                                fov_pad_random_start=config.fov_pad_random_start,
+                                                               fov_border_px=config.fov_border_px,
                                                                )
 
 
@@ -894,6 +923,7 @@ if __name__ == '__main__':
                                                            fov=extra_fov,
                                                            fov_pad=config.fov_pad,
                                                            fov_pad_random_start=config.fov_pad_random_start,
+                                                           fov_border_px=config.fov_border_px,
                                                            )
         query_dataset_test_extra = CVUSADatasetEval(data_folder=config.data_folder ,
                                           split="test",
@@ -1072,6 +1102,13 @@ if __name__ == '__main__':
         print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
     else:
         print("InfoNCE overlap gating: off")
+    if config.fov_border_px < 0:
+        raise ValueError("fov_border_px must be >= 0, got {}".format(config.fov_border_px))
+    if config.fov_border_px and config.fov_pad:
+        raise ValueError(
+            "fov_border_px={} with fov_pad=True: they are alternatives. Padding already fills the "
+            "crop out to the panorama width, so a border adds nothing.".format(config.fov_border_px))
+
     if config.aerial_rotation not in ("continuous", "discrete", "quarter"):
         raise ValueError("aerial_rotation must be 'continuous', 'discrete' or 'quarter', "
                          "got {!r}".format(config.aerial_rotation))
@@ -1284,6 +1321,7 @@ if __name__ == '__main__':
                                                         fov=fov_dynamic,
                                                         fov_pad=config.fov_pad,
                                                         fov_pad_random_start=config.fov_pad_random_start,
+                                                        fov_border_px=config.fov_border_px,
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
@@ -1306,6 +1344,7 @@ if __name__ == '__main__':
             train_dataloader.dataset.fov_batch_size = (
                 config.batch_size if config.fov_sampling == "loguniform_batch" else None)
             train_dataloader.dataset.fov_epoch = epoch
+            train_dataloader.dataset.fov_border_px = config.fov_border_px
 
             if config.enable_aerial_crop:
                 # `aerial_ramp_frac < 1` compresses both aerial schedules into

@@ -28,7 +28,7 @@ import torch
 
 from singeo.distances import SatelliteEmbeddings
 
-DATA_ROOT = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+DATA_ROOT = "/home/71/25021871/data/chamodya/CVPR_subset"
 
 
 def train_ids(data_root):

@@ -23,7 +23,7 @@ from singeo.masked_encoder import downsample_mask  # noqa: E402
 from singeo.model import TimmModel_SinGeo  # noqa: E402
 from singeo.wedge import RandomWedge, binarise, wedge_mask  # noqa: E402
 
-DATA_ROOT = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+DATA_ROOT = "/home/71/25021871/data/chamodya/CVPR_subset"
 SIZE = 384
 
 

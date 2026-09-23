@@ -9,35 +9,214 @@ All numbers are **R@1 under unknown orientation**. `Avg` is the mean of the four
 FoV columns, SinGeo's headline metric. ConvNeXt-B @384, batch 16, AdamW 1e-4
 cosine, 80 epochs, full CVUSA (35,532 / 8,884) unless stated.
 
-Runs live in `/home/71/25021871/data/data/singeo/checkpoint/<model>/<name>_<stamp>/`
-(`log.txt`, `info.txt`, a `train.py` snapshot, checkpoints). Launch with
-`./run.sh <round>`. Read results from `log.txt`, never `run_logs/*.console`.
+Runs live in `<model_path>/<model>/<name>_<stamp>/` (`log.txt`, `info.txt`, a
+`train.py` snapshot, checkpoints) -- see the Environments table for `model_path`
+on each server. Launch with `./run.sh <round>`. Read results from `log.txt`,
+never `run_logs/*.console`.
 
 **Differences under ~3 Avg points are noise** (measured from round1a vs round1b,
 where the only change was near-inert for the first 40 epochs).
 
 ---
 
+## Environments — two servers, two stacks
+
+Runs before 2026-09-22 were trained on server A, later ones on server B. Results
+are comparable across them only as far as the stacks allow; nothing has been
+re-run to measure a stack effect yet.
+
+| | server A (to 2026-09-21) | server B (from 2026-09-22) |
+|---|---|---|
+| GPU | A40-48Q, 45 GiB usable | H100 NVL, 95 GiB |
+| runs in parallel | 2 (~1.18 s/it each) | 3–4 (~1.8 it/s each; 3.83 it/s alone) |
+| python | 3.8 | 3.12 |
+| torch / timm | 2.1.1+cu121 / 0.9.0 | 2.14.0+cu130 / 1.0.29 |
+| albumentations | 1.x | **1.3.1 — pinned.** 2.x crashes `LimitedFoV` and silently ignores CoarseDropout / ImageCompression arguments |
+| data | `/home/71/25021871/data/data/cvusa/CVPR_subset` | `/home/71/25021871/data/chamodya/CVPR_subset` |
+| checkpoints | `/home/71/25021871/data/data/singeo/checkpoint` | `/home/71/25021871/data/chamodya/Singeo_data` |
+| gps dict | `Workspace/SinGeo-1/data/CVUSA/gps_dict.pkl` | `<repo>/data/CVUSA/CVPR_subset/gps_dict.pkl` (35,532 ids × 128) |
+
+`satellite_embeddings_2024.csv` (64-d GEE vectors, 45,516 rows) lives beside the
+data and is required by any run with `negative_tiering=embed`.
+
+**Server A logs are not on server B.** Rows marked "A" below are transcribed;
+their `log.txt` files stay on the old machine.
+
+---
+
+## Two evaluation protocols — never mix them in one column
+
+`fov_pad=True` hands the encoder a full-width panorama whose discarded azimuths
+are mean-colour fill; `fov_pad=False` hands it a narrower tensor. Same network,
+different inputs, so the recalls are not comparable.
+
+Measured on round4a's `weights_e80`, one checkpoint scored both ways:
+
+| round4a weights_e80 | FoV 360 | FoV 180 | FoV 90 | FoV 70 | Avg |
+|---|---|---|---|---|---|
+| padded (as trained) | 94.92 | 92.13 | 75.38 | 65.61 | **82.01** |
+| unpadded | 94.92 | 84.65 | **48.75** | 30.79 | **64.78** |
+
+−17.23 Avg for the protocol alone. FoV 360 is identical because padding cannot
+fire on a full panorama. **A padded-protocol number may only be compared with
+another padded-protocol number.**
+
+---
+
+## Reproducible record: configuration and result per run
+
+Everything below is `./run.sh <round>`; the listed overrides are what the round
+passes, on top of the `train.py` snapshot defaults in each run directory. Shared
+by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
+0.1, `prob_rotate` 0.75, `prob_flip` 0.5, `crop_dropout_strength` 0.5, gate on.
+
+| run | srv | protocol | overrides (`SINGEO_*`) | 360 | 180 | 90 | 70 | **Avg** | status |
+|---|---|---|---|---|---|---|---|---|---|
+| **round4a** | A | padded | `RNC_TAU=0.5` (else defaults: pad, per-sample loguniform, wedge, RnC 0.25 embed) | 94.92 | 92.13 | 75.38 | 65.61 | **82.01** | final |
+| round5a | A | padded | `RNC_WEIGHT=0` | 91.75 | 92.41 | 74.22 | 64.15 | 80.63 | final |
+| **round8a** | A | unpadded | `ENABLE_AERIAL_CROP=false RNC_WEIGHT=0 FOV_PAD=false FOV_SAMPLING=deterministic RNC_TAU=0.5` | 96.58 | 90.72 | 69.26 | 54.20 | **77.69** | final |
+| round8b | A | unpadded | as 8a + wedge + `GROUND_ROLL_Q1=true` | 91.28 | 79.32 | 53.42 | 40.17 | 66.05 | final |
+| round11a | A | unpadded | 8b + `AERIAL_ROTATION=discrete AERIAL_CIRCULAR_MASK=false` | 91.21 | 79.91 | 53.38 | 40.92 | 66.35 | e76, stopped e79 |
+| round11b | A | unpadded | 8b without the wedge (`ENABLE_AERIAL_CROP=false`) | 93.01 | 81.57 | 49.65 | 32.64 | 64.22 | e60, stopped |
+| **round4aB1** | A | unpadded | `FOV_PAD=false FOV_SAMPLING=loguniform_batch ENABLE_AERIAL_CROP=false RNC_WEIGHT=0 AERIAL_ROTATION=quarter AERIAL_CIRCULAR_MASK=false RNC_TAU=0.5` | 96.32 | 90.81 | 70.88 | 58.91 | **79.23** | final |
+| **round4aB2fix** | A | unpadded | B1 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 89.55 | 86.79 | 64.49 | 51.90 | **73.18** | final |
+| round4aB3 | A | unpadded | B2fix + `INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.0, 0.25, 0.0, 0.0)'` | — | — | — | — | 63.53 @e48 | stopped (server move) |
+| **roundP1** | B | padded | `FOV_PAD=true FOV_SAMPLING=loguniform ENABLE_AERIAL_CROP=false RNC_WEIGHT=0 AERIAL_ROTATION=quarter AERIAL_CIRCULAR_MASK=false RNC_TAU=0.5` | 95.01 | 91.09 | 72.25 | 61.99 | **80.08** | final |
+| **roundP2** | B | padded | P1 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 95.34 | 91.96 | 74.39 | 64.58 | **81.57** | final |
+| roundP3 | B | unpadded + 64 px border | B1 + `FOV_BORDER_PX=64` | 96.54 | 91.56 | 71.81 | 60.83 | 80.19 | e68, running |
+| roundP4 | B | unpadded + 64 px border | P3 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | — | — | — | — | — | running |
+| SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
+
+---
+
+## Padding × wedge: the wedge only helps when the ground crop is padded
+
+The 2×2 the project never had. Each row compares two runs that share a protocol,
+so each wedge effect is a fair within-row comparison.
+
+| ground treatment | no wedge | wedge + RnC | **wedge effect** |
+|---|---|---|---|
+| unpadded, crop flush to the tensor edge | B1 **79.23** | B2fix **73.18** | **−6.05** |
+| **padded** | P1 **80.08** | P2 **81.57** | **+1.48** |
+| unpadded + 64 px border | P3 (80.19 @e68) | P4 running | pending |
+
+A swing of **7.5 Avg** between the rows. The padded gain is consistent rather
+than a single noisy eval — +1.26, +1.13, +1.29, +1.48 over the last four — and
+P2 leads P1 at every FoV, most at the narrow end (90: +2.14, 70: +2.59).
+
+**Ruled out as the mechanism: a blank-matching shortcut between the padded ground
+crop and the blanked wedge.** Wedge width is a per-epoch curriculum value, so it
+is identical for all 16 samples in a batch and cannot identify which wedge goes
+with which crop; pad placement is independent of wedge heading; and the gallery
+carries no blanks at test time. What remains is shared representation: one
+encoder sees both branches, and padding gives it consistent practice with
+blank-bounded views.
+
+**round4a's score was not mainly the wedge.** P1 is round4a's recipe without the
+wedge and reaches 80.08 on its own; the wedge adds ~1.5.
+
+---
+
+## The 180° heading bug — every wedge run before 2026-09-19 was mispointed
+
+`apply_limited_fov` reports the ground arc in the panorama's own frame (column 0
+= 0°), while `apply_aerial_sector` places the wedge in compass bearings (0 = tile
+top). CVUSA panoramas face **north at the centre column**, so column 0 faces
+**south**: the two frames were 180° apart.
+
+Evidence, three independent tests on the val split:
+
+| test | best offset | at the code's 0° |
+|---|---|---|
+| colour profiles, panorama vs tile, 600 pairs | **180°** (+0.295); 237 pairs vs 122 | +0.140 |
+| same, chroma only (rules out sun direction) | **180°** (+0.162); 203 vs 117 | +0.080 |
+| round8a embeddings: which wedge matches a 90° crop, 800 crops | **180°** (z +0.96); 341 within ±15° vs 26 | −0.41 |
+
+Handedness was already correct (a mirrored fit is 4–5× weaker), so the fix is one
+constant: `CVUSA_PANO_COL0_BEARING = 180` in `singeo/dataset/cvusa.py`, applied
+before the wedge is placed and `meta` written. After it, the dataset's own wedge
+beats the opposite-side wedge for 176/200 crops (174/200 with the paired flip).
+
+**What it affected:** wedge placement, the `loss6` overlap gate, and the RnC
+q2↔r2 distances — i.e. everything that reads the crop's heading. **Not** affected:
+q1/r1 (full 360° arcs), `loss1`–`loss5`, and evaluation, which uses no arcs. So
+all recorded recalls are valid measurements; what was wrong is the wedge's
+training signal in every run before round4aB2fix.
+
+---
+
+## The tensor-edge artefact — why unpadded evaluation collapses
+
+Measured on round4a (padded training) by pasting **the identical 90° crop** into
+canvases of different widths. Only the surroundings change.
+
+| canvas | implied FoV | R@1 |
+|---|---|---|
+| 768 (as trained) | 90° | 75.41 |
+| 512 | 135° | 75.39 |
+| 256 | 270° | 74.08 |
+| random width per image | anything | 73.35 |
+| 192 = no padding | 360° | **48.75** |
+
+The **amount** of fill is nearly irrelevant — a canvas claiming 270° for a 90°
+crop costs 1.33 points, and randomising it costs 2.06. The collapse comes only
+when the crop touches the tensor edge. Sliding the same crop across a fixed
+full-width canvas isolates it:
+
+| crop position | R@1 |
+|---|---|
+| touching the left edge | 63.61 |
+| 4 px in | 74.10 |
+| 16 px | 74.86 |
+| 64 px | 75.42 |
+| centred | **75.71** |
+| 4 px from the right | 74.23 |
+| touching the right edge | 63.80 |
+
+**About 12 points per touching edge, and the two add up** (both touching = 48.75).
+**A 4 px gap — one ConvNeXt input patch — recovers 10.5 of the 12.** The scene's
+edge columns need a blank neighbour, because that is what they always had in
+training; flush, the convolutions substitute their own zero padding, which is a
+different pattern.
+
+The model does **not** extrapolate into the blank: across 10 images, feature
+columns are image-specific only within ~32 px of the crop, half-gone at 64 px and
+identical for every image beyond 128 px (cosine 0.99–1.00) — exactly the reach of
+the last stage's 7×7 convolution at 32 px per position.
+
+`fov_border_px=N` (new) keeps the crop narrow and adds N blank columns each side,
+in training and evaluation alike. It preserves per-batch collation and reveals
+nothing the crop width did not already reveal. roundP3/P4 test it at N=64.
+
+---
+
 ## Where things stand
+
+Best per protocol, since the two cannot be mixed:
 
 | | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** |
 |---|---|---|---|---|---|
-| **round4a** — best overall (padded, log-uniform, RnC τ0.5) | 94.92 | 92.13 | 75.38 | 65.61 | **82.01** |
+| **roundP2** — best padded (pad, per-sample FoV, wedge + RnC) | 95.34 | 91.96 | 74.39 | 64.58 | **81.57** |
+| round4a — previous best padded | 94.92 | 92.13 | 75.38 | 65.61 | 82.01 |
+| **round4aB1** — best unpadded (per-batch FoV, no wedge) | 96.32 | 90.81 | 70.88 | 58.91 | **79.23** |
 | **SinGeo published** | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 |
-| **round8a** — upstream-equivalent baseline (unpadded, no wedge) | 96.58 | 90.72 | 69.26 | 54.20 | 77.69 |
-| round8b — unpadded **with** wedge | 91.28 | 79.32 | 53.42 | 40.17 | 66.05 |
+| round8a — upstream-equivalent, deterministic FoV | 96.58 | 90.72 | 69.26 | 54.20 | 77.69 |
+| roundP3 — unpadded + 64 px border, no wedge | 96.54 | 91.56 | 71.81 | 60.83 | 80.19 @e68 |
 
-`round4a` beats the published paper on Avg, FoV 90, 180 and 70. `round8a` is a
-verified upstream reproduction (config diffed against commit `298b156`; only
-paths, `num_workers` and the checkpoint-selection FoV differ) and lands within
-~1 point at three of four FoVs.
+**round4aB1 reproduces SinGeo unpadded**: +0.06 Avg, ahead at FoV 90 (+0.78) and
+70 (+0.91), behind at 360 (−0.48) and 180 (−0.99). The only change from round8a
+is per-batch log-uniform FoV sampling, worth +1.54 Avg and +4.71 at FoV 70, with
+no padding and no epoch-16 collapse. It is the baseline any wedge claim must beat.
 
-**The wedge problem, as it first appeared:** in the unpadded family, 8a → 8b
-costs **−11.64 Avg**, and that gap was read as "aerial wedging is destructive".
+**The wedge, as measured in each protocol:**
+- **unpadded, crop flush:** −6.05 Avg (B1 → B2fix). Destructive.
+- **padded:** +1.48 Avg (P1 → P2). Supportive, and largest at narrow FoV.
+- **unpadded + 64 px border:** P3 vs P4, running.
 
-**Corrected:** 8b also carries the q1 roll, and **the roll, not the wedge,
-accounts for 91% of the gap** (next section). Isolated, the wedge costs 0.45
-Avg — noise.
+**Corrections recorded since this file was written.** The old headline "the wedge
+costs 0.45 Avg, noise" came from runs where the wedge pointed 180° away from the
+ground crop, and from a pair that both carried the q1 roll. With the heading
+fixed and the roll off, the wedge costs 6.05 unpadded and gains 1.48 padded.
 
 ---
 
@@ -372,27 +551,26 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 ## Next experiments, in priority order
 
-1. **Let round11b reach epoch 80.** It is now the run that confirms the
-   roll attribution: if its final Avg lands near 8b's 66.05 rather than 8a's
-   77.69, the roll explains the whole −11.64. 11a is lower priority — against
-   11b it measures the wedge under a capped FoV 180.
-2. **Keep `ground_roll_q1=False` from here on.** It is the default, and
-   round4aB (item 4) already runs with it off.
-3. **Soft targets on `loss6`** — replace the importance weight with a target
-   similarity equal to the overlap fraction. The cheapest change that expresses
-   "only part of the tile matches", and it reuses the arc overlap already
-   computed.
-4. **round4aB — unpadded + per-batch log-uniform FoV. Built, not launched.**
-   Removes the largest known handicap of the unpadded family without touching
-   padding. B1 (no wedge) vs B2 (wedge + all-pairs RnC) is the **first wedge
-   comparison without the roll's FoV 180 ceiling**, so it is the cleanest test
-   yet of whether the wedge helps.
-5. **Positives-only RnC with ≥3 aerial views**, as the graded ordering prior
-   alongside (3). Needs `rnc_weight` retuned — positives-only is ~15× smaller
-   than the all-pairs term 0.25 was tuned for. Costs ~1.6× memory.
+1. **Finish roundP3 and roundP4** (running). P4 − P3 gives the wedge effect with
+   the crop lifted off the tensor edge, completing the third row of the 2×2. If
+   P3 holds near 80 it already beats round4aB1 (79.23) on the same protocol,
+   which would mean a 64 px border recovers most of what padding provides.
+2. **Re-score roundP1 and roundP2 unpadded**, and with a fixed 4 px margin, so
+   the padded row can be compared with the unpadded ones. Needs the padding-eval
+   script rebuilt on server B (it was never committed on server A).
+3. **The fill-value test.** Does a margin have to be the dataset-mean blank, or
+   will any constant do? Distinguishes "the edge needs a familiar neighbour" from
+   "the edge needs any neighbour", and decides whether the border must match
+   training statistics.
+4. **Wedge as a third aerial view.** Keep r2 as SinGeo's rotated full tile with
+   all six terms, and add the wedge as r3 entering only through RnC. round4aB3
+   showed that dropping `loss3`/`loss5`/`loss6` removes SinGeo's rotation
+   supervision along with the wedge's hard positives (−4.7 vs B2fix at e48), so
+   the wedge should be *added*, never substituted. Costs ~1.3× aerial compute.
+5. **Anchor the stack change.** Re-run round4aB1 on server B. If it lands within
+   noise of 79.23, cross-server comparisons in the table above stand as they are.
 6. **`prob_rotate=0`** — keep q1 fixed entirely, the strongest form of the
-   alignment thesis. One env var. Pair it with `fov=0.0` in the eval set to see
-   the north-aligned protocol too.
+   alignment thesis. One env var.
 
 ## Open from earlier
 

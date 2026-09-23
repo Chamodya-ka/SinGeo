@@ -4,6 +4,7 @@ Run with `pytest tests/test_rnc.py`, or directly with `python tests/test_rnc.py`
 """
 
 import math
+import numpy as np
 import os
 import random
 import sys
@@ -735,7 +736,7 @@ def test_aerial_sector_rotation_moves_the_wedge():
 # The simultaneous-rotation block must not roll a cropped ground view
 # ---------------------------------------------------------------------------
 
-CVUSA_FOLDER = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+CVUSA_FOLDER = "/home/71/25021871/data/chamodya/CVPR_subset"
 
 
 def _cvusa_sample(prob_rotate, seed=1234, ground_fov=90.0):
@@ -1571,3 +1572,59 @@ def test_infonce_term_weights_must_have_six_entries():
 
     with _pytest.raises(ValueError, match="6 entries"):
         _infonce_term_fixture((1.0, 0.5, 0.5))
+
+
+def test_fixed_border_wraps_the_crop_without_touching_the_arc():
+    """`border_px` lifts the crop off the tensor edge and nothing else."""
+    pano = torch.arange(768, dtype=torch.float32).view(1, 1, 768).expand(3, 35, 768).clone()
+
+    for fov in (70.0, 90.0, 180.0):
+        for border in (4, 64):
+            angle = random.randint(0, 359)
+            plain, c0, e0 = apply_limited_fov(pano, fov, angle)
+            edged, c1, e1 = apply_limited_fov(pano, fov, angle, border_px=border)
+
+            content = plain.shape[2]
+            assert edged.shape[2] == content + 2 * border, (fov, border, edged.shape)
+
+            # The crop itself is untouched, and sits exactly `border` columns in.
+            assert torch.equal(edged[:, :, border:border + content], plain)
+            assert (edged[:, :, :border] == 0).all() and (edged[:, :, -border:] == 0).all()
+
+            # The recorded azimuth arc is a property of the crop, not the canvas.
+            assert (c1, e1) == (c0, e0)
+
+
+def test_border_zero_is_the_unpadded_path_exactly():
+    pano = torch.rand(3, 35, 768)
+    for fov in (70.0, 90.0, 360.0):
+        angle = random.randint(0, 359)
+        assert torch.equal(apply_limited_fov(pano, fov, angle, border_px=0)[0],
+                           apply_limited_fov(pano, fov, angle)[0])
+
+
+def test_border_and_pad_are_mutually_exclusive():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="alternatives"):
+        apply_limited_fov(torch.rand(3, 35, 768), 90.0, 0, pad=True, border_px=64)
+
+
+def test_eval_transform_applies_the_same_border():
+    """get_transforms_val must reproduce the training tensor width."""
+    from singeo.transforms import get_transforms_val
+
+    _, ground = get_transforms_val((384, 384), (140, 768), fov=90.0, fov_pad=False,
+                                   fov_border_px=64)
+    out = ground(image=np.zeros((140, 768, 3), dtype=np.uint8))["image"]
+    assert out.shape[2] == int(90 / 360 * 768) + 128, out.shape
+
+
+def test_border_keeps_a_batch_collatable_under_per_batch_fov():
+    """Every crop in a batch shares one FoV, so the border keeps widths equal."""
+    from torch.utils.data._utils.collate import default_collate
+
+    pano = torch.rand(3, 35, 768)
+    batch = [apply_limited_fov(pano, 137.0, random.randint(0, 359), border_px=64)[0]
+             for _ in range(8)]
+    assert default_collate(batch).shape[0] == 8

@@ -400,7 +400,7 @@ class Zoomin(ImageOnlyTransform):
         
         return resized_tensor   
 
-def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True):
+def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px=0):
     """Ground FoV crop that also reports the azimuth arc it kept.
 
     Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
@@ -452,6 +452,10 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True):
         panorama's own azimuth frame. `pad` does not move the arc: it changes
         which columns hold the kept azimuths, not which azimuths are kept.
     """
+    if pad and border_px > 0:
+        raise ValueError("border_px and pad are alternatives: pad fills out to the panorama's "
+                         "full width, border_px adds a fixed margin to the narrow crop")
+
     if fov <= 0:
         return x, 0.0, 360.0
 
@@ -489,6 +493,27 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True):
         filled[:, :, start:start + fov_index] = cropped
 
         cropped = filled
+
+    elif border_px > 0:
+        # A fixed blank border on both sides instead of padding out to the full
+        # panorama width. The point is the tensor edge, not the amount of fill.
+        #
+        # Measured on round4a (padded training, FoV 90): a crop flush against the
+        # tensor border loses ~12 R@1 per touching edge (75.71 centred -> 63.61
+        # touching left, 63.80 touching right, 48.75 with both touching). A 4 px
+        # gap -- one ConvNeXt input patch -- recovers 10.5 of those 12 points,
+        # and 64 px recovers essentially all of it. The scene's edge columns need
+        # a blank neighbour, because that is what they always had in training;
+        # without one the convolutions substitute their own zero padding, which
+        # is a different pattern.
+        #
+        # Unlike `pad`, this keeps the width proportional to the FoV, so the
+        # per-batch FoV draw still collates: every crop in a batch is the same
+        # width, plus the same constant border.
+        bordered = torch.zeros(x.shape[0], x.shape[1], fov_index + 2 * border_px,
+                               dtype=x.dtype, device=x.device)
+        bordered[:, :, border_px:border_px + fov_index] = cropped
+        cropped = bordered
 
     # Column c of the rolled image holds original column (c - rotate_index) mod
     # W, so keeping columns [0, fov_index) keeps original azimuths starting at
@@ -621,15 +646,22 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
 
 
 class LimitedFoV(ImageOnlyTransform):
-    def __init__(self, fov=360.):
+    """Crop to `fov`, optionally keeping a fixed blank border around the crop.
+
+    `border_px` must match the training setting, exactly like `fov_pad`: it
+    changes the tensor the encoder sees, so training and evaluation have to agree.
+    """
+
+    def __init__(self, fov=360., border_px=0):
         super(LimitedFoV, self).__init__(fov)
         self.fov = fov
+        self.border_px = border_px
 
     def apply(self, x, **params):
         #print(x.shape)
         if self.fov > 0:
             angle = random.randint(0, 359)
-            cropped, _, _ = apply_limited_fov(x, self.fov, angle)
+            cropped, _, _ = apply_limited_fov(x, self.fov, angle, border_px=self.border_px)
             return cropped
         else:
             return x
@@ -775,7 +807,8 @@ def get_transforms_val(image_size_sat,
                        rotate=False,
                        mask_ratio=0.0,
                        fov_pad=False,
-                       fov_pad_random_start=True):
+                       fov_pad_random_start=True,
+                       fov_border_px=0):
 
 
 
@@ -795,7 +828,7 @@ def get_transforms_val(image_size_sat,
                                    # the two is used here has to be used there,
                                    # `pad_random_start` included.
                                    LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start)
-                                   if fov_pad else LimitedFoV(fov=fov),
+                                   if fov_pad else LimitedFoV(fov=fov, border_px=fov_border_px),
                                   ])
             
                

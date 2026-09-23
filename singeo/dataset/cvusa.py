@@ -419,6 +419,11 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # narrower tensor. Has to match `fov_pad` on the eval transforms.
         self.fov_pad = False
 
+        # Fixed blank border, in columns, kept on each side of the ground crop
+        # instead of padding out to the panorama width. 0 is off. Must match the
+        # eval transforms; see `apply_limited_fov`.
+        self.fov_border_px = 0
+
         # How the aerial wedge's tile is rotated. "continuous" draws uniformly in
         # +-sat_rot_max and interpolates (SinGeo's T1-style variant). "discrete"
         # rotates by 0 or +-90 only, an exact pixel permutation, with the
@@ -517,7 +522,8 @@ class CVUSADatasetTrainSinGeo(Dataset):
             angle = random.randint(0, 359)
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                pad=self.fov_pad,
-                                                               pad_random_start=self.pad_random_start)
+                                                               pad_random_start=self.pad_random_start,
+                                                               border_px=self.fov_border_px)
             # Panorama frame -> compass bearing, the frame the wedge is placed in
             # and every arc comparison assumes. See CVUSA_PANO_COL0_BEARING.
             g_center = (g_center + CVUSA_PANO_COL0_BEARING) % 360.0

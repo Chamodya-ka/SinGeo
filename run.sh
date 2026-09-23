@@ -22,6 +22,9 @@
 #   round4aB  unpadded per-batch loguniform: no-wedge vs wedge+RnC [full data, 80 ep]
 #   round4aB2fix  B2 with the ground-heading fix (wedge on the side q2 sees) [full data, 80 ep]
 #   round4aB3  B2fix minus the wedge hard positives; RnC carries the wedge [full data, 80 ep]
+#   roundP    padded + per-sample FoV: no wedge (P1) vs wedge+RnC (P2), the padded half of the 2x2
+#   roundP3   unpadded + a fixed 64 px border on the ground crop, vs round4aB1 [full data, 80 ep]
+#   roundP4   P3 + wedge + RnC: the wedge question with the crop off the tensor edge
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -29,9 +32,9 @@
 
 set -euo pipefail
 
-REPO="/home/71/25021871/temp/SinGeo"
-PY="/home/71/25021871/Workspace/SinGeo-1/singeo/bin/python"
-OUT="/home/71/25021871/data/data/singeo/checkpoint"
+REPO="/home/71/25021871/SinGeo"
+PY="/home/71/25021871/data/chamodya/venv/bin/python"
+OUT="/home/71/25021871/data/chamodya/Singeo_data"
 LOGS="$REPO/run_logs"
 
 cd "$REPO"
@@ -61,7 +64,7 @@ launch() {
 # The 10k subset needs its own neighbour dictionary. Uncommenting `nrows=10000`
 # in singeo/dataset/cvusa.py is a separate manual step -- see the plan.
 SUBSET=(
-    SINGEO_GPS_DICT_PATH=/home/71/25021871/Workspace/SinGeo-1/data/CVUSA/gps_dict_10k.pkl
+    SINGEO_GPS_DICT_PATH=$REPO/data/CVUSA/gps_dict_10k.pkl
     SINGEO_EPOCHS=40
 )
 
@@ -936,6 +939,132 @@ READING IT:
 
 Everything else identical to round4aB2fix: unpadded, per batch log uniform FoV,
 quarter turn r2 with the disc mask off, no q1 roll, tau 0.5, batch 16, 80 ep.'
+    ;;
+
+roundP)
+    echo "Round P - padding x wedge, the padded half of the 2x2 [full data, 80 ep]"
+    echo "  unpadded half: round4aB1 (no wedge, Avg 79.23) and round4aB2fix (wedge, 73.18)"
+    echo "  training logs report the PADDED protocol; re-score unpadded for the factorial"
+    launch roundP1-pad-nowedge \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_ENABLE_AERIAL_CROP=false SINGEO_RNC_WEIGHT=0.0 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_RNC_TAU=0.5 SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P1. Padded, per-sample log-uniform FoV, NO wedge, InfoNCE only.
+Single variable vs round4aB1 (unpadded, per-batch log-uniform, no wedge; final
+Avg 79.23): padding, together with the per-sample FoV draw that padding allows.
+
+WHY. Completes the padding x wedge 2x2. Every padded run before this one had the
+wedge on, so the wedge has never been measured under padding. With P2 (this run
+plus the wedge) it gives the wedge effect under padding, to set against the
+unpadded wedge effect: round4aB2fix minus round4aB1 = -9.31 Avg at e40, -6.05 final.
+
+EVALUATION. The log below reports the PADDED protocol. For the factorial the
+checkpoints must be re-scored unpadded, and with a fixed 4 px margin (the edge
+artefact: a padded-trained model loses about 12 points per crop edge that touches
+the tensor border, and a 4 px gap recovers most of it).
+
+Otherwise matched to round4aB1: no wedge, rnc_weight 0, quarter-turn r2, disc
+mask off, no q1 roll, tau 0.5, batch 16, 80 epochs. NOTE: new server (H100,
+torch 2.14, timm 1.0.29, albumentations 1.3.1); B1 ran on the old A40 stack.'
+
+    launch roundP2-pad-wedge-rnc \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P2. Padded, per-sample log-uniform FoV, WITH the aligned wedge and all
+pairs RnC. Single variable vs P1: the wedge plus RnC. Single variable vs
+round4aB2fix (unpadded, final Avg 73.18): padding with the per-sample FoV draw.
+
+WHY. The second half of the padding x wedge 2x2. Hypothesis under test: padding
+and the wedge go hand in hand, because with padded ground crops the shared
+encoder sees blank boundaries on both branches. A blank-matching shortcut is
+ruled out by construction (wedge width is shared by the whole batch, and pad
+placement is independent of wedge heading), so any interaction has to come from
+shared representation, not cheating.
+
+READING IT: if P2 minus P1 is near zero or positive while B2fix minus B1 is about
+-9, the interaction is real. If both are about -9, the wedge is destructive
+regardless of padding, and round4a owed its score to padding and sampling.
+
+Wedge heading fixed (CVUSA_PANO_COL0_BEARING); RnC at 0.25 with GEE embedding
+tiering, exactly as round4aB2fix. The log reports the PADDED protocol; re-score
+unpadded afterwards. Everything else identical to P1.'
+    ;;
+
+roundP3)
+    echo "Round P3 - unpadded + a fixed 64 px border on the ground crop [full data, 80 ep]"
+    echo "  single variable vs round4aB1 (Avg 79.23): the border, in training AND eval"
+    launch roundP3-border64 \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_ENABLE_AERIAL_CROP=false SINGEO_RNC_WEIGHT=0.0 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_RNC_TAU=0.5 SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P3. round4aB1 plus a fixed 64 px blank border on every ground crop, in
+training AND at evaluation. Single variable vs round4aB1 (final Avg 79.23).
+
+HYPOTHESIS. The unpadded protocol handicaps the model at the tensor edge, not
+through any missing FoV cue. At the border the convolutions substitute their own
+zero padding, which is not the blank-fill pattern the scene edge columns are
+trained beside. Measured on round4a at FoV 90: a crop centred on a full width
+canvas scores 75.71, one edge touching 63.61 and 63.80, both edges touching
+48.75. That is about 12 points per touching edge, and a 4 px gap, one ConvNeXt
+input patch, recovers 10.5 of the 12. The AMOUNT of fill does not matter: a
+256 px canvas, which implies 270 deg for a 90 deg crop, scores 74.08, and random
+canvas widths score 73.35.
+
+WHAT IT CHANGES. The crop stays narrow, so tensor width still tracks FoV exactly
+as the stock protocol does; nothing is hidden or revealed that the crop width did
+not already reveal. Only the two scene edges gain a blank neighbour. Per batch
+FoV keeps every crop in a batch the same width, so batching is unaffected.
+
+READING IT, against round4aB1 79.23, noise about 3 points:
+  clearly above   the edge was a real handicap and unpadded training was paying
+      for it; the fix is one constant and needs no FoV knowledge
+  about equal     the edge costs nothing once training and evaluation agree, and
+      the artefact only bites a padded-trained model scored unpadded
+  below           the border itself costs, most likely by diluting the
+      descriptor with blank positions
+
+Everything else identical to round4aB1: unpadded, per batch log uniform FoV, no
+wedge, rnc_weight 0, quarter turn r2, disc mask off, no q1 roll, tau 0.5,
+batch 16, 80 epochs. New server, running alongside P1 and P2.'
+    ;;
+
+roundP4)
+    echo "Round P4 - wedge + RnC on top of the 64 px border [full data, 80 ep]"
+    echo "  single variable vs roundP3 (border, no wedge); vs round4aB2fix it is the border"
+    launch roundP4-border64-wedge-rnc \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P4. The aligned wedge and all pairs RnC on top of roundP3 (unpadded, per
+batch log uniform FoV, 64 px blank border on every ground crop, train and eval).
+
+TWO SINGLE VARIABLE READINGS.
+  vs roundP3         the wedge plus RnC, with the crop lifted off the tensor edge
+  vs round4aB2fix    the 64 px border, with the wedge held fixed
+
+WHY. The wedge effect is known only where the ground crop sits flush against the
+tensor border: round4aB2fix minus round4aB1 is -9.31 Avg at e40 and -6.05 final.
+If the edge artefact is what makes unpadded training expensive, the wedge may
+behave differently once both scene edges have a blank neighbour. That also gives
+a third column for the wedge question, beside padded (P2 minus P1) and plain
+unpadded (B2fix minus B1).
+
+Note the border applies to the GROUND crop only. The wedge already carries its
+own blank region inside the tile, and the aerial branch is untouched.
+
+Wedge heading fixed (CVUSA_PANO_COL0_BEARING); RnC all pairs at 0.25 with GEE
+embedding tiering, exactly as round4aB2fix and P2. Everything else identical to
+roundP3: unpadded, per batch log uniform FoV, quarter turn r2, disc mask off, no
+q1 roll, tau 0.5, batch 16, 80 epochs.'
     ;;
 
 list)

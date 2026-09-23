@@ -24,7 +24,7 @@ from singeo.visualize import RnCSampleVisualizer
 class Configuration:
     # Mirror the values in train_singeo_cvusa.py so the visualization matches
     # what training would actually show the model.
-    data_folder: str = "/home/71/25021871/data/data/cvusa/CVPR_subset"
+    data_folder: str = "/home/71/25021871/data/chamodya/CVPR_subset"
     output_dir: str = "./rnc_viz"
 
     img_size: int = 384
