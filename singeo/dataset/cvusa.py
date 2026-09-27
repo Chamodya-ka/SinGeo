@@ -10,7 +10,9 @@ import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
-                               draw_discrete_aerial_rotation, draw_quarter_rotation)
+                               draw_discrete_aerial_rotation, draw_quarter_rotation,
+                               scatter_blank_columns)
+from torch.utils.data._utils.collate import default_collate
 
 # Compass bearing that column 0 of a CVUSA panorama faces.
 #
@@ -32,6 +34,39 @@ from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_
 # from what q2 sees, the loss6 overlap gate favoured the mismatched pairs, and the
 # RnC q2 <-> r2 distances were wrong. Evaluation uses no arcs and was unaffected.
 CVUSA_PANO_COL0_BEARING = 180.0
+
+class BatchMaxPadCollate:
+    """Pad every ground crop in a batch to the batch's widest, scattering the blank.
+
+    Per-sample FoV draws give each sample its own crop width, which
+    `default_collate` cannot stack. Padding out to the panorama's full width (the
+    `fov_pad` route) fixes that but makes every tensor 768 wide whatever the FoV.
+    This pads only as far as the widest crop in the batch, so the tensor tracks
+    the batch rather than the protocol, and the widest sample gets no blank at all.
+
+    The blank goes in as 1..`gap_segments` runs at random positions, ends
+    included, so blank can fall inside the scene. The scene's columns keep their
+    order, and the recorded arcs are untouched: they describe the crop, not the
+    canvas.
+
+    Only the ground crop (view 2) is touched; q1, r1, r2, ids and meta pass
+    through `default_collate` unchanged.
+    """
+
+    def __init__(self, gap_segments=4):
+        self.gap_segments = gap_segments
+
+    def __call__(self, batch):
+        widths = [sample[1].shape[2] for sample in batch]
+        target = max(widths)
+
+        if min(widths) != target:
+            batch = [(sample[0],
+                      scatter_blank_columns(sample[1], target, self.gap_segments),
+                      *sample[2:]) for sample in batch]
+
+        return default_collate(batch)
+
 
 class CVUSADatasetTrain(Dataset):
     

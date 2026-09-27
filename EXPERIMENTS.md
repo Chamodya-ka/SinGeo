@@ -83,37 +83,70 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | round4aB3 | A | unpadded | B2fix + `INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.0, 0.25, 0.0, 0.0)'` | — | — | — | — | 63.53 @e48 | stopped (server move) |
 | **roundP1** | B | padded | `FOV_PAD=true FOV_SAMPLING=loguniform ENABLE_AERIAL_CROP=false RNC_WEIGHT=0 AERIAL_ROTATION=quarter AERIAL_CIRCULAR_MASK=false RNC_TAU=0.5` | 95.01 | 91.09 | 72.25 | 61.99 | **80.08** | final |
 | **roundP2** | B | padded | P1 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 95.34 | 91.96 | 74.39 | 64.58 | **81.57** | final |
-| roundP3 | B | unpadded + 64 px border | B1 + `FOV_BORDER_PX=64` | 96.54 | 91.56 | 71.81 | 60.83 | 80.19 | e68, running |
-| roundP4 | B | unpadded + 64 px border | P3 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | — | — | — | — | — | running |
+| **roundP3** | B | unpadded + 64 px border | B1 + `FOV_BORDER_PX=64` | 96.63 | 91.82 | 72.23 | 61.77 | **80.61** | final |
+| **roundP4** | B | unpadded + 64 px border | P3 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** | final — best overall |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 
 ---
 
-## Padding × wedge: the wedge only helps when the ground crop is padded
+## Padding × wedge: the wedge helps once the crop is off the tensor edge
 
-The 2×2 the project never had. Each row compares two runs that share a protocol,
-so each wedge effect is a fair within-row comparison.
+Each row compares two runs that share a protocol, so every wedge effect below is
+a fair within-row comparison.
 
 | ground treatment | no wedge | wedge + RnC | **wedge effect** |
 |---|---|---|---|
 | unpadded, crop flush to the tensor edge | B1 **79.23** | B2fix **73.18** | **−6.05** |
-| **padded** | P1 **80.08** | P2 **81.57** | **+1.48** |
-| unpadded + 64 px border | P3 (80.19 @e68) | P4 running | pending |
+| padded (75% blank at FoV 90) | P1 **80.08** | P2 **81.57** | **+1.48** |
+| **unpadded + 64 px border** (40% blank at FoV 90) | P3 **80.61** | **P4 82.09** | **+1.48** |
 
-A swing of **7.5 Avg** between the rows. The padded gain is consistent rather
-than a single noisy eval — +1.26, +1.13, +1.29, +1.48 over the last four — and
-P2 leads P1 at every FoV, most at the narrow end (90: +2.14, 70: +2.59).
+**The wedge is not destructive. The flush tensor edge is.** Give the crop a
+neighbour on each side — 64 px of blank is enough — and the wedge turns from
+−6.05 to +1.48, exactly the gain it shows under full padding.
 
-**Ruled out as the mechanism: a blank-matching shortcut between the padded ground
-crop and the blanked wedge.** Wedge width is a per-epoch curriculum value, so it
-is identical for all 16 samples in a batch and cannot identify which wedge goes
-with which crop; pad placement is independent of wedge heading; and the gallery
-carries no blanks at test time. What remains is shared representation: one
-encoder sees both branches, and padding gives it consistent practice with
-blank-bounded views.
+Per FoV, the wedge's gain sits where it should, at the narrow end:
 
-**round4a's score was not mainly the wedge.** P1 is round4a's recipe without the
-wedge and reaches 80.08 on its own; the wedge adds ~1.5.
+| wedge effect | FoV 360 | FoV 180 | FoV 90 | FoV 70 |
+|---|---|---|---|---|
+| padded (P2 − P1) | +0.33 | +0.87 | +2.14 | +2.59 |
+| 64 px border (P4 − P3) | −0.54 | +0.42 | **+2.84** | **+3.20** |
+
+**It pays off late.** P4 − P3 is negative until epoch ~40 (−3.26 at e16, −0.24 at
+e40) and climbs steadily after: +0.74 at e44, +0.91 at e56, +1.21 at e68, +1.48
+at e80. The wedge costs while the sector is wide and the model immature, and
+earns it back as the sector narrows. Mid-run wedge comparisons mislead.
+
+### Why "no padding" underperformed "fixed pad"
+
+It was never the padding. Holding the wedge fixed, the whole gap is the edge:
+
+| no-wedge runs | Avg | | wedge runs | Avg |
+|---|---|---|---|---|
+| B1, flush | 79.23 | | B2fix, flush | 73.18 |
+| P1, padded | 80.08 | | P2, padded | 81.57 |
+| P3, 64 px border | **80.61** | | P4, 64 px border | **82.09** |
+
+A 64 px border matches padding without the wedge (+0.53) and beats it with the
+wedge (+0.52), while keeping the tensor proportional to the FoV. Padding's real
+contribution was giving the crop's edge columns a blank neighbour; the extra fill
+out to 768 columns added nothing, which is exactly what the canvas-width probe
+showed (75.41 at 768 vs 74.08 at 256).
+
+### Against the paper
+
+| | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** |
+|---|---|---|---|---|---|
+| **roundP4** (border + wedge + RnC) | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** |
+| SinGeo published | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 |
+| difference | −0.71 | +0.44 | **+4.97** | **+6.97** | **+2.92** |
+
+**Caveat on the claim.** P4's protocol adds a constant 64 px blank border to every
+ground query, in training and evaluation alike. It is FoV-independent and reveals
+nothing the crop width does not already reveal, but it is not the paper's exact
+input. The honest statement is: *SinGeo surpassed by +2.92 Avg, with aerial sector
+supervision contributing +1.48 of it, under a protocol with a fixed border.*
+Scoring P4 without the border would reintroduce the mismatch it was trained
+against, so the border belongs in the protocol description, not hidden.
 
 ---
 
@@ -192,31 +225,37 @@ nothing the crop width did not already reveal. roundP3/P4 test it at N=64.
 
 ## Where things stand
 
-Best per protocol, since the two cannot be mixed:
+| | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** | protocol |
+|---|---|---|---|---|---|---|
+| **roundP4** — best overall (64 px border, wedge + RnC) | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** | border |
+| roundP3 — same without the wedge | 96.63 | 91.82 | 72.23 | 61.77 | 80.61 | border |
+| round4a — best padded, previous best overall | 94.92 | 92.13 | 75.38 | 65.61 | 82.01 | padded |
+| roundP2 — padded, wedge + RnC | 95.34 | 91.96 | 74.39 | 64.58 | 81.57 | padded |
+| roundP1 — padded, no wedge | 95.01 | 91.09 | 72.25 | 61.99 | 80.08 | padded |
+| **round4aB1** — SinGeo reproduced, no wedge | 96.32 | 90.81 | 70.88 | 58.91 | 79.23 | unpadded |
+| **SinGeo published** | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | unpadded |
+| round8a — upstream-equivalent, deterministic FoV | 96.58 | 90.72 | 69.26 | 54.20 | 77.69 | unpadded |
+| round4aB2fix — unpadded **with** wedge | 89.55 | 86.79 | 64.49 | 51.90 | 73.18 | unpadded |
 
-| | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** |
-|---|---|---|---|---|---|
-| **roundP2** — best padded (pad, per-sample FoV, wedge + RnC) | 95.34 | 91.96 | 74.39 | 64.58 | **81.57** |
-| round4a — previous best padded | 94.92 | 92.13 | 75.38 | 65.61 | 82.01 |
-| **round4aB1** — best unpadded (per-batch FoV, no wedge) | 96.32 | 90.81 | 70.88 | 58.91 | **79.23** |
-| **SinGeo published** | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 |
-| round8a — upstream-equivalent, deterministic FoV | 96.58 | 90.72 | 69.26 | 54.20 | 77.69 |
-| roundP3 — unpadded + 64 px border, no wedge | 96.54 | 91.56 | 71.81 | 60.83 | 80.19 @e68 |
+**Three results carry the project:**
 
-**round4aB1 reproduces SinGeo unpadded**: +0.06 Avg, ahead at FoV 90 (+0.78) and
-70 (+0.91), behind at 360 (−0.48) and 180 (−0.99). The only change from round8a
-is per-batch log-uniform FoV sampling, worth +1.54 Avg and +4.71 at FoV 70, with
-no padding and no epoch-16 collapse. It is the baseline any wedge claim must beat.
+1. **round4aB1 reproduces SinGeo unpadded** (+0.06 Avg; +0.78 at FoV 90, +0.91 at
+   70, −0.48 at 360, −0.99 at 180). The only change from round8a is per-batch
+   log-uniform FoV sampling, worth +1.54 Avg with no padding and no epoch-16
+   collapse. It is the baseline any wedge claim must beat.
+2. **The wedge is supportive once the crop is not flush against the tensor edge**:
+   −6.05 flush, **+1.48** padded, **+1.48** with a 64 px border, and the gain is
+   concentrated at FoV 90 and 70. The "aerial cropping is destructive" finding was
+   an artefact of the edge condition, compounded earlier by a 180° heading bug and
+   by the q1 roll.
+3. **roundP4 surpasses the paper by +2.92 Avg** (+4.97 at FoV 90, +6.97 at 70),
+   with aerial sector supervision contributing +1.48 of it — under a protocol that
+   adds a constant, FoV-independent 64 px border. See "Against the paper" above.
 
-**The wedge, as measured in each protocol:**
-- **unpadded, crop flush:** −6.05 Avg (B1 → B2fix). Destructive.
-- **padded:** +1.48 Avg (P1 → P2). Supportive, and largest at narrow FoV.
-- **unpadded + 64 px border:** P3 vs P4, running.
-
-**Corrections recorded since this file was written.** The old headline "the wedge
-costs 0.45 Avg, noise" came from runs where the wedge pointed 180° away from the
-ground crop, and from a pair that both carried the q1 roll. With the heading
-fixed and the roll off, the wedge costs 6.05 unpadded and gains 1.48 padded.
+**Corrections recorded since this file was first written.** The old headline "the
+wedge costs 0.45 Avg, noise" came from a pair that both carried the q1 roll, and
+from runs where the wedge pointed 180° away from the ground crop. Both are fixed;
+the numbers above supersede it.
 
 ---
 
@@ -551,26 +590,27 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 ## Next experiments, in priority order
 
-1. **Finish roundP3 and roundP4** (running). P4 − P3 gives the wedge effect with
-   the crop lifted off the tensor edge, completing the third row of the 2×2. If
-   P3 holds near 80 it already beats round4aB1 (79.23) on the same protocol,
-   which would mean a 64 px border recovers most of what padding provides.
-2. **Re-score roundP1 and roundP2 unpadded**, and with a fixed 4 px margin, so
-   the padded row can be compared with the unpadded ones. Needs the padding-eval
-   script rebuilt on server B (it was never committed on server A).
-3. **The fill-value test.** Does a margin have to be the dataset-mean blank, or
-   will any constant do? Distinguishes "the edge needs a familiar neighbour" from
-   "the edge needs any neighbour", and decides whether the border must match
-   training statistics.
-4. **Wedge as a third aerial view.** Keep r2 as SinGeo's rotated full tile with
-   all six terms, and add the wedge as r3 entering only through RnC. round4aB3
-   showed that dropping `loss3`/`loss5`/`loss6` removes SinGeo's rotation
-   supervision along with the wedge's hard positives (−4.7 vs B2fix at e48), so
-   the wedge should be *added*, never substituted. Costs ~1.3× aerial compute.
+1. **Sweep the border width.** 64 px was chosen from the slide probe, where 4 px
+   already recovered 10.5 of 12 points. If 4–16 px does as well as 64, the
+   protocol change shrinks to almost nothing, which makes the result far easier
+   to defend. One training run per width, or start with eval-only probes on P4.
+2. **Re-score roundP1 and roundP2 unpadded and with the 4 px margin**, so the
+   padded row can be compared with the unpadded and border rows on one protocol.
+   Needs the padding-eval script rebuilt on server B.
+3. **The fill-value test.** Must the border be the dataset-mean blank, or will any
+   constant do? Decides whether the border is "a familiar neighbour" or merely
+   "any neighbour", and whether it must match training statistics.
+4. **Wedge as a third aerial view.** Keep r2 as SinGeo's rotated full tile with all
+   six terms and add the wedge as r3 through RnC only. round4aB3 showed that
+   dropping `loss3`/`loss5`/`loss6` removes SinGeo's rotation supervision along
+   with the wedge's hard positives (−4.7 vs B2fix at e48), so the wedge should be
+   *added*, never substituted. Costs ~1.3× aerial compute.
 5. **Anchor the stack change.** Re-run round4aB1 on server B. If it lands within
-   noise of 79.23, cross-server comparisons in the table above stand as they are.
-6. **`prob_rotate=0`** — keep q1 fixed entirely, the strongest form of the
-   alignment thesis. One env var.
+   noise of 79.23, the cross-server rows in the record table stand as they are.
+   This matters now that P4 is compared against server-A numbers.
+6. **Tune the wedge curriculum under the border.** P4 − P3 is negative until epoch
+   ~40 and positive after. A slower sector ramp (`aerial_ramp_frac`) may convert
+   the early loss into extra late gain.
 
 ## Open from earlier
 

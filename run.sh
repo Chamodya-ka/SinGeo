@@ -25,6 +25,8 @@
 #   roundP    padded + per-sample FoV: no wedge (P1) vs wedge+RnC (P2), the padded half of the 2x2
 #   roundP3   unpadded + a fixed 64 px border on the ground crop, vs round4aB1 [full data, 80 ep]
 #   roundP4   P3 + wedge + RnC: the wedge question with the crop off the tensor edge
+#   roundP5   batch-max padding, blank scattered inside the crop, wedge on [full data, 80 ep]
+#   roundP6/7/8  circular conv padding (Mind the Pad) x {no input pad, input pad, batch-max}
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -1065,6 +1067,138 @@ Wedge heading fixed (CVUSA_PANO_COL0_BEARING); RnC all pairs at 0.25 with GEE
 embedding tiering, exactly as round4aB2fix and P2. Everything else identical to
 roundP3: unpadded, per batch log uniform FoV, quarter turn r2, disc mask off, no
 q1 roll, tau 0.5, batch 16, 80 epochs.'
+    ;;
+
+roundP5)
+    echo "Round P5 - batch-max padding with blank scattered inside the crop [full data, 80 ep]"
+    echo "  wedge arm only. reference points: P4 82.09 (64px border + wedge), P2 81.57 (padded + wedge)"
+    launch roundP5-batchmax-scatter-wedge \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_FOV_PAD_BATCH_MAX=true SINGEO_FOV_GAP_SEGMENTS=4 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P5. Per sample FoV again, but each ground crop is padded only to the
+WIDEST crop in its batch, and the blank goes in as 1 to 4 random runs whose
+positions include the inside of the scene, not just the two ends:
+
+    [--im-ag-e--]
+    [---image---]
+    [--im-age---]
+    [longercropi]     the widest crop in the batch gets no blank at all
+
+WHY. Two things change against fov_pad. The tensor width follows the batch
+instead of the protocol, so a batch of narrow crops stays narrow and only the
+widest sample is blank free. And because blank can land inside the scene, the
+rule blank appears only at the two ends is not learnable, so the edge condition
+the model must handle is variable by construction. If the tensor edge is what
+made unpadded training expensive, making the edge and the blank placement random
+should teach the model to handle any of them.
+
+The scene columns keep their order and spacing within each run of scene; only
+where the blank sits changes. The recorded arcs are untouched, since they
+describe the crop and not the canvas.
+
+READING IT, against P4 82.09 and P2 81.57, both with the same wedge and RnC:
+  above P4     scattering beats a fixed border, and the model gains from having
+      to treat blank as content free wherever it appears
+  near P4      the border already captured the effect; scattering adds nothing
+  below P4     gaps inside the scene cost more than the edge robustness is worth,
+      most likely by breaking the local continuity convolutions rely on
+
+PROTOCOL. Evaluation applies the same rule with the canvas set to the panorama
+width, which is the top of the range the training batches cover. That is a THIRD
+protocol, distinct from padded and from the 64 px border, so cross run numbers
+need re-scoring before they can be put in one column.
+
+Wedge and RnC exactly as P4 and round4aB2fix: aligned heading, all pairs RnC 0.25
+with GEE embedding tiering, quarter turn r2, disc mask off, no q1 roll, tau 0.5,
+batch 16, 80 epochs.'
+    ;;
+
+roundP6)
+    echo "Round P6 - circular conv padding + NO input padding (per-batch log-uniform FoV) [80 ep]"
+    echo "  zero-padding twin: round4aB2fix 73.18 Avg"
+    launch roundP6-circular-noinputpad \
+        SINGEO_CONV_PADDING_MODE=circular \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P6. Circular padding in all 36 padding convolutions of ConvNeXt-B, with
+NO input padding at all: the crop reaches the tensor edge, and the convolutions
+wrap instead of inserting zeros.
+
+WHY. Mind the Pad (ICLR 2021) argues zero padding injects a constant the network
+never meets inside an image, and the artefact propagates inward. Measured here
+from the input side: a crop flush against the tensor edge costs about 12 R@1 per
+touching edge, and 4 px of blank margin recovers most of it. If the mechanism is
+the zeros, changing the padding rule should remove the need for a margin.
+
+CAVEAT. Circular wraps BOTH axes. Horizontally that is right for a full panorama,
+whose ends are genuinely adjacent, but a narrow crop joins two unrelated edges,
+and vertically it wraps sky onto road. It swaps one wrong assumption for another.
+
+COMPARISON. Per batch log uniform FoV, which unpadded batches collate under, so
+round4aB2fix is an exact zero padding twin: same wedge, same RnC, same sampling,
+unpadded, 73.18 Avg. P6 minus round4aB2fix isolates the convolution padding rule
+with no input margin anywhere -- the cleanest test of the Mind the Pad argument
+in this series. Caveat: round4aB2fix ran on the old A40 stack (torch 2.1, timm
+0.9), so an anchor rerun of a known config on this server would firm it up.
+
+Also read against P7 (same convolutions, padded input) and P8 (same
+convolutions, batch max input). Wedge and RnC exactly as P2.'
+    ;;
+roundP7)
+    echo "Round P7 - circular conv padding + input padding, one change from P2 [80 ep]"
+    echo "  P2 reference: 81.57 Avg (padded, per-sample FoV, wedge + RnC)"
+    launch roundP7-circular-inputpad \
+        SINGEO_CONV_PADDING_MODE=circular \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P7. Exactly roundP2 with one change: every padding convolution wraps
+(circular) instead of padding with zeros. Input padding stays on, per sample
+log uniform FoV, wedge and all pairs RnC unchanged.
+
+READING IT, against P2 81.57:
+  above P2   zero padding was costing even when the crop never touches the tensor
+      edge, because the padded region is itself bounded by zeros at the tensor
+      border, and the artefact reaches inward
+  near P2    with a wide blank margin the convolutions never see the tensor
+      border near the scene, so the padding rule stops mattering. That would say
+      the input margin already solved what Mind the Pad describes.
+
+CAVEAT. Circular wraps both axes, so it joins the left and right ends of a padded
+tensor, which for a full width panorama is correct, and wraps sky onto road
+vertically, which is not.'
+    ;;
+roundP8)
+    echo "Round P8 - circular conv padding + batch-max padding [80 ep]"
+    echo "  P5 reference: same input scheme with zero padding convs"
+    launch roundP8-circular-batchmax \
+        SINGEO_CONV_PADDING_MODE=circular \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_FOV_PAD_BATCH_MAX=true SINGEO_FOV_GAP_SEGMENTS=4 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P8. Batch max padding (each ground crop padded to the widest crop in its
+batch, blank scattered in 1 to 4 runs) PLUS circular padding in every padding
+convolution. Exactly roundP5 with the convolution padding rule changed, so P8
+minus P5 isolates circular against zeros under a variable input canvas.
+
+Two readings:
+  vs P5    the convolution padding rule, input scheme held fixed
+  vs P7    input scheme, circular padding held fixed: batch max against padding
+      out to the full panorama width
+
+Wedge and RnC exactly as P2, P5 and P7.'
     ;;
 
 list)

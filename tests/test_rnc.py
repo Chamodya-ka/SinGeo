@@ -1628,3 +1628,128 @@ def test_border_keeps_a_batch_collatable_under_per_batch_fov():
     batch = [apply_limited_fov(pano, 137.0, random.randint(0, 359), border_px=64)[0]
              for _ in range(8)]
     assert default_collate(batch).shape[0] == 8
+
+
+def test_scatter_blank_columns_keeps_the_scene_in_order():
+    """Blank goes in as runs; the crop's columns survive in order."""
+    from singeo.transforms import scatter_blank_columns
+
+    crop = torch.arange(1, 101, dtype=torch.float32).view(1, 1, 100).expand(3, 5, 100).clone()
+
+    for width in (100, 104, 160, 400):
+        for segments in (1, 4):
+            out = scatter_blank_columns(crop, width, segments, rng=random.Random(width + segments))
+            assert out.shape[2] == width
+
+            kept = out[0, 0][out[0, 0] != 0]
+            assert torch.equal(kept, crop[0, 0]), (width, segments)
+            assert int((out[0, 0] == 0).sum()) == width - 100
+
+            # Blank arrives in at most `segments` runs.
+            blank = (out[0, 0] == 0).tolist()
+            runs = sum(1 for i, b in enumerate(blank) if b and (i == 0 or not blank[i - 1]))
+            assert runs <= segments, (width, segments, runs)
+
+
+def test_scatter_can_place_blank_inside_the_scene():
+    """Not a border: over many draws, gaps land away from both ends."""
+    from singeo.transforms import scatter_blank_columns
+
+    crop = torch.ones(3, 5, 100)
+    inside = 0
+    for seed in range(60):
+        out = scatter_blank_columns(crop, 140, 4, rng=random.Random(seed))
+        blank = (out[0, 0] == 0)
+        if blank[10:130].any() and not blank[:10].all():
+            inside += 1
+    assert inside > 20, inside
+
+
+def test_scatter_is_a_no_op_at_equal_width():
+    from singeo.transforms import scatter_blank_columns
+
+    crop = torch.rand(3, 5, 200)
+    assert torch.equal(scatter_blank_columns(crop, 200, 4), crop)
+
+
+def test_batch_max_collate_pads_to_the_widest_crop():
+    """Every q2 reaches the batch max; the widest sample keeps no blank."""
+    from singeo.dataset.cvusa import BatchMaxPadCollate
+
+    widths = [120, 300, 512, 200]
+    batch = [(torch.rand(3, 5, 768), torch.ones(3, 5, w), torch.rand(3, 4, 4),
+              torch.rand(3, 4, 4), torch.tensor(i), torch.zeros(4)) for i, w in enumerate(widths)]
+
+    q1, q2, r1, r2, ids, meta = BatchMaxPadCollate(4)(batch)
+
+    assert q2.shape == (4, 3, 5, max(widths))
+    for i, w in enumerate(widths):
+        assert int((q2[i, 0, 0] != 0).sum()) == w, (i, w)
+    assert int((q2[widths.index(max(widths)), 0, 0] == 0).sum()) == 0
+    assert q1.shape[0] == 4 and ids.tolist() == [0, 1, 2, 3]
+
+
+def test_eval_scatter_transform_reaches_full_width():
+    from singeo.transforms import get_transforms_val
+
+    _, ground = get_transforms_val((384, 384), (140, 768), fov=90.0, fov_pad=False,
+                                   fov_scatter_pad=True, fov_gap_segments=4)
+    out = ground(image=np.zeros((140, 768, 3), dtype=np.uint8))["image"]
+    assert out.shape[2] == 768, out.shape
+
+
+def test_set_conv_padding_mode_covers_every_padding_conv():
+    import torch.nn as nn
+    from singeo.model import set_conv_padding_mode
+
+    import timm
+    model = timm.create_model('convnext_base.fb_in22k_ft_in1k_384', pretrained=False, num_classes=0)
+
+    padding_convs = [m for m in model.modules()
+                     if isinstance(m, nn.Conv2d) and any(p > 0 for p in m.padding)]
+    assert len(padding_convs) == 36, len(padding_convs)
+
+    assert set_conv_padding_mode(model, "circular") == 36
+    assert all(m.padding_mode == "circular" for m in padding_convs)
+    # The convs that do not pad are left alone: a mode would be meaningless there.
+    assert all(m.padding_mode == "zeros" for m in model.modules()
+               if isinstance(m, nn.Conv2d) and not any(p > 0 for p in m.padding))
+
+
+def test_circular_padding_changes_only_the_borders():
+    """Same weights: the interior is untouched, the border rows/columns are not."""
+    import torch.nn as nn
+    from singeo.model import set_conv_padding_mode
+
+    torch.manual_seed(0)
+    net = nn.Conv2d(4, 4, 7, padding=3, groups=4)
+    x = torch.randn(1, 4, 24, 40)
+
+    zeros = net(x)
+    assert set_conv_padding_mode(net, "circular") == 1
+    circular = net(x)
+
+    assert circular.shape == zeros.shape
+    assert torch.allclose(circular[:, :, 3:-3, 3:-3], zeros[:, :, 3:-3, 3:-3], atol=1e-6)
+    assert not torch.allclose(circular[:, :, :, :3], zeros[:, :, :, :3])
+
+
+def test_padding_mode_zeros_is_the_stock_path():
+    from singeo.model import set_conv_padding_mode
+    import torch.nn as nn
+
+    torch.manual_seed(0)
+    net = nn.Conv2d(4, 4, 7, padding=3, groups=4)
+    x = torch.randn(1, 4, 16, 32)
+    before = net(x)
+    set_conv_padding_mode(net, "zeros")
+    assert torch.equal(net(x), before)
+
+
+def test_unknown_padding_mode_raises():
+    import pytest as _pytest
+    import torch.nn as nn
+    from singeo.model import set_conv_padding_mode
+
+    with _pytest.raises(ValueError, match="padding mode"):
+        set_conv_padding_mode(nn.Conv2d(1, 1, 3, padding=1), "wrap")

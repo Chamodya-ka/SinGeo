@@ -153,6 +153,45 @@ class TimmModel_aug(nn.Module):
              
             return image_features
 
+PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
+
+
+def set_conv_padding_mode(model, mode):
+    """Switch every padding convolution in `model` to `mode`.
+
+    Motivation: "Mind the Pad -- CNNs Can Develop Blind Spots" (Alsallakh et al.,
+    ICLR 2021). Zero padding injects a constant the network never sees inside the
+    image, which creates border artefacts that propagate inward layer by layer.
+    Measured here on round4a, a ground crop flush against the tensor edge loses
+    ~12 R@1 per touching edge, and a 4 px blank margin recovers most of it -- the
+    same symptom from the input side.
+
+    In ConvNeXt-B only the 36 depthwise 7x7 convolutions pad (by 3); the stem
+    (4x4/4) and the three downsample convs (2x2/2) do not, so this covers every
+    padded convolution in the backbone. `padding_mode` is read at forward time and
+    `_reversed_padding_repeated_twice` is fixed at construction, so flipping the
+    attribute afterwards is enough and leaves the weights untouched.
+
+    CAVEAT worth stating in any writeup: `"circular"` wraps BOTH axes. Horizontally
+    that is exactly right for a full panorama, whose two ends really are adjacent,
+    but for a narrow crop it joins two unrelated edges, and vertically it wraps sky
+    onto road for the ground view and top onto bottom for the aerial tile. It
+    replaces one wrong assumption with another; which one costs less is empirical.
+
+    Returns:
+        The number of convolutions changed.
+    """
+    if mode not in PADDING_MODES:
+        raise ValueError("conv padding mode must be one of {}, got {!r}".format(PADDING_MODES, mode))
+
+    changed = 0
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d) and any(p > 0 for p in module.padding):
+            module.padding_mode = mode
+            changed += 1
+    return changed
+
+
 class TimmModel_SinGeo(nn.Module):
 
     def __init__(self, 

@@ -645,6 +645,80 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
     return x * keep
 
 
+def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
+    """Widen `crop` to `width` by inserting blank columns in 1..N random runs.
+
+    The crop's own columns keep their order and spacing inside each run of scene;
+    what changes is where the blank sits. Unlike a border, a run may land *inside*
+    the scene, so the model cannot learn "blank only ever appears at the two ends".
+
+        [--im-ag-e--]   budget split into 3 runs plus the ends
+        [---image---]   one run at each end
+        [longercropi]   width == crop width: nothing inserted
+
+    Args:
+        crop: `[C, H, w]` tensor.
+        width: target width, `>= w`.
+        gap_segments: maximum number of blank runs; the count is drawn uniformly
+            from `1..min(gap_segments, budget)`.
+        rng: optional `random.Random` for reproducible placement.
+
+    Returns:
+        `[C, H, width]` with the crop's columns in order and the rest zero, which
+        after `A.Normalize` is the dataset mean colour, exactly like `fov_pad`.
+    """
+    source = rng if rng is not None else random
+    budget = int(width) - crop.shape[2]
+    if budget <= 0:
+        return crop
+
+    segments = max(1, min(int(gap_segments), budget))
+    count = source.randint(1, segments)
+
+    # Split the blank budget into `count` positive parts.
+    cuts = sorted(source.sample(range(1, budget), count - 1)) if count > 1 else []
+    sizes = [b - a for a, b in zip([0] + cuts, cuts + [budget])]
+
+    # Insertion points, in crop-column space: 0 is before the first column and w
+    # after the last, so the ends stay reachable.
+    points = sorted(source.randint(0, crop.shape[2]) for _ in range(count))
+
+    out = torch.zeros(crop.shape[0], crop.shape[1], int(width), dtype=crop.dtype,
+                      device=crop.device)
+    written = 0      # columns of `out` already filled
+    taken = 0        # columns of `crop` already copied
+    for point, size in zip(points, sizes):
+        chunk = point - taken
+        if chunk:
+            out[:, :, written:written + chunk] = crop[:, :, taken:point]
+            written += chunk
+            taken = point
+        written += size          # the blank run: `out` is already zero there
+    if taken < crop.shape[2]:
+        out[:, :, written:written + (crop.shape[2] - taken)] = crop[:, :, taken:]
+    return out
+
+
+class LimitedFoVScatterPad(ImageOnlyTransform):
+    """Crop to `fov`, then scatter blank columns up to the panorama's full width.
+
+    The evaluation counterpart of `BatchMaxPadCollate`: training pads each crop to
+    the widest crop in its batch, which varies per batch, and evaluation pads to
+    the full width, which is the top of that range.
+    """
+
+    def __init__(self, fov=360., gap_segments=4):
+        super(LimitedFoVScatterPad, self).__init__(fov)
+        self.fov = fov
+        self.gap_segments = gap_segments
+
+    def apply(self, x, **params):
+        if self.fov <= 0:
+            return x
+        cropped, _, _ = apply_limited_fov(x, self.fov, random.randint(0, 359))
+        return scatter_blank_columns(cropped, x.shape[2], self.gap_segments)
+
+
 class LimitedFoV(ImageOnlyTransform):
     """Crop to `fov`, optionally keeping a fixed blank border around the crop.
 
@@ -808,7 +882,9 @@ def get_transforms_val(image_size_sat,
                        mask_ratio=0.0,
                        fov_pad=False,
                        fov_pad_random_start=True,
-                       fov_border_px=0):
+                       fov_border_px=0,
+                       fov_scatter_pad=False,
+                       fov_gap_segments=4):
 
 
 
@@ -827,6 +903,8 @@ def get_transforms_val(image_size_sat,
                                    # Must match the training crop: whichever of
                                    # the two is used here has to be used there,
                                    # `pad_random_start` included.
+                                   LimitedFoVScatterPad(fov=fov, gap_segments=fov_gap_segments)
+                                   if fov_scatter_pad else
                                    LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start)
                                    if fov_pad else LimitedFoV(fov=fov, border_px=fov_border_px),
                                   ])

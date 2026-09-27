@@ -13,7 +13,7 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from singeo.dataset.cvusa import CVUSADatasetEval, CVUSADatasetTrainSinGeo
+from singeo.dataset.cvusa import BatchMaxPadCollate, CVUSADatasetEval, CVUSADatasetTrainSinGeo
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
 from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor
@@ -22,7 +22,7 @@ from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
 from singeo.loss import InfoNCE, RankNContrast
 from singeo.distances import GeoNeighbourRanks, GeoCoordinates, SatelliteEmbeddings, RnCDistanceBuilder
-from singeo.model import TimmModel_SinGeo
+from singeo.model import PADDING_MODES, TimmModel_SinGeo, set_conv_padding_mode
 from singeo.visualize import RnCSampleVisualizer
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
 from singeo.transforms import get_dynamic_rotation_angle
@@ -471,6 +471,29 @@ class Configuration:
     # own width does not already reveal.
     fov_border_px: int = 0
 
+    # Pad each ground crop to the WIDEST crop in its batch, with the blank going
+    # in as 1..fov_gap_segments random runs whose positions include the inside of
+    # the scene. Needs per-sample FoV (fov_sampling="loguniform") and no other
+    # padding.
+    #
+    # Two things separate it from fov_pad. The tensor width follows the batch, not
+    # the protocol, so a batch of narrow crops stays narrow and the widest sample
+    # carries no blank at all. And blank can land inside the scene, so "blank only
+    # appears at the two ends" is not learnable -- the edge condition the model
+    # has to handle becomes variable by construction.
+    # Padding mode for every convolution that pads -- the 36 depthwise 7x7 layers
+    # of ConvNeXt-B. "zeros" is stock. See singeo.model.set_conv_padding_mode and
+    # "Mind the Pad" (ICLR 2021): zero padding injects a constant the network never
+    # meets inside an image, and the artefact propagates inward.
+    #
+    # "circular" wraps both axes, which is right for a full panorama horizontally
+    # and wrong vertically (sky onto road) and for narrow crops (two unrelated
+    # edges joined). "replicate" repeats the edge pixel and assumes nothing.
+    conv_padding_mode: str = "zeros"
+
+    fov_pad_batch_max: bool = False
+    fov_gap_segments: int = 4
+
     fov_pad: bool=True
 
     # Where the padded block sits inside the full-width ground tensor.
@@ -697,6 +720,13 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    if cfg.conv_padding_mode != "zeros":
+        lines.append("Conv padding mode: {} (all 36 padding convs; stock is zeros)".format(
+            cfg.conv_padding_mode))
+    if cfg.fov_pad_batch_max:
+        lines.append("Ground padding: to the WIDEST crop in each batch, blank scattered in "
+                     "1-{} runs (inside the scene as well as at the ends)".format(
+                         cfg.fov_gap_segments))
     if cfg.fov_border_px:
         lines.append("Ground crop border: {} px of blank on each side, train and eval".format(
             cfg.fov_border_px))
@@ -813,6 +843,11 @@ if __name__ == '__main__':
     new_hight = round((224 / 1232) * new_width)
     img_size_ground = (new_hight, new_width)
     
+    if config.conv_padding_mode != "zeros":
+        changed = set_conv_padding_mode(model, config.conv_padding_mode)
+        print("Conv padding mode: {} applied to {} padding convolutions".format(
+            config.conv_padding_mode, changed))
+
     # Activate gradient checkpointing
     if config.grad_checkpointing:
         model.set_grad_checkpointing(True)
@@ -884,7 +919,9 @@ if __name__ == '__main__':
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
-                                  pin_memory=True)
+                                  pin_memory=True,
+                                  collate_fn=BatchMaxPadCollate(config.fov_gap_segments)
+                                  if config.fov_pad_batch_max else None)
 
 
     # transformations for Eval and Sim sampling.
@@ -896,6 +933,8 @@ if __name__ == '__main__':
                                                                fov_pad=config.fov_pad,
                                                                fov_pad_random_start=config.fov_pad_random_start,
                                                                fov_border_px=config.fov_border_px,
+                                                               fov_scatter_pad=config.fov_pad_batch_max,
+                                                               fov_gap_segments=config.fov_gap_segments,
                                                                )
 
 
@@ -924,6 +963,8 @@ if __name__ == '__main__':
                                                            fov_pad=config.fov_pad,
                                                            fov_pad_random_start=config.fov_pad_random_start,
                                                            fov_border_px=config.fov_border_px,
+                                                           fov_scatter_pad=config.fov_pad_batch_max,
+                                                           fov_gap_segments=config.fov_gap_segments,
                                                            )
         query_dataset_test_extra = CVUSADatasetEval(data_folder=config.data_folder ,
                                           split="test",
@@ -1102,6 +1143,21 @@ if __name__ == '__main__':
         print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
     else:
         print("InfoNCE overlap gating: off")
+    if config.conv_padding_mode not in PADDING_MODES:
+        raise ValueError("conv_padding_mode must be one of {}, got {!r}".format(
+            PADDING_MODES, config.conv_padding_mode))
+
+    if config.fov_pad_batch_max:
+        if config.fov_pad or config.fov_border_px:
+            raise ValueError("fov_pad_batch_max excludes fov_pad and fov_border_px: all three "
+                             "decide what surrounds the crop")
+        if config.fov_sampling != "loguniform":
+            raise ValueError(
+                "fov_pad_batch_max needs fov_sampling='loguniform' (per sample). With one FoV per "
+                "batch every crop is already the same width, so there is nothing to pad to.")
+        if config.fov_gap_segments < 1:
+            raise ValueError("fov_gap_segments must be >= 1, got {}".format(config.fov_gap_segments))
+
     if config.fov_border_px < 0:
         raise ValueError("fov_border_px must be >= 0, got {}".format(config.fov_border_px))
     if config.fov_border_px and config.fov_pad:
@@ -1146,7 +1202,7 @@ if __name__ == '__main__':
     if config.fov_sampling not in ("loguniform", "loguniform_batch", "deterministic"):
         raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch' or "
                          "'deterministic', got {!r}".format(config.fov_sampling))
-    if config.fov_sampling == "loguniform" and not config.fov_pad:
+    if config.fov_sampling == "loguniform" and not (config.fov_pad or config.fov_pad_batch_max):
         raise ValueError(
             "fov_sampling='loguniform' needs fov_pad=True: per-sample draws give each sample a "
             "different crop width and default_collate cannot stack them. Use "
@@ -1322,6 +1378,8 @@ if __name__ == '__main__':
                                                         fov_pad=config.fov_pad,
                                                         fov_pad_random_start=config.fov_pad_random_start,
                                                         fov_border_px=config.fov_border_px,
+                                                        fov_scatter_pad=config.fov_pad_batch_max,
+                                                        fov_gap_segments=config.fov_gap_segments,
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
