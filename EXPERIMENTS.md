@@ -85,6 +85,17 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | **roundP2** | B | padded | P1 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 95.34 | 91.96 | 74.39 | 64.58 | **81.57** | final |
 | **roundP3** | B | unpadded + 64 px border | B1 + `FOV_BORDER_PX=64` | 96.63 | 91.82 | 72.23 | 61.77 | **80.61** | final |
 | **roundP4** | B | unpadded + 64 px border | P3 + wedge: `RNC_WEIGHT=0.25 RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=embed` | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** | final — best overall |
+| **roundP9** | B | unpadded + 64 px border | P4 with `RNC_WEIGHT=0` (wedge kept, RnC off) | 96.27 | 90.78 | 69.71 | 58.45 | **78.80** | final |
+| roundP5 | B | batch-max, scattered | `FOV_PAD_BATCH_MAX=true FOV_GAP_SEGMENTS=4` + wedge + RnC | 82.01 | 84.98 | 60.61 | 49.64 | 69.31 | final |
+| **roundP10a** | B | padded | wedge, `RNC_WEIGHT=0 OVERLAP_GATE_MEASURE=circle` | 95.24 | 92.35 | 73.36 | 61.85 | **80.70** | final |
+| roundP10b | B | padded | P10a + `INFONCE_TERM_WEIGHTS='(1,1,1,1,1,1)'` | 95.67 | 91.97 | 72.70 | 61.79 | 80.53 | final |
+| **roundP12** | B | unpadded + 64 px border | P4 with `RNC_POSITIVES_ONLY=true RNC_HARDEST_NEGATIVE=true` (weight 0.25, **no GEE**) | 96.36 | 91.21 | 73.40 | 63.99 | **81.24** | final |
+| roundP11 | B | border, **q1 bordered too** | P4 + `FOV_BORDER_Q1=true` | 85.38 | 84.67 | 61.71 | 52.28 | 71.01 | final |
+| roundP10c | B | padded | P10b + positives-only RnC w2.0, `loss6` dropped | 89.76 | 88.70 | 66.13 | 53.85 | 74.61 | final |
+| roundP10d | B | padded | P10b + positives-only RnC w2.0 | 84.58 | 84.51 | 58.33 | 47.66 | 68.77 | final |
+| roundP6/P7/P8 | B | circular conv padding × {none, padded, batch-max} | `CONV_PADDING_MODE=circular` | — | — | — | — | 66.45 / 68.04 / 65.86 | stopped e48–54 |
+| roundP12b | B | padded, per-sample | P12 under P2's protocol | — | — | — | — | — | running |
+| roundP12c | B | unpadded + 64 px border | P12 at `RNC_WEIGHT=0.5` | — | — | — | — | — | running |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 
 ---
@@ -147,6 +158,141 @@ input. The honest statement is: *SinGeo surpassed by +2.92 Avg, with aerial sect
 supervision contributing +1.48 of it, under a protocol with a fixed border.*
 Scoring P4 without the border would reintroduce the mismatch it was trained
 against, so the border belongs in the protocol description, not hidden.
+
+---
+
+## Splitting the wedge from RnC — the wedge alone is destructive, RnC repairs it
+
+P4 − P3 was +1.48 Avg, but the wedge and RnC arrived together. roundP9 is P4 with
+`rnc_weight=0`, the wedge kept and carried by InfoNCE alone:
+
+| | Avg | vs P3 |
+|---|---|---|
+| P3 — border, no wedge | 80.61 | — |
+| **P9 — border + wedge, no RnC** | **78.80** | **−1.81** |
+| P4 — border + wedge + RnC | 82.09 | +1.48 |
+
+| decomposition | Avg |
+|---|---|
+| the wedge alone, as InfoNCE hard positives (P9 − P3) | **−1.81** |
+| what RnC adds once the wedge is there (P4 − P9) | **+3.29** |
+| the two together (P4 − P3) | +1.48 |
+
+**So aerial wedging on its own still costs, even with the crop lifted off the
+tensor edge.** What turns it into a gain is RnC, which ranks the wedge as a
+partial match below the full tile instead of forcing it to be identical. The
+border removed the edge artefact; it did not make the hard positive harmless.
+
+That also corrects the reading of the 2×2 above: the "+1.48 wedge effect" in the
+padded and border rows is a *wedge plus RnC* effect, and RnC is the larger half.
+
+### Full gating partly rescues the wedge without RnC
+
+roundP10a is padded, wedge on, RnC off, with the gate switched from
+`containment` (which is 1 for any pair with a full 360° side, so only `loss6` is
+gated) to `circle` (`inter/360`, so every term is weighted by the share of the
+compass the two views share).
+
+| | Avg | FoV 360 | FoV 180 | FoV 90 | FoV 70 |
+|---|---|---|---|---|---|
+| P1 — padded, no wedge, no RnC | 80.08 | 95.01 | 91.09 | 72.25 | 61.99 |
+| **P10a — + wedge, full gating, no RnC** | **80.70** | 95.24 | 92.35 | 73.36 | 61.85 |
+| P10b — P10a with all six term weights 1 | 80.53 | 95.67 | 91.97 | 72.70 | 61.79 |
+| P2 — padded, wedge + RnC, containment gate | 81.57 | 95.34 | 91.96 | 74.39 | 64.58 |
+
+- **The wedge without RnC is +0.61 here**, against −1.81 under the border with
+  containment gating. Full gating looks like the difference, but protocol and
+  measure changed together — see the missing control below.
+- **The feared cost of circle gating did not appear.** It down-weights narrow
+  crops in `loss2`, `loss4` and `loss6`, yet FoV 90 is +1.10 and FoV 70 only
+  −0.13 against P1.
+- **SinGeo's term hierarchy is not load-bearing once the gate is on**: P10b − P10a
+  = −0.17, inside noise. Weighting all six terms equally changes nothing.
+- **RnC still beats gating**: P2 (wedge + RnC) is 0.87 above P10a, and its lead is
+  at the narrow end (FoV 70 +2.73).
+
+**What cannot move, in any protocol.** InfoNCE takes a weighted *mean*, so a gate
+weight identical for every sample in a batch cancels. `r1-r2` and `r2-q1` carry
+the wedge sector, which is a per-epoch curriculum value, so their weights never
+vary within a batch; `q1-r1` is 1 by construction. Only `q1-q2`, `r1-q2` and
+`q2-r2` can be gated at all, and the first two only under per-sample FoV.
+
+**Missing control:** padded + wedge + no RnC + *containment* gate — the padded twin
+of P9. Without it, P10a's +0.61 against P9's −1.81 confounds the gate measure with
+the input protocol.
+
+---
+
+## Which RnC? The all-pairs objective never descends; positives + hardest negative does
+
+RnC's four groups are a *ranking* loss. Whether the model can satisfy that ranking
+turns out to depend entirely on what is in each rank set.
+
+| run | RnC scope | `g2a` at e1 → e80 | Avg |
+|---|---|---|---|
+| P4 | all pairs, negatives ranked by GEE embedding | 2.534 → **2.532** (−0.1%) | **82.09** |
+| **P12** | a location's own views **+ the single hardest negative** | 0.630 → **0.404** (**−36%**) | **81.24** |
+| P10d | positives only, weight 2.0 | 0.356 → 0.140 | 68.77 |
+
+**P4's RnC never moved.** Its groups sat at ~2.53 for 80 epochs, against a
+random-feature value of about 2.55 measured earlier — the ordering was never being
+solved, the term just sat on its floor. Whatever P4 gained from RnC, it did not
+come from satisfying the ranking.
+
+**P12's descends steadily** and flattens around epoch 70. With three references per
+row — full view, partial view, one hardest negative — the ordering is learnable.
+
+### Why positives-only alone fails, and what the hardest negative fixes
+
+Measured on one gradient step with two views per domain: positives-only makes
+cos(q1, r2) **fall** and cos(q2, r2) fall further. For the partial view the term
+where it is the reference has a rank set of itself alone and contributes 0, so
+**nothing pulls it toward its own location** — it is only pushed behind the full
+view. roundP10d confirms the cost in training: −11.76 Avg against its no-RnC twin
+(at weight 2.0, which was too strong; the form is the point, not the number).
+
+Adding one negative per row restores the attraction and makes the target ordering
+explicit, with no GEE anywhere:
+
+```
+full view  <  partial view  <  hardest negative
+0.000         0.222            1.000
+```
+
+Positives land in [0, 0.5) from `0.5 × (1 − arc overlap)`; the negative is pinned at
+1.0 by `negative_tiering="none"`, which `rnc_positives_only` forces. The 45,516-row
+satellite-embedding CSV is never read, so the recipe ports to any server with just
+the CVUSA data.
+
+| comparison | Avg |
+|---|---|
+| P12 − P9 — what this RnC adds over no RnC | **+2.44** |
+| P4 − P9 — what all-pairs RnC adds | +3.29 |
+| P12 − P4 — the two forms against each other | **−0.85** (inside noise) |
+| P12 − P3 — wedge + this RnC against no wedge at all | **+0.63** |
+
+**The trade:** at most 0.85 Avg, in exchange for dropping an external data source and
+replacing an objective that never descended with one that does. P12 also turns the
+wedge from a liability (P9, −1.81 against P3) into a net gain.
+
+---
+
+## Masking the panorama is not the same as masking a crop
+
+roundP11 is P4 with the 64 px border extended to q1:
+
+| | FoV 360 | FoV 180 | FoV 90 | FoV 70 | Avg |
+|---|---|---|---|---|---|
+| P4 — border on crops only | 96.09 | 92.24 | 75.07 | 64.97 | **82.09** |
+| P11 — border on q1 as well | 85.38 | 84.67 | 61.71 | 52.28 | **71.01** |
+
+**−11.08 Avg, uniformly across FoVs**, with train R@1 unchanged at 99.0 — the model
+still fits the training task, the representation just transfers worse.
+
+A panorama is **cyclic**: its two tensor edges are a true adjacency, not the arbitrary
+cut a crop has. Replacing that adjacency with blank destroys real structure, while on
+a crop the blank only shields an edge that was already arbitrary. **Mask what the
+counterpart view genuinely cannot see, nothing else.**
 
 ---
 
@@ -225,37 +371,45 @@ nothing the crop width did not already reveal. roundP3/P4 test it at N=64.
 
 ## Where things stand
 
+The project reads as **masked learning on both branches**: the ground crop masks the
+panorama, the wedge masks the tile wide-to-narrow, the gate tells the loss how much
+the two masks overlap, and RnC ranks that overlap.
+
 | | FoV 360 | FoV 180 | FoV 90 | FoV 70 | **Avg** | protocol |
 |---|---|---|---|---|---|---|
-| **roundP4** — best overall (64 px border, wedge + RnC) | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** | border |
-| roundP3 — same without the wedge | 96.63 | 91.82 | 72.23 | 61.77 | 80.61 | border |
-| round4a — best padded, previous best overall | 94.92 | 92.13 | 75.38 | 65.61 | 82.01 | padded |
+| **roundP4** — best overall (border, wedge, all-pairs RnC) | 96.09 | 92.24 | **75.07** | **64.97** | **82.09** | border |
+| **roundP12** — same, GEE-free RnC | 96.36 | 91.21 | 73.40 | 63.99 | **81.24** | border |
+| round4a — best padded, pre-reframing | 94.92 | 92.13 | 75.38 | 65.61 | 82.01 | padded |
 | roundP2 — padded, wedge + RnC | 95.34 | 91.96 | 74.39 | 64.58 | 81.57 | padded |
-| roundP1 — padded, no wedge | 95.01 | 91.09 | 72.25 | 61.99 | 80.08 | padded |
-| **round4aB1** — SinGeo reproduced, no wedge | 96.32 | 90.81 | 70.88 | 58.91 | 79.23 | unpadded |
+| roundP3 — border, no wedge, no RnC | 96.63 | 91.82 | 72.23 | 61.77 | 80.61 | border |
+| **round4aB1** — SinGeo reproduced | 96.32 | 90.81 | 70.88 | 58.91 | 79.23 | unpadded |
 | **SinGeo published** | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | unpadded |
-| round8a — upstream-equivalent, deterministic FoV | 96.58 | 90.72 | 69.26 | 54.20 | 77.69 | unpadded |
-| round4aB2fix — unpadded **with** wedge | 89.55 | 86.79 | 64.49 | 51.90 | 73.18 | unpadded |
+| roundP9 — border + wedge, no RnC | 96.27 | 90.78 | 69.71 | 58.45 | 78.80 | border |
 
-**Three results carry the project:**
+**The component ladder, all single-variable, all 80 epochs:**
 
-1. **round4aB1 reproduces SinGeo unpadded** (+0.06 Avg; +0.78 at FoV 90, +0.91 at
-   70, −0.48 at 360, −0.99 at 180). The only change from round8a is per-batch
-   log-uniform FoV sampling, worth +1.54 Avg with no padding and no epoch-16
-   collapse. It is the baseline any wedge claim must beat.
-2. **The wedge is supportive once the crop is not flush against the tensor edge**:
-   −6.05 flush, **+1.48** padded, **+1.48** with a 64 px border, and the gain is
-   concentrated at FoV 90 and 70. The "aerial cropping is destructive" finding was
-   an artefact of the edge condition, compounded earlier by a 180° heading bug and
-   by the q1 roll.
-3. **roundP4 surpasses the paper by +2.92 Avg** (+4.97 at FoV 90, +6.97 at 70),
-   with aerial sector supervision contributing +1.48 of it — under a protocol that
-   adds a constant, FoV-independent 64 px border. See "Against the paper" above.
+| component | Δ Avg | from |
+|---|---|---|
+| ground-mask curriculum (log-uniform FoV) | **+1.54** | 8a → B1 |
+| mask fill that clears the tensor edge (64 px border) | **+1.38** | B1 → P3 |
+| aerial mask as an InfoNCE **hard** positive | **−1.81** | P3 → P9 |
+| mask-overlap ranking, all-pairs RnC + GEE | **+3.29** | P9 → P4 |
+| mask-overlap ranking, positives + hardest negative, no GEE | **+2.44** | P9 → P12 |
+| masking the panorama too | **−11.08** | P4 → P11 |
+| circular conv padding instead of zeros | **−9.0** | P2 → P7 (stopped e48) |
+| SinGeo's per-term weight hierarchy, once gated | −0.17 | P10a → P10b |
 
-**Corrections recorded since this file was first written.** The old headline "the
-wedge costs 0.45 Avg, noise" came from a pair that both carried the q1 roll, and
-from runs where the wedge pointed 180° away from the ground crop. Both are fixed;
-the numbers above supersede it.
+**Three claims the evidence supports:**
+
+1. **SinGeo is reproduced and surpassed.** round4aB1 matches the paper unpadded
+   (+0.06); roundP4 is **+2.92 Avg** over it, +4.97 at FoV 90 and +6.97 at FoV 70,
+   under a protocol that adds a constant 64 px border to every ground query.
+2. **Aerial masking pays only as a graded positive.** As a hard positive it costs
+   1.81; ranked below the full tile by RnC it turns into a net gain (+0.63 for P12
+   over P3, +1.48 for P4).
+3. **Mask only what the other view cannot see.** The border helps on crops, whose
+   edges are arbitrary cuts, and costs 11 Avg on the panorama, whose edges are a
+   true cyclic adjacency.
 
 ---
 
@@ -590,27 +744,33 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 ## Next experiments, in priority order
 
-1. **Sweep the border width.** 64 px was chosen from the slide probe, where 4 px
-   already recovered 10.5 of 12 points. If 4–16 px does as well as 64, the
-   protocol change shrinks to almost nothing, which makes the result far easier
-   to defend. One training run per width, or start with eval-only probes on P4.
-2. **Re-score roundP1 and roundP2 unpadded and with the 4 px margin**, so the
-   padded row can be compared with the unpadded and border rows on one protocol.
-   Needs the padding-eval script rebuilt on server B.
-3. **The fill-value test.** Must the border be the dataset-mean blank, or will any
-   constant do? Decides whether the border is "a familiar neighbour" or merely
-   "any neighbour", and whether it must match training statistics.
-4. **Wedge as a third aerial view.** Keep r2 as SinGeo's rotated full tile with all
-   six terms and add the wedge as r3 through RnC only. round4aB3 showed that
-   dropping `loss3`/`loss5`/`loss6` removes SinGeo's rotation supervision along
-   with the wedge's hard positives (−4.7 vs B2fix at e48), so the wedge should be
-   *added*, never substituted. Costs ~1.3× aerial compute.
-5. **Anchor the stack change.** Re-run round4aB1 on server B. If it lands within
-   noise of 79.23, the cross-server rows in the record table stand as they are.
-   This matters now that P4 is compared against server-A numbers.
-6. **Tune the wedge curriculum under the border.** P4 − P3 is negative until epoch
-   ~40 and positive after. A slower sector ramp (`aerial_ramp_frac`) may convert
-   the early loss into extra late gain.
+Framed as masked learning, each item attributes one component.
+
+1. **Finish the RnC dose-response.** roundP12c (weight 0.5) and roundP12b (padded,
+   per-sample) are running. With P9 at 0 and P12 at 0.25 that gives a curve, and
+   P12b says whether the GEE-free form holds under padding too.
+2. **`NEGATIVE_TIERING=none` with all-pairs RnC.** The remaining question about P4:
+   is its +3.29 the mask-overlap ordering, or the GEE ranking over negatives? P12
+   suggests the former. One run settles it and may drop the CSV from every recipe.
+3. **The structured-vs-random mask control.** Replace the wedge with area-matched
+   random rectangles. This is what makes "aerial *sector* learning" a claim rather
+   than a description. Needs ~30 lines in the dataset.
+4. **Protocol-transfer matrix** (eval only, ~1 h): every model × {768-padded, 64 px,
+   4 px, flush, random width}. Establishes empirically that panorama-width padding is
+   not needed at inference — currently shown only for round4a's checkpoint.
+5. **Scale sensitivity** (eval only). Padding is not required, but pixels-per-degree
+   consistency still is, since a 90° query is resized to 192 columns *because* 768
+   spans 360°. Rescale queries ±25/50% and measure. The honest claim is about FoV
+   knowledge, not padding, and a reviewer will find this.
+6. **Minimal margin**: P4 with `FOV_BORDER_PX=4`, then 16. The slide probe recovered
+   10.5 of 12 points at 4 px; if training agrees, the protocol difference from stock
+   SinGeo becomes one patch of blank.
+7. **Mask-aware encoding** (`AERIAL_MASK_MODE=gated`): exclude masked positions from
+   the descriptor instead of feeding blanks — the most natural form of the masking
+   story, still untested. Needs ground height 140 → 128/160 and the timm 1.0 encoder
+   test fixed.
+8. **Anchor the stack change**: rerun round4aB1 on server B, since the ladder's first
+   two steps come from server A.
 
 ## Open from earlier
 

@@ -11,7 +11,7 @@ import time
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
-                               scatter_blank_columns)
+                               scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
 
 # Compass bearing that column 0 of a CVUSA panorama faces.
@@ -459,6 +459,13 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # eval transforms; see `apply_limited_fov`.
         self.fov_border_px = 0
 
+        # Give the FULL PANORAMA the same blank border as the crops. Off by
+        # default: q1 spans 360 degrees and has always met the tensor edge, in
+        # training and at evaluation alike. Turning it on makes training q1 match
+        # the FoV 360 eval query, which is built by the crop path and so does
+        # carry the border.
+        self.fov_border_q1 = False
+
         # How the aerial wedge's tile is rotated. "continuous" draws uniformly in
         # +-sat_rot_max and interpolates (SinGeo's T1-style variant). "discrete"
         # rotates by 0 or +-90 only, an exact pixel permutation, with the
@@ -641,7 +648,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
             # width really is the only signal, which is correct for that path
             # because it does not pad.
             if meta is not None:
-                q2_is_full = float(meta[M_GROUND_EXTENT]) >= 360.0
+                # A bordered crop must never be rolled: the roll would wrap the
+                # blank into the middle of the scene.
+                q2_is_full = (float(meta[M_GROUND_EXTENT]) >= 360.0
+                              and not self.fov_border_px)
             else:
                 q2_is_full = query_img2.shape[2] == w
 
@@ -669,6 +679,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
         if self.roll_q1:
             width = query_img1.shape[2]
             query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
+
+        # Last, so every roll above acts on the bare panorama.
+        if self.fov_border_q1 and self.fov_border_px:
+            query_img1 = add_blank_border(query_img1, self.fov_border_px)
 
         label = torch.tensor(idx, dtype=torch.long)
 

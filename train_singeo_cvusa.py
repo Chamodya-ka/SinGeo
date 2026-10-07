@@ -186,6 +186,16 @@ class Configuration:
     # itself, and logsumexp({s}) - s = 0. Only g2a and a2g carry signal.
     rnc_positives_only: bool = True
 
+    # Add the single most confusable negative per row to the positives-only rank
+    # sets. Positives-only leaves a partial view (wedge, crop) with nothing it
+    # must beat, so it is only pushed BEHIND the full view and never pulled
+    # toward its own location -- measured on one step: cos(q1, r2) falls under
+    # positives-only and rises under all-pairs. With the hardest negative in the
+    # rank set the ordering becomes full view < partial view < hardest negative,
+    # which restores the attraction while keeping RnC free of the GEE ranking
+    # over all 15 negatives. Needs rnc_positives_only=True.
+    rnc_hardest_negative: bool = False
+
     rnc_similarity: str = "cosine"     # "cosine" | "l2"
     # Per-group weights, ordered (ground->aerial, ground->ground,
     # aerial->ground, aerial->aerial). The four groups are always computed and
@@ -489,7 +499,23 @@ class Configuration:
     # "circular" wraps both axes, which is right for a full panorama horizontally
     # and wrong vertically (sky onto road) and for narrow crops (two unrelated
     # edges joined). "replicate" repeats the edge pixel and assumes nothing.
+    # Which overlap measure the InfoNCE gate uses. "containment" (inter/min) is
+    # 1 for any pair with a full 360 side, so it gates loss6 only. "circle"
+    # (inter/360) gates every term by the share of the compass both views see.
+    #
+    # Careful reading it: InfoNCE takes a WEIGHTED MEAN, so a weight that is the
+    # same for every sample in a batch cancels. Under a per-batch FoV draw that
+    # leaves loss6 as the only term the gate can move; r1-r2 and r2-q1 never vary
+    # within a batch under any protocol, since the wedge sector is per-epoch.
+    overlap_gate_measure: str = "containment"
+
     conv_padding_mode: str = "zeros"
+
+    # Apply fov_border_px to the full panorama q1 as well as to the crops. Off by
+    # default. With it on every ground view carries the same blank margin, which
+    # also matches the FoV 360 evaluation query: that one is built by the crop
+    # path and is therefore already bordered, while training q1 is not.
+    fov_border_q1: bool = False
 
     fov_pad_batch_max: bool = False
     fov_gap_segments: int = 4
@@ -665,15 +691,24 @@ def write_run_info(path, cfg, run_name, note, overrides):
             cfg.rnc_weight, cfg.rnc_tau, cfg.rnc_similarity))
         lines.append("  positive pairs  : arc overlap, measure '{}', scale {}".format(
             cfg.rnc_positive_overlap, cfg.rnc_positive_scale))
-        lines.append("  negative tiering: '{}'".format(cfg.negative_tiering))
-        if gee_on:
+        # Report the EFFECTIVE tiering: positives-only forces it to "none" and the
+        # embedding table is never even loaded, so printing the requested value
+        # would claim a dependency the run does not have.
+        effective_tiering = "none" if cfg.rnc_positives_only else cfg.negative_tiering
+        if effective_tiering != cfg.negative_tiering:
+            lines.append("  negative tiering: '{}'  (requested '{}', overridden by "
+                         "rnc_positives_only)".format(effective_tiering, cfg.negative_tiering))
+            lines.append("    -> negatives all sit at distance 1.0; no GEE table is read")
+        else:
+            lines.append("  negative tiering: '{}'".format(effective_tiering))
+        if gee_on and effective_tiering == "embed":
             lines.append("    -> Google Earth Engine satellite embeddings, i.e. negatives are")
             lines.append("       ranked by how similar the two SCENES look, not by how far apart")
             lines.append("       they are. A photograph cannot reveal 500 km vs 1500 km, but it")
             lines.append("       can reveal that two places look alike, so this target is one the")
             lines.append("       encoder can actually represent. Dense, so it barely ties.")
             lines.append("    -> source: {}".format(cfg.sat_embedding_csv))
-        elif cfg.negative_tiering == "geo":
+        elif effective_tiering == "geo":
             lines.append("    -> geographic separation, source '{}'".format(cfg.rnc_geo_source))
         lines.append("  group weights (g2a, g2g, a2g, a2a): {}".format(cfg.rnc_group_weights))
         lines.append("  ties: {}".format("excluded from rank sets" if cfg.rnc_exclude_ties
@@ -720,6 +755,9 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    if cfg.overlap_gated_infonce and cfg.overlap_gate_measure != "containment":
+        lines.append("InfoNCE gate measure: {} (every term weighted, not just loss6)".format(
+            cfg.overlap_gate_measure))
     if cfg.conv_padding_mode != "zeros":
         lines.append("Conv padding mode: {} (all 36 padding convs; stock is zeros)".format(
             cfg.conv_padding_mode))
@@ -730,6 +768,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
     if cfg.fov_border_px:
         lines.append("Ground crop border: {} px of blank on each side, train and eval".format(
             cfg.fov_border_px))
+        if cfg.fov_border_q1:
+            lines.append("  the full panorama q1 carries the same border")
     lines.append("Ground padding (fov_pad): {}".format(
         "ON  - crops keep the panorama's full width, dropped azimuths filled"
         if cfg.fov_pad else "OFF - crops return a narrower tensor (stock SinGeo)"))
@@ -909,6 +949,7 @@ if __name__ == '__main__':
     # the transform pipeline.
     train_dataset.fov_pad = config.fov_pad
     train_dataset.fov_border_px = config.fov_border_px
+    train_dataset.fov_border_q1 = config.fov_border_q1
     train_dataset.aerial_rotation = config.aerial_rotation
     train_dataset.aerial_circular_mask = config.aerial_circular_mask
     train_dataset.pad_random_start = config.fov_pad_random_start
@@ -1123,10 +1164,17 @@ if __name__ == '__main__':
         print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
             config.rnc_weight, config.rnc_tau, effective_tiering))
         if config.rnc_positives_only:
-            print("RNC scope: POSITIVES ONLY - only views of the same location are ranked; "
-                  "negative pairs leave every rank set, negative_tiering is unused "
-                  "(requested {!r}), and the same-domain groups g2g/a2a are exactly 0 "
-                  "with two views per domain".format(config.negative_tiering))
+            if config.rnc_hardest_negative:
+                print("RNC scope: POSITIVES + HARDEST NEGATIVE - a location's own views plus the "
+                      "single most confusable negative per row, so the partial view must beat "
+                      "that negative while still ranking behind the full view. "
+                      "negative_tiering is unused (requested {!r}); g2g/a2a are NOT zero here, "
+                      "since each row keeps one negative".format(config.negative_tiering))
+            else:
+                print("RNC scope: POSITIVES ONLY - only views of the same location are ranked; "
+                      "negative pairs leave every rank set, negative_tiering is unused "
+                      "(requested {!r}), and the same-domain groups g2g/a2a are exactly 0 "
+                      "with two views per domain".format(config.negative_tiering))
         else:
             print("RNC scope: all pairs (positives ranked against negatives)")
         print("RNC positive overlap:", config.rnc_positive_overlap)
@@ -1143,6 +1191,17 @@ if __name__ == '__main__':
         print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
     else:
         print("InfoNCE overlap gating: off")
+    if config.rnc_hardest_negative and not config.rnc_positives_only:
+        raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
+                         "every negative is already in the rank sets")
+
+    if config.fov_border_q1 and not config.fov_border_px:
+        raise ValueError("fov_border_q1 needs fov_border_px > 0: there is no border to add")
+
+    if config.overlap_gate_measure not in ("containment", "circle", "iou"):
+        raise ValueError("overlap_gate_measure must be 'containment', 'circle' or 'iou', got "
+                         "{!r}".format(config.overlap_gate_measure))
+
     if config.conv_padding_mode not in PADDING_MODES:
         raise ValueError("conv_padding_mode must be one of {}, got {!r}".format(
             PADDING_MODES, config.conv_padding_mode))
@@ -1403,6 +1462,7 @@ if __name__ == '__main__':
                 config.batch_size if config.fov_sampling == "loguniform_batch" else None)
             train_dataloader.dataset.fov_epoch = epoch
             train_dataloader.dataset.fov_border_px = config.fov_border_px
+            train_dataloader.dataset.fov_border_q1 = config.fov_border_q1
 
             if config.enable_aerial_crop:
                 # `aerial_ramp_frac < 1` compresses both aerial schedules into

@@ -1753,3 +1753,193 @@ def test_unknown_padding_mode_raises():
 
     with _pytest.raises(ValueError, match="padding mode"):
         set_conv_padding_mode(nn.Conv2d(1, 1, 3, padding=1), "wrap")
+
+
+def _gate_weights(measure, q2_extents, sector=200.0, sat_centre=0.0):
+    """The six gate weights for a batch, under one overlap measure."""
+    from singeo.trainer import _singeo_infonce_terms
+    from singeo.loss import InfoNCE
+
+    seen = {}
+
+    class _Loss(InfoNCE):
+        def forward(self, a, b, scale, weights=None):
+            seen[len(seen)] = None if weights is None else weights.clone()
+            return super().forward(a, b, scale, weights)
+
+    class _Cfg:
+        gpu_ids = (0,)
+        overlap_gated_infonce = True
+        overlap_gate_measure = measure
+
+    class _Model:
+        logit_scale = torch.log(torch.tensor(1 / 0.07))
+
+    n = len(q2_extents)
+    meta = torch.zeros(n, 4)
+    meta[:, M_GROUND_CENTER] = 0.0
+    meta[:, M_GROUND_EXTENT] = torch.tensor(q2_extents)
+    meta[:, M_SAT_CENTER] = sat_centre
+    meta[:, M_SAT_EXTENT] = sector
+
+    torch.manual_seed(0)
+    feats = [torch.randn(n, 32) for _ in range(4)]
+    loss_fn = _Loss(loss_function=torch.nn.CrossEntropyLoss(label_smoothing=0.1), device='cpu')
+    _singeo_infonce_terms(_Cfg(), _Model(), loss_fn, *feats, meta=meta)
+    return [seen[i] for i in range(6)]
+
+
+def test_containment_gate_touches_only_loss6():
+    # The wedge is drifted off the crop, so loss6's pair is only partly covered;
+    # centred on it, containment would legitimately be 1 as well.
+    w = _gate_weights("containment", [90.0, 180.0, 70.0], sector=200.0, sat_centre=150.0)
+    for i in (0, 1, 2, 3, 4):                      # loss1..loss5
+        assert torch.allclose(w[i], torch.ones(3)), (i, w[i])
+    assert not torch.allclose(w[5], torch.ones(3))
+
+
+def test_circle_gate_weights_every_term_by_shared_compass():
+    w = _gate_weights("circle", [90.0, 180.0, 70.0], sector=200.0)
+    assert torch.allclose(w[0], torch.ones(3))                     # q1-r1: both full
+    # q1-q2 and r1-q2 become the crop's share of the circle...
+    expected = torch.tensor([90.0, 180.0, 70.0]) / 360.0
+    assert torch.allclose(w[1], expected, atol=1e-4)
+    assert torch.allclose(w[3], expected, atol=1e-4)
+    # ...and r1-r2 / r2-q1 the sector's share, identical for every sample, which
+    # is exactly why they cancel in InfoNCE's weighted mean.
+    assert torch.allclose(w[2], torch.full((3,), 200.0 / 360.0), atol=1e-4)
+    assert torch.allclose(w[4], torch.full((3,), 200.0 / 360.0), atol=1e-4)
+
+
+def test_constant_gate_weights_cannot_change_the_loss():
+    """A weight identical for every sample cancels: the weighted mean is scale free."""
+    from singeo.loss import InfoNCE
+
+    torch.manual_seed(0)
+    a, b = torch.randn(8, 32), torch.randn(8, 32)
+    loss_fn = InfoNCE(loss_function=torch.nn.CrossEntropyLoss(label_smoothing=0.1), device='cpu')
+    scale = torch.log(torch.tensor(1 / 0.07)).exp()
+
+    plain = loss_fn(a, b, scale)
+    for value in (0.2, 0.5, 1.0):
+        weighted = loss_fn(a, b, scale, weights=torch.full((8,), value))
+        assert torch.allclose(plain, weighted, atol=1e-6), value
+
+
+def test_add_blank_border_centres_the_view():
+    from singeo.transforms import add_blank_border
+
+    x = torch.rand(3, 10, 768)
+    out = add_blank_border(x, 64)
+    assert out.shape == (3, 10, 768 + 128)
+    assert torch.equal(out[:, :, 64:64 + 768], x)
+    assert (out[:, :, :64] == 0).all() and (out[:, :, -64:] == 0).all()
+    assert torch.equal(add_blank_border(x, 0), x)
+
+
+def test_bordered_panorama_keeps_its_blank_at_the_edges_after_rotation():
+    """The border is added after the paired roll, so blank never wraps inward."""
+    if not os.path.isdir(CVUSA_FOLDER):
+        print("   (skipped: CVUSA data folder not present)")
+        return
+
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    from singeo.transforms import get_transforms_val
+
+    sat_tf, ground_tf = get_transforms_val((96, 96), (35, 192), fov=0.0)
+    ds = CVUSADatasetTrainSinGeo(data_folder=CVUSA_FOLDER,
+                                 transforms_query1=ground_tf, transforms_query2=ground_tf,
+                                 transforms_reference1=sat_tf, transforms_reference2=sat_tf,
+                                 prob_flip=0.0, prob_rotate=1.0,   # always rotate, so q1 is rolled
+                                 shuffle_batch_size=4, return_meta=True, enable_aerial_crop=True)
+    ds.ground_fov = 90.0
+    ds.sat_arc = 270.0
+    ds.fov_border_px = 16
+    ds.fov_border_q1 = True
+
+    random.seed(3)
+    for i in range(6):
+        q1, q2, _, _, _, meta = ds[i]
+        assert q1.shape[2] == 192 + 32, q1.shape
+        assert (q1[:, :, :16] == 0).all() and (q1[:, :, -16:] == 0).all(), i
+        # the scene itself reaches both borders, i.e. nothing was rolled into them
+        assert (q1[:, :, 16:-16].abs().sum(0).sum(0) > 0).all(), i
+        # the crop keeps its own border and its arc is unchanged by either
+        assert q2.shape[2] == int(90 / 360 * 192) + 32
+        assert float(meta[M_GROUND_EXTENT]) < 360.0
+
+
+def _rnc_scope_probe(positives_only, hardest_negative, steps=5.0):
+    """Which same-location pairs move under one RnC-only gradient step."""
+    import torch.nn.functional as _F
+    from singeo.loss import RankNContrast, compute_rnc_groups
+    from singeo.distances import RnCDistanceBuilder, expand_views, full_arc_like
+
+    torch.manual_seed(0)
+    B = 8
+    ids = torch.arange(B)
+    full = full_arc_like(ids)
+    ground = torch.stack([torch.rand(B) * 360, 70 + torch.rand(B) * 200], 1)
+    aerial = torch.stack([torch.rand(B) * 360, 180 + torch.rand(B) * 150], 1)
+    ids_g, arcs_g = expand_views(ids, [full, ground])
+    ids_a, arcs_a = expand_views(ids, [full, aerial])
+
+    fg = torch.randn(2 * B, 64, requires_grad=True)
+    fa = torch.randn(2 * B, 64, requires_grad=True)
+    builder = RnCDistanceBuilder(positive_scale=0.5, negative_tiering='none',
+                                negative_margin=1e-2, positive_overlap='circle')
+    groups = compute_rnc_groups(RankNContrast(temperature=0.5), builder, fg, fa, ids_g, ids_a,
+                                arcs_g, arcs_a, positives_only=positives_only,
+                                hardest_negative=hardest_negative)
+    sum(groups.values()).backward()
+
+    def pair(g, a, i, j):
+        return float((_F.normalize(g[i * B:(i + 1) * B], dim=-1) *
+                      _F.normalize(a[j * B:(j + 1) * B], dim=-1)).sum(-1).mean())
+
+    after_g, after_a = (fg - steps * fg.grad).detach(), (fa - steps * fa.grad).detach()
+    return {'q1-r2': pair(after_g, after_a, 0, 1) - pair(fg.detach(), fa.detach(), 0, 1),
+            'q2-r2': pair(after_g, after_a, 1, 1) - pair(fg.detach(), fa.detach(), 1, 1)}
+
+
+def test_hardest_negative_gives_the_partial_view_attraction():
+    """Positives-only repels the wedge; adding the hardest negative pulls it in."""
+    plain = _rnc_scope_probe(positives_only=True, hardest_negative=False)
+    hardest = _rnc_scope_probe(positives_only=True, hardest_negative=True)
+
+    # Without it, the wedge's similarity to its own views does not rise.
+    assert plain['q2-r2'] < 0, plain
+    # With it, both wedge pairings move up relative to the positives-only case.
+    assert hardest['q2-r2'] > plain['q2-r2'], (plain, hardest)
+    assert hardest['q1-r2'] > plain['q1-r2'], (plain, hardest)
+
+
+def test_hardest_negative_adds_exactly_one_reference_per_row():
+    from singeo.loss import RankNContrast, compute_rnc_groups
+    from singeo.distances import RnCDistanceBuilder, expand_views, full_arc_like
+
+    torch.manual_seed(0)
+    B = 6
+    ids = torch.arange(B)
+    full = full_arc_like(ids)
+    arcs = torch.stack([torch.rand(B) * 360, 90 + torch.rand(B) * 180], 1)
+    ids_g, arcs_g = expand_views(ids, [full, arcs])
+    ids_a, arcs_a = expand_views(ids, [full, arcs])
+    fg, fa = torch.randn(2 * B, 32), torch.randn(2 * B, 32)
+
+    seen = {}
+
+    class _Spy(RankNContrast):
+        def forward(self, anchor, reference, distances, valid=None):
+            seen[len(seen)] = valid.clone()
+            return super().forward(anchor, reference, distances, valid)
+
+    builder = RnCDistanceBuilder(positive_scale=0.5, negative_tiering='none',
+                                negative_margin=1e-2, positive_overlap='circle')
+    for flag in (False, True):
+        seen.clear()
+        compute_rnc_groups(_Spy(temperature=0.5), builder, fg, fa, ids_g, ids_a, arcs_g, arcs_a,
+                           positives_only=True, hardest_negative=flag)
+        counts = seen[0].sum(dim=1)                      # g2a: refs allowed per anchor row
+        expected = 2 + (1 if flag else 0)                # own r1 and r2, plus one negative
+        assert (counts == expected).all(), (flag, counts)

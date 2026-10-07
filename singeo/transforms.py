@@ -645,6 +645,24 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
     return x * keep
 
 
+def add_blank_border(x, border_px):
+    """`[C, H, W]` -> `[C, H, W + 2*border_px]`, the view centred on blank columns.
+
+    The symmetric counterpart of `apply_limited_fov(..., border_px=...)`, for views
+    that are never cropped -- the full panorama. Zero after `A.Normalize` is the
+    dataset mean colour, the same fill the crops get.
+
+    Apply it LAST. The paired rotation block rolls the panorama, and rolling a
+    bordered tensor would wrap the blank into the middle of the scene.
+    """
+    if border_px <= 0:
+        return x
+    out = torch.zeros(x.shape[0], x.shape[1], x.shape[2] + 2 * border_px,
+                      dtype=x.dtype, device=x.device)
+    out[:, :, border_px:border_px + x.shape[2]] = x
+    return out
+
+
 def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
     """Widen `crop` to `width` by inserting blank columns in 1..N random runs.
 

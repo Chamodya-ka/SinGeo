@@ -27,6 +27,12 @@
 #   roundP4   P3 + wedge + RnC: the wedge question with the crop off the tensor edge
 #   roundP5   batch-max padding, blank scattered inside the crop, wedge on [full data, 80 ep]
 #   roundP6/7/8  circular conv padding (Mind the Pad) x {no input pad, input pad, batch-max}
+#   roundP9   64px border + wedge WITHOUT RnC: splits P4 minus P3 into wedge and RnC
+#   roundP10  padded + wedge, no RnC, FULL gating (circle): (a) default weights (b) all weights 1
+#   roundP11  P4 with the 64px border on the panorama q1 as well as the crops
+#   roundP10c positives-only RnC on P10b: (c) loss6 zeroed (d) loss6 kept, the +RnC delta
+#   roundP12  RnC over positives + the hardest negative, on the P4 protocol
+#   roundP12bc  P12 under the padded per-sample protocol (b) and at rnc_weight 0.5 (c)
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -1199,6 +1205,315 @@ Two readings:
       out to the full panorama width
 
 Wedge and RnC exactly as P2, P5 and P7.'
+    ;;
+
+roundP9)
+    echo "Round P9 - 64px border + wedge, NO RnC [full data, 80 ep]"
+    echo "  P3 80.61 (border, no wedge) | P4 82.09 (border, wedge + RnC)"
+    launch roundP9-border64-wedge-nornc \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P9. roundP4 with RnC switched off (rnc_weight 0, NOT use_rnc false, so the
+wedge, the recorded arcs and the overlap gate all stay). The aerial wedge is
+therefore carried by InfoNCE alone, through loss3 (r1-r2), loss5 (r2-q1) and
+loss6 (r2-q2), with loss6 gated by the arc overlap as in every other run.
+
+WHY. P4 minus P3 is +1.48 Avg, but the wedge and RnC arrived together, so that
+number is their sum. This run splits it:
+
+  P9 minus P3   the wedge alone, as hard positives inside InfoNCE
+  P4 minus P9   what RnC adds on top of the wedge
+  P4 minus P3   +1.48, the pair together (known)
+
+READING IT, against P3 80.61 and P4 82.09, noise about 3 points:
+  near 82.09   the wedge alone explains the gain and RnC is optional, which
+      simplifies the method considerably
+  near 80.61   the wedge alone does nothing and the gain came from RnC ranking
+      the wedge as a partial match rather than from the wedge itself
+  below 80.61  the wedge as a HARD positive hurts, and RnC was repairing it,
+      which is the story the flush-edge runs told before the border existed
+
+Note RnC leaves the loss entirely here, so no GEE embedding table is loaded and
+rnc_positives_only/negative_tiering are irrelevant. Everything else identical to
+P3 and P4: unpadded with a fixed 64 px border on every ground crop (train and
+eval), per batch log uniform FoV, quarter turn r2, disc mask off, no q1 roll,
+batch 16, 80 epochs.'
+    ;;
+
+roundP10)
+    echo "Round P10 - padded + wedge, NO RnC, FULL InfoNCE gating (circle measure) [80 ep]"
+    echo "  two arms: default term weights (a) vs all weights 1 (b)"
+    echo "  reference: P2 81.57 (padded, wedge, RnC, containment gate) | P1 80.08 (no wedge)"
+    launch roundP10a-fullgate-nornc \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P10a. Padded, per sample log uniform FoV, wedge ON, RnC OFF (rnc_weight 0,
+so the wedge, the arcs and the gate all stay), and the InfoNCE gate switched from
+containment to CIRCLE, so every term is weighted by the share of the compass the
+two views share instead of only loss6.
+
+WHAT ACTUALLY CHANGES. InfoNCE takes a weighted MEAN, so a weight identical for
+every sample in a batch cancels. Per sample FoV makes the crop extent vary inside
+a batch, so three terms genuinely move: q1-q2, r1-q2 and q2-r2, all weighted by
+the crop extent over 360. Two terms cannot move under any protocol -- r1-r2 and
+r2-q1 carry the wedge sector, which is a per epoch curriculum value and therefore
+constant across the batch -- and q1-r1 is 1 by construction. Measured weights for
+crops of 90, 180, 70 deg with a 200 deg sector: q1-q2 and r1-q2 go 1.00 1.00 1.00
+under containment to 0.25 0.50 0.19 under circle.
+
+WHAT IT MEANS. Narrow crops now count for less as positives, exactly the samples
+the FoV 90 and 70 columns are scored on. That is the risk of this design and the
+reason to measure it.
+
+COMPARISONS. Against P2 81.57 this differs in two ways at once (RnC off AND the
+gate measure), because no padded run yet has the wedge with RnC off. Against P1
+80.08 it is wedge plus full gating with no RnC either side. The missing control,
+padded plus wedge, no RnC, containment gate, is worth running next to separate
+the two.
+
+Everything else as P2: quarter turn r2, disc mask off, no q1 roll, batch 16,
+80 epochs, tau irrelevant with RnC off.'
+
+    launch roundP10b-fullgate-nornc-w1 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P10b. Exactly P10a with one change: every InfoNCE term weighted 1 instead
+of SinGeo 1, 0.5, 0.5, 0.25, 0.25, 0.25.
+
+WHY. SinGeo weights the panorama to tile term highest and the three wedge terms
+lowest, a hierarchy chosen before the wedge existed. With the gate now scoring
+each pair by how much the two views actually share, the fixed hierarchy and the
+per sample gate are two answers to the same question. This asks whether the
+hierarchy is still needed once the gate is doing the work.
+
+Note the two interact: loss3 and loss5 carry the wedge and their gate weight is
+constant per batch, so raising them from 0.5 and 0.25 to 1 is a real change in
+how much the wedge pulls, unmediated by any gate.
+
+READING IT against P10a: above means the hierarchy was holding the wedge terms
+back once gating is in place; below means SinGeo down weighting of the wedge
+terms was load bearing. Everything else identical to P10a.'
+    ;;
+
+roundP11)
+    echo "Round P11 - roundP4 with the 64px border on the PANORAMA as well [full data, 80 ep]"
+    echo "  single variable vs roundP4 (82.09, best overall): q1 carries the border too"
+    launch roundP11-border64-q1 \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 SINGEO_FOV_BORDER_Q1=true \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_NEGATIVE_TIERING=embed \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P11. Exactly roundP4 (82.09 Avg, best overall) with one change: the 64 px
+blank border is added to the FULL PANORAMA q1 as well, not only to the crops.
+
+WHY. In P4 the border lifts every ground CROP off the tensor edge, but q1 still
+runs flush, 768 columns wide. Two reasons that is worth testing.
+
+  1. Consistency with evaluation. The FoV 360 eval query is built by the crop
+     path, so it already carries the border, while training q1 does not. P11
+     removes that mismatch. P4 is the run whose FoV 360 sits lowest among the
+     border runs (96.09 against P3 96.63), which is where such a mismatch would
+     show.
+  2. The edge argument applied to its own premise. If a scene column next to
+     blank is what the encoder learned to read, q1 has never had one.
+
+AGAINST IT. A panorama is cyclic: its two ends are genuinely adjacent, so the
+tensor edge there is not an arbitrary cut the way a crop edge is. The border
+replaces a true adjacency with blank, which may cost rather than help. That is
+the measurement.
+
+MECHANICS. The border is applied LAST in the sample, after the paired rotation
+rolls q1, so blank is never wrapped into the middle of the scene. q1 keeps its
+360 degree arc, so no RnC distance or gate weight changes. q1 becomes 896 columns
+wide, the crops are unchanged.
+
+READING IT against P4 82.09, noise about 3 points:
+  above P4   the mismatch was costing, most visibly at FoV 360
+  near P4    q1 was never the problem, which further isolates the effect to
+      cropped views whose edges really are arbitrary
+  below P4   blanking a true adjacency costs, and the border should stay on the
+      crops only
+
+Everything else identical to P4: wedge on with the aligned heading, all pairs RnC
+0.25 with GEE embedding tiering, per batch log uniform FoV, quarter turn r2, disc
+mask off, no q1 roll, batch 16, 80 epochs.'
+    ;;
+
+roundP10c)
+    echo "Round P10c/d - positives-only RnC on top of P10b (80.53) [full data, 80 ep]"
+    echo "  c: loss6 (q2-r2) zeroed, as asked | d: loss6 kept, the clean +RnC delta"
+    launch roundP10c-posrnc-noloss6 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)' \
+        SINGEO_RNC_WEIGHT=2.0 SINGEO_RNC_TAU=0.5 SINGEO_RNC_POSITIVES_ONLY=true \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P10c. roundP10b (80.53: padded, per sample FoV, wedge, full circle gating,
+all six InfoNCE weights 1, no RnC) plus POSITIVES ONLY RnC, with the InfoNCE
+q2-r2 term zeroed so that pair is left to RnC: weights (1, 1, 1, 1, 1, 0).
+
+WHAT POSITIVES ONLY RnC ACTUALLY DOES, measured on one gradient step with two
+views per domain: g2g and a2a are exactly 0, and the surviving groups enforce an
+ordering across the four cross pairs -- q1-r1 rises by 0.0101, q2-r2 falls by
+0.0078, q2-r1 falls by 0.0033, q1-r2 is flat. For the q2-r2 pair it is PURELY
+REPULSIVE: the term whose reference is r2 has a rank set of itself alone and
+contributes nothing, so no term pulls q2 and r2 together.
+
+CONSEQUENCE of zeroing loss6 here: the q2-r2 pair is trained only to sit farther
+than q2-r1. r2 still gets attraction from loss3 and loss5, and q2 from loss2 and
+loss4, so the run is not degenerate, but RnC is not carrying q2-r2, it is only
+ordering it. Read the result that way.
+
+WEIGHT. Positives only is far smaller than the all pairs form: two non zero
+groups near 0.45 each against four near 2.0, so about a tenth of the influence at
+the same weight. rnc_weight 2.0 puts its contribution near what 0.25 gives the
+all pairs form (about 1.8 against 2.0 added to an InfoNCE near 4). The weight is
+a free parameter and may deserve a sweep.
+
+Paired with roundP10d, which is identical except loss6 keeps weight 1.'
+
+    launch roundP10d-posrnc-keeploss6 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_RNC_WEIGHT=2.0 SINGEO_RNC_TAU=0.5 SINGEO_RNC_POSITIVES_ONLY=true \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P10d. Exactly roundP10b plus positives only RnC at weight 2.0, with every
+InfoNCE term left at weight 1 including loss6. One variable against P10b, so
+P10d minus P10b IS the contribution of positives only RnC, which is what the
+question asks. Paired with P10c, which additionally zeroes loss6; P10c minus P10d
+then isolates what removing the q2-r2 hard positive costs once RnC is present.
+
+Together the three runs give:
+  P10b 80.53            wedge, full gating, no RnC
+  P10d minus P10b       positives only RnC added
+  P10c minus P10d       loss6 removed on top of that
+
+Everything else as P10b: padded, per sample log uniform FoV, wedge on, circle
+gate, quarter turn r2, disc mask off, batch 16, 80 epochs. positives_only forces
+negative_tiering to none, so no GEE table is read.'
+    ;;
+
+roundP12)
+    echo "Round P12 - RnC with positives + the hardest negative [full data, 80 ep]"
+    echo "  P4 82.09 (all-pairs RnC) | P9 78.80 (no RnC) | both same protocol"
+    launch roundP12-rnc-hardneg \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P12. roundP4 with one change: RnC ranks a location own views PLUS the
+single most confusable negative per row, instead of all 15 negatives.
+
+THE PROBLEM IT FIXES. Positives only RnC leaves the partial view with nothing it
+must beat. For a ground anchor the rank set holds the full tile and the wedge, so
+the wedge is pushed BEHIND the tile and never pulled toward its own location.
+Measured on one gradient step: cos(q1, r2) FALLS under positives only and RISES
+under all pairs. roundP10d confirmed the cost in training, minus 11.76 Avg,
+though at weight 2.0.
+
+WHAT THIS RUN DOES. Each rank set gains the hardest negative, chosen per row by
+current cosine similarity and detached. The ordering becomes
+
+    full view  <  partial view  <  hardest negative
+
+so the wedge keeps its graded position below the tile AND gains an attractive
+gradient, without dragging in the GEE embedding ranking over all 15 negatives
+that the all pairs form carries.
+
+READING IT, against P4 82.09 and P9 78.80 (same protocol, RnC off):
+  near or above P4   the graded ordering is what RnC contributes, and the
+      embedding ranking over negatives is not needed. That simplifies the method
+      and drops the GEE table from it entirely
+  between P9 and P4  partially: both the ordering and the negative ranking carry
+      weight
+  near P9            the hardest negative is not enough attraction, and the all
+      pairs form is doing something the ordering alone cannot
+
+PORTABILITY. positives_only forces negative_tiering to none, so this run needs NO
+satellite embedding CSV and will start on any server with the CVUSA data.
+
+Everything else identical to P4: unpadded with a 64 px border on every ground
+crop, per batch log uniform FoV, wedge on with the aligned heading, quarter turn
+r2, disc mask off, no q1 roll, weight 0.25, tau 0.5, batch 16, 80 epochs.'
+    ;;
+
+roundP12bc)
+    echo "Round P12b/c - the hardest-negative RnC under a padded protocol, and at weight 0.5"
+    echo "  P12 81.24 (border64, per-batch, w 0.25) | P2 81.57 (padded, all-pairs RnC + GEE)"
+    launch roundP12b-padded-persample \
+        SINGEO_FOV_PAD=true SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P12b. roundP12 moved to the padded protocol: per SAMPLE log uniform FoV
+with every crop padded out to the panorama width, instead of a per batch draw
+with a 64 px border.
+
+TWO SINGLE VARIABLE READINGS.
+  vs roundP12 81.24   the input protocol, RnC form held fixed
+  vs roundP2  81.57   the RnC form, protocol held fixed: positives plus the
+      hardest negative and NO GEE table, against all pairs ranked by GEE
+      embedding distance
+
+WHY IT IS WORTH A RUN. P12 showed this RnC form descends where all pairs never
+did (g2a fell 0.63 to 0.40 over the run; P4 sat at 2.53 throughout) and recovers
+most of the gain, +2.44 over no RnC against all pairs +3.29, while dropping the
+45,516 row satellite embedding CSV from the method. If P12b matches or beats P2,
+that holds under the padded protocol too and the external data source is gone
+from every configuration, not just the border one.
+
+Note per sample FoV also makes the ground mask ratio vary WITHIN a batch, which
+is the regime where the gate and the RnC positive distances differ per sample
+rather than being shared by the whole batch.
+
+Wedge on with the aligned heading, containment gate as in P12 and P2, quarter
+turn r2, disc mask off, no q1 roll, tau 0.5, weight 0.25, batch 16, 80 epochs.
+positives_only forces negative_tiering to none, so no GEE table is read.'
+
+    launch roundP12c-weight05 \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.5 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=quarter SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P12c. Exactly roundP12 with rnc_weight 0.25 raised to 0.5.
+
+WHY. P12 trails roundP4 by 0.85 Avg, and the gap sits at the narrow FoVs, 90 and
+70, which is where the wedge ordering should help most. Its RnC groups were still
+descending when the run ended, having flattened only around epoch 70, so the term
+may simply be under weighted rather than weaker in kind.
+
+Against P12 81.24 and P4 82.09 this gives a dose response at 0, 0.25 and 0.5,
+since roundP9 is the same configuration with RnC off at 78.80:
+
+  0.00  roundP9   78.80
+  0.25  roundP12  81.24
+  0.50  roundP12c this run
+
+CAUTION. Too much RnC crowds out InfoNCE: the all pairs form at 1.0 was about 13
+Avg below its 0.25 twin at the same epoch, and positives only at 2.0 lost 11.76.
+0.5 is a deliberate step, not a sweep toward large weights.
+
+Everything else identical to roundP12.'
     ;;
 
 list)

@@ -222,7 +222,7 @@ def rnc_same_domain_mask(batch_size, device=None):
 
 def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
                        ids_ground, ids_aerial, arcs_ground, arcs_aerial,
-                       positives_only=False):
+                       positives_only=False, hardest_negative=False):
     """Run RNC separately for the four anchor/reference groups.
 
     The groups are kept apart on purpose. Same-domain and cross-domain
@@ -276,11 +276,33 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
     n_a = features_aerial.shape[0]
     device = features_ground.device
 
-    def scope(ids_a, ids_b, drop_diagonal):
+    def scope(ids_a, ids_b, drop_diagonal, anchor=None, reference=None):
         """`valid` mask for one group: which references may take part at all."""
         mask = None
         if positives_only:
             mask = ids_a.unsqueeze(1) == ids_b.unsqueeze(0)
+
+            if hardest_negative and anchor is not None:
+                # Positives-only leaves the partial view (the wedge, the crop)
+                # with no reference it must BEAT -- it is only ranked behind the
+                # full view, so nothing pulls it toward its own location. Adding
+                # the single most confusable negative per row restores that:
+                # every positive's rank set now contains it, so the ordering
+                # becomes full view < partial view < hardest negative, and the
+                # partial view gains an attractive gradient without dragging in
+                # all 15 negatives and the embedding-ranking they carry.
+                with torch.no_grad():
+                    sims = F.normalize(anchor.detach().float(), dim=-1) @ \
+                           F.normalize(reference.detach().float(), dim=-1).T
+                    sims = sims.masked_fill(mask, float('-inf'))
+                    if drop_diagonal:
+                        sims = sims.masked_fill(
+                            torch.eye(sims.shape[0], sims.shape[1], dtype=torch.bool,
+                                      device=sims.device), float('-inf'))
+                    hardest = sims.argmax(dim=1)
+                mask = mask.clone()
+                mask[torch.arange(mask.shape[0], device=mask.device), hardest] = True
+
         if drop_diagonal:
             no_self = rnc_same_domain_mask(ids_a.shape[0], device=device)
             mask = no_self if mask is None else (mask & no_self)
@@ -293,7 +315,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_ground, features_aerial,
         builder(ids_ground, arcs_ground, ids_aerial, arcs_aerial,
                 hardness=hardness(features_ground, features_aerial)),
-        valid=scope(ids_ground, ids_aerial, False),
+        valid=scope(ids_ground, ids_aerial, False, features_ground, features_aerial),
     )
 
     # (b) ground anchors -> ground references (self-pairs dropped)
@@ -301,7 +323,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_ground, features_ground,
         builder(ids_ground, arcs_ground, ids_ground, arcs_ground,
                 hardness=hardness(features_ground, features_ground)),
-        valid=scope(ids_ground, ids_ground, True),
+        valid=scope(ids_ground, ids_ground, True, features_ground, features_ground),
     )
 
     # (c) aerial anchors -> ground references
@@ -309,7 +331,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_aerial, features_ground,
         builder(ids_aerial, arcs_aerial, ids_ground, arcs_ground,
                 hardness=hardness(features_aerial, features_ground)),
-        valid=scope(ids_aerial, ids_ground, False),
+        valid=scope(ids_aerial, ids_ground, False, features_aerial, features_ground),
     )
 
     # (d) aerial anchors -> aerial references (self-pairs dropped)
@@ -317,7 +339,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         features_aerial, features_aerial,
         builder(ids_aerial, arcs_aerial, ids_aerial, arcs_aerial,
                 hardness=hardness(features_aerial, features_aerial)),
-        valid=scope(ids_aerial, ids_aerial, True),
+        valid=scope(ids_aerial, ids_aerial, True, features_aerial, features_aerial),
     )
 
     return groups

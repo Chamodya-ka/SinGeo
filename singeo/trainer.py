@@ -958,7 +958,7 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
 
 
 
-def _pair_overlap_gate(arc_a, arc_b):
+def _pair_overlap_gate(arc_a, arc_b, measure="containment"):
     """`[B]` weight for each aligned (view a, view b) pair, from their arcs.
 
     ``"containment"`` -- `inter / min(extent_a, extent_b)` -- is the right
@@ -973,7 +973,7 @@ def _pair_overlap_gate(arc_a, arc_b):
     pairs views of the same location, which is what the InfoNCE positives are.
     """
     overlap = angular_overlap(arc_a[:, 0], arc_a[:, 1], arc_b[:, 0], arc_b[:, 1],
-                              measure="containment")
+                              measure=measure)
     return overlap.diagonal()
 
 
@@ -1017,12 +1017,20 @@ def _singeo_infonce_terms(train_config, model, loss_function,
         arc_q2 = torch.stack([meta[:, M_GROUND_CENTER], meta[:, M_GROUND_EXTENT]], dim=1)
         arc_r2 = torch.stack([meta[:, M_SAT_CENTER], meta[:, M_SAT_EXTENT]], dim=1)
 
-        w1 = _pair_overlap_gate(arc_q1, arc_r1)
-        w2 = _pair_overlap_gate(arc_q1, arc_q2)
-        w3 = _pair_overlap_gate(arc_r1, arc_r2)
-        w4 = _pair_overlap_gate(arc_r1, arc_q2)
-        w5 = _pair_overlap_gate(arc_r2, arc_q1)
-        w6 = _pair_overlap_gate(arc_r2, arc_q2)
+        # "containment" leaves every pair with a full 360 side at exactly 1, so
+        # only loss6 is gated. "circle" (inter/360) instead scores every pair by
+        # the share of the compass both views see, which is what "gate all the
+        # terms" means. Note a weight that is CONSTANT across the batch cancels
+        # in InfoNCE's weighted mean, so under a per-batch FoV draw only loss6
+        # can change, and r1-r2 / r2-q1 never vary within a batch under any
+        # protocol, because the wedge sector is a per-epoch curriculum value.
+        measure = getattr(train_config, 'overlap_gate_measure', 'containment')
+        w1 = _pair_overlap_gate(arc_q1, arc_r1, measure)
+        w2 = _pair_overlap_gate(arc_q1, arc_q2, measure)
+        w3 = _pair_overlap_gate(arc_r1, arc_r2, measure)
+        w4 = _pair_overlap_gate(arc_r1, arc_q2, measure)
+        w5 = _pair_overlap_gate(arc_r2, arc_q1, measure)
+        w6 = _pair_overlap_gate(arc_r2, arc_q2, measure)
     else:
         w1 = w2 = w3 = w4 = w5 = w6 = None
 
@@ -1105,6 +1113,7 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     group_weights = dict(zip(('g2a', 'g2g', 'a2g', 'a2a'), group_weights))
     enable_aerial_crop = getattr(train_config, 'enable_aerial_crop', True)
     rnc_positives_only = getattr(train_config, 'rnc_positives_only', False)
+    rnc_hardest_negative = getattr(train_config, 'rnc_hardest_negative', False)
     # "pool" / "gated" send the wedged aerial view through the mask-aware encoder
     # (singeo.masked_encoder). Its mask arrives as an extra batch element only when
     # the dataset was built to emit one.
@@ -1169,7 +1178,8 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
                                             features_ground, features_aerial,
                                             ids_ground, ids_aerial,
                                             arcs_ground, arcs_aerial,
-                                            positives_only=rnc_positives_only)
+                                            positives_only=rnc_positives_only,
+                                            hardest_negative=rnc_hardest_negative)
 
                 rnc_total = sum(group_weights[k] * v for k, v in groups.items())
                 total = infonce_weight * total + rnc_weight * rnc_total
