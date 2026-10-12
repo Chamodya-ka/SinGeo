@@ -25,18 +25,19 @@ class Configuration:
     normalize_features: bool = True
        
     # Dataset
-    data_folder = "./data/CVACT"     
+    data_folder = "/home/71/25021871/data/chamodya/CVACT"     
         
     # Checkpoint to start from
-    checkpoint_start = None
+    checkpoint_start = "/home/71/25021871/data/chamodya/Singeo_data/convnext_base.fb_in22k_ft_in1k_384/roundP4-border64-wedge-rnc_20260924-085758/weights_end.pth"
     # set num_workers to 0 if on Windows
     num_workers: int = 0 if os.name == 'nt' else 4 
     
     # train on GPU if available
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu' 
-    fov: float = 360.0 # 0.0 for north-aligned panorama, others for limited FoV with unknown orientation
+    fov: float = 270.0 # 0.0 for north-aligned panorama, others for limited FoV with unknown orientation
     random_fov: bool = False
 
+    fov_pad: bool=True
 #-----------------------------------------------------------------------------#
 # Config                                                                      #
 #-----------------------------------------------------------------------------#
@@ -101,6 +102,8 @@ if __name__ == '__main__':
                                                                    mean=mean,
                                                                    std=std,
                                                                    fov=fov,
+                                                                   fov_pad=config.fov_pad,
+                                                                   fov_border_px=64
                                                                    )
 
     #-----------------------------------------------------------------------------#
@@ -156,43 +159,43 @@ if __name__ == '__main__':
     #-----------------------------------------------------------------------------#
 
     # Reference Satellite Images
-    reference_dataset_test = CVACTDatasetTest(data_folder=config.data_folder ,
-                                              img_type="reference",
-                                              transforms=sat_transforms_val)
+    # reference_dataset_test = CVACTDatasetTest(data_folder=config.data_folder ,
+    #                                           img_type="reference",
+    #                                           transforms=sat_transforms_val)
     
-    reference_dataloader_test = DataLoader(reference_dataset_test,
-                                           batch_size=config.batch_size,
-                                           num_workers=config.num_workers,
-                                           shuffle=False,
-                                           pin_memory=True)
-    
-    
-    
-    # Query Ground Images Test
-    query_dataset_test = CVACTDatasetTest(data_folder=config.data_folder ,
-                                          img_type="query",    
-                                          transforms=ground_transforms_val,
-                                          )
-    
-    query_dataloader_test = DataLoader(query_dataset_test,
-                                       batch_size=config.batch_size,
-                                       num_workers=config.num_workers,
-                                       shuffle=False,
-                                       pin_memory=True)
+    # reference_dataloader_test = DataLoader(reference_dataset_test,
+    #                                        batch_size=config.batch_size,
+    #                                        num_workers=config.num_workers,
+    #                                        shuffle=False,
+    #                                        pin_memory=True)
     
     
-    print("Reference Images Test:", len(reference_dataset_test))
-    print("Query Images Test:", len(query_dataset_test))          
+    
+    # # Query Ground Images Test
+    # query_dataset_test = CVACTDatasetTest(data_folder=config.data_folder ,
+    #                                       img_type="query",    
+    #                                       transforms=ground_transforms_val,
+    #                                       )
+    
+    # query_dataloader_test = DataLoader(query_dataset_test,
+    #                                    batch_size=config.batch_size,
+    #                                    num_workers=config.num_workers,
+    #                                    shuffle=False,
+    #                                    pin_memory=True)
+    
+    
+    # print("Reference Images Test:", len(reference_dataset_test))
+    # print("Query Images Test:", len(query_dataset_test))          
 
 
-    print("\n{}[{}]{}".format(30*"-", "CVACT_TEST", 30*"-"))  
+    # print("\n{}[{}]{}".format(30*"-", "CVACT_TEST", 30*"-"))  
 
   
-    r1_test = evaluate(config=config,
-                       model=model,
-                       reference_dataloader=reference_dataloader_test,
-                       query_dataloader=query_dataloader_test, 
-                       ranks=[1, 5, 10],
-                       step_size=1000,
-                       cleanup=True)
+    # r1_test = evaluate(config=config,
+    #                    model=model,
+    #                    reference_dataloader=reference_dataloader_test,
+    #                    query_dataloader=query_dataloader_test, 
+    #                    ranks=[1, 5, 10],
+    #                    step_size=1000,
+    #                    cleanup=True)
     

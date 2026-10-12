@@ -1516,6 +1516,19 @@ Avg below its 0.25 twin at the same epoch, and positives only at 2.0 lost 11.76.
 Everything else identical to roundP12.'
     ;;
 
+roundP12d)
+    echo "Round P12d - RnC with positives + the hardest negative [full data, 80 ep] + continuos aerial rotation"
+    echo "  P4 82.09 (all-pairs RnC) | P9 78.80 (no RnC) | both same protocol"
+    launch roundP12-rnc-hardneg \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P12d. roundP12 with one change: Aerial images are rotated continuously.'
+;;
+
 list)
     screen -list || echo "no sessions"
     echo

@@ -7,9 +7,9 @@ import torch
 
 TOP_K = 128
 
-dataset = CVACTDatasetTrain(data_folder = "./data/CVACT")
+dataset = CVACTDatasetTrain(data_folder =  "/home/71/25021871/data/chamodya/CVACT")
 
-anuData = sio.loadmat('./data/CVACT/ACT_data.mat')
+anuData = sio.loadmat('/home/71/25021871/data/chamodya/CVACT/ACT_data.mat')
 
 utm = anuData["utm"]
 ids = anuData['panoIds']

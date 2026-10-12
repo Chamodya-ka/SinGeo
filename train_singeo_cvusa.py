@@ -710,6 +710,15 @@ def write_run_info(path, cfg, run_name, note, overrides):
             lines.append("    -> source: {}".format(cfg.sat_embedding_csv))
         elif effective_tiering == "geo":
             lines.append("    -> geographic separation, source '{}'".format(cfg.rnc_geo_source))
+        if cfg.rnc_positives_only and getattr(cfg, "rnc_hardest_negative", False):
+            lines.append("  scope: a location's own views + the single hardest negative per row")
+            lines.append("    -> ordering full view < partial view < hardest negative;"
+                         " g2g/a2a are NOT zero")
+        elif cfg.rnc_positives_only:
+            lines.append("  scope: positives only -- a location's own views, no negatives at all")
+            lines.append("    -> g2g/a2a are exactly 0 with two views per domain")
+        else:
+            lines.append("  scope: all pairs -- every negative in the batch joins the rank sets")
         lines.append("  group weights (g2a, g2g, a2g, a2a): {}".format(cfg.rnc_group_weights))
         lines.append("  ties: {}".format("excluded from rank sets" if cfg.rnc_exclude_ties
                                          else "compete (original RnC)"))
@@ -724,10 +733,13 @@ def write_run_info(path, cfg, run_name, note, overrides):
             cfg.aerial_arc_start, cfg.aerial_arc_end, cfg.aerial_rot_max)
         if wedge_on else "OFF"))
     if wedge_on:
+        rotation_text = {
+            "discrete": "discrete 0/+-90 (exact), schedule keep 1.0 -> 0.25",
+            "quarter": "uniform 90*k, k in {0,1,2,3} (exact), no schedule",
+        }.get(cfg.aerial_rotation,
+              "continuous up to +-{} deg (interpolated)".format(cfg.aerial_rot_max))
         lines.append("  tile rotation: {}{}".format(
-            "discrete 0/+-90 (exact), schedule keep 1.0 -> 0.25"
-            if cfg.aerial_rotation == "discrete"
-            else "continuous up to +-{} deg (interpolated)".format(cfg.aerial_rot_max),
+            rotation_text,
             ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
         lines.append("InfoNCE overlap gating: {}".format(
             "ON  - each positive weighted by the containment overlap of the two views' arcs,"
@@ -747,11 +759,14 @@ def write_run_info(path, cfg, run_name, note, overrides):
     lines.append("")
 
     lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))
-    if cfg.fov_sampling == "loguniform":
-        lines.append("  fresh FoV per sample from [floor, 360], floor ramping 360 -> {} deg".format(
+    if cfg.fov_sampling.startswith("loguniform"):
+        lines.append("  fresh FoV per {} from [floor, 360], floor ramping 360 -> {} deg".format(
+            "batch" if cfg.fov_sampling == "loguniform_batch" else "sample",
             cfg.fov_curriculum_end))
         lines.append("  over the first {:.0%} of the run, while the LR is still near its peak.".format(
             cfg.fov_ramp_frac))
+        if cfg.fov_sampling == "loguniform_batch":
+            lines.append("  one draw per batch, so unpadded crops of equal width still collate.")
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
@@ -1442,6 +1457,7 @@ if __name__ == '__main__':
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
+        
         if fov_floor is None:
             print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
                   f"{' (padded to full width)' if config.fov_pad else ''}")
