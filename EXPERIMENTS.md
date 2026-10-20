@@ -66,7 +66,16 @@ another padded-protocol number.**
 ## Reproducible record: configuration and result per run
 
 Everything below is `./run.sh <round>`; the listed overrides are what the round
-passes, on top of the `train.py` snapshot defaults in each run directory. Shared
+passes, on top of the `train.py` snapshot defaults in each run directory.
+
+> **There are two roundP12 runs, differing only in tile rotation.**
+> `roundP12-rnc-hardneg_20261007-100406` ran `quarter` → **81.24**, which is what
+> `./run.sh roundP12` produces and what the table below records.
+> `roundP12-rnc-hardneg_20261010-101612` ran `continuous` → **81.91**, launched with a
+> command-line override. Both are final at e80. Name a timestamp when referring to "P12";
+> roundP13/P14 were built from the **continuous** one, so their control is **81.91**.
+> (An earlier note here claimed `run.sh` failed to reproduce P12 — that was wrong, it
+> compared the script against the other run.) Shared
 by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 0.1, `prob_rotate` 0.75, `prob_flip` 0.5, `crop_dropout_strength` 0.5, gate on.
 
@@ -96,6 +105,10 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP6/P7/P8 | B | circular conv padding × {none, padded, batch-max} | `CONV_PADDING_MODE=circular` | — | — | — | — | 66.45 / 68.04 / 65.86 | stopped e48–54 |
 | roundP12b | B | padded, per-sample | P12 under P2's protocol | — | — | — | — | — | running |
 | roundP12c | B | unpadded + 64 px border | P12 at `RNC_WEIGHT=0.5` | — | — | — | — | — | running |
+| **roundP14** | B | unpadded + 64 px border | P12(cont) + `OVERLAP_GATE_MEASURE=circle INFONCE_GATE_SCALES_TERMS=true INFONCE_TERM_WEIGHTS='(1,1,1,1,1,1)'` — gate sets the between-term balance | 96.20 | 91.64 | 72.97 | 62.93 | **80.93** | final |
+| **roundP12 (cont)** | B | unpadded + 64 px border | as roundP12 but `AERIAL_ROTATION=continuous` | 96.49 | 91.60 | 74.75 | 64.78 | **81.91** | final |
+| roundP15 | B | **padded** | P14 + `FOV_PAD=true FOV_BORDER_PX=0 FOV_SAMPLING=gaussian FOV_GAUSSIAN_STD=20` | — | — | — | — | — | running |
+| roundP13 | B | unpadded + 64 px border | P12 + `INFONCE_TERM_WEIGHTS='(1,1,1,1,1,1)'` (weighted mean unchanged) | — | — | — | — | — | stopped at e0 |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 
 ---
@@ -220,6 +233,88 @@ vary within a batch; `q1-r1` is 1 by construction. Only `q1-q2`, `r1-q2` and
 **Missing control:** padded + wedge + no RnC + *containment* gate — the padded twin
 of P9. Without it, P10a's +0.61 against P9's −1.81 confounds the gate measure with
 the input protocol.
+
+---
+
+## The gate and the term weights act on different axes — until the denominator changes
+
+The paragraph above ("what cannot move") is a statement about the *reduction*, not
+about the gate. It is worth separating the two mechanisms, because they were being
+conflated, and the separation turns into an experiment.
+
+`singeo/loss.py` reduced every InfoNCE term as a weighted **mean**:
+
+```python
+denominator = w.sum().clamp(min=1e-6)
+loss = ((w * per_sample1).sum() + (w * per_sample2).sum()) / (2.0 * denominator)
+```
+
+The gate `w` appears in the numerator *and* the denominator, so a value shared by
+the whole batch divides itself out exactly. That leaves two separate jobs:
+
+| | what it does | set by |
+|---|---|---|
+| **within-term** | how much sample *j* counts as a positive inside term *i* | the overlap gate `w` |
+| **between-term** | how much term *i* counts against the other five | `infonce_term_weights`, by hand |
+
+So **no gate setting can ever substitute for the hand-set hierarchy** — it is not a
+tuning question, there is no mechanism. The weighted mean is what severs them.
+
+### `infonce_gate_scales_terms`: normalise by the batch size instead
+
+Dividing by `B` rather than `w.sum()` keeps the per-sample weighting and lets a
+batch-shared gate survive, so the same signal does both jobs:
+
+| gate `w` | `/ w.sum()` (old) | `/ B` (new) | new ÷ ungated |
+|---|---|---|---|
+| 1.00 | 5.909 | 5.909 | 1.00 |
+| 0.75 | 5.909 | 4.432 | 0.75 |
+| 0.50 | 5.909 | 2.955 | 0.50 |
+| 0.25 | 5.909 | 1.477 | 0.25 |
+
+(One fixed batch of 16, same data every row.) The denominator has three
+constraints: independent of `w` or the gate cancels again; a per-sample *average*
+or the scale rides on batch size and swamps RnC in
+`infonce_weight·InfoNCE + rnc_weight·RnC`; and `B` specifically, so that at `w ≡ 1`
+the result is bit-identical to the ungated loss and `rnc_weight=0.25` keeps meaning
+what it meant in P12. The gate is then a pure discount in [0, 1] — never an
+amplification.
+
+**Only `circle` can express a hierarchy.** `containment` returns 1.0 for any pair
+with a full 360° side, so five of six terms would scale by 1.0. The flag warns if
+paired with `containment`, and errors if the gate is off entirely.
+
+### The geometry nearly reproduces SinGeo's hand-set hierarchy
+
+Mean per-term gate under P12's curriculum (`circle`, continuous rotation,
+sector 360 → 180, `loguniform_batch` FoV), at the final epoch:
+
+| | q1-r1 | q1-q2 | r1-r2 | r1-q2 | r2-q1 | r2-q2 |
+|---|---|---|---|---|---|---|
+| geometry @ e80 | 1.00 | 0.44 | 0.50 | 0.44 | 0.50 | 0.22 |
+| **SinGeo, hand-set** | **1.00** | **0.50** | **0.50** | **0.25** | **0.25** | **0.25** |
+
+Four of six land within 0.06 — `q1-r1` and `r1-r2` exactly. The hierarchy is
+therefore largely *the share of the compass the two views see*, not an arbitrary
+tuple. The exceptions are the two cross terms `r1-q2` and `r2-q1`, pairing a full
+view of one domain with a partial view of the other, which SinGeo discounts about
+2× harder than overlap alone justifies. Whether that extra discount is
+load-bearing is what P14 measures.
+
+It is also **curriculum-adaptive**, which a fixed tuple cannot be: at epoch 1 every
+view is near-full and all six scalars sit between 0.94 and 1.00, so the loss starts
+treating the pairs alike and concentrates on the full-view term only as the views
+narrow.
+
+**Known confound in P14.** The six scalars sum to ~5.8 early and ~3.1 late, so the
+total loss magnitude drifts down across the run — a mild implicit LR decay stacked
+on the cosine schedule. If P14 matches or beats P12, the follow-up is to divide by
+the sum of the six weights, which keeps the balance and removes the drift.
+
+**P13 was stopped before epoch 1** and produced no result. It was P12 with flat term
+weights under the *unchanged* weighted mean, i.e. it would have measured the
+hierarchy's value without the gate being able to replace it. P10a → P10b already
+estimated that at −0.17 under a different protocol.
 
 ---
 
@@ -398,6 +493,9 @@ the two masks overlap, and RnC ranks that overlap.
 | masking the panorama too | **−11.08** | P4 → P11 |
 | circular conv padding instead of zeros | **−9.0** | P2 → P7 (stopped e48) |
 | SinGeo's per-term weight hierarchy, once gated | −0.17 | P10a → P10b |
+| **the hierarchy, when the gate is given the between-term axis** | **−0.98** | P12(cont) → P14 |
+| continuous vs quarter tile rotation, CVUSA | +0.67 | P12 → P12(cont) |
+| continuous vs quarter tile rotation, CVACT | −0.06 | C1 → C3 |
 
 **Three claims the evidence supports:**
 
@@ -746,6 +844,13 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 Framed as masked learning, each item attributes one component.
 
+0. **roundP14, running.** Does the overlap gate, given the between-term axis,
+   replace SinGeo's hand-set weight hierarchy? Control is P12 at 81.24. Reading:
+   **at or above 81.24** means the hierarchy is derivable from view geometry and
+   the tuple can be deleted — then rerun dividing by the sum of the six weights to
+   strip the loss-scale drift. **Below** it, the gap is the value of the extra ~2×
+   discount SinGeo puts on the two cross terms `r1-q2` and `r2-q1`, which is the
+   only place geometry and the hand-set tuple disagree.
 1. **Finish the RnC dose-response.** roundP12c (weight 0.5) and roundP12b (padded,
    per-sample) are running. With P9 at 0 and P12 at 0.25 that gives a curve, and
    P12b says whether the GEE-free form holds under padding too.

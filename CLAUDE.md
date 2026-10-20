@@ -25,7 +25,7 @@ overlap. Last updated 2026-10-08.
   `negative_tiering=embed` with `rnc_positives_only=False` reads it.
 - **Hardware:** H100 NVL, 95 GiB, 62 GB RAM. One run ≈ 23 GB and 3.8 it/s (10 min/epoch);
   three fit at ~1.2 it/s each. **Four do not** — 4 × 23 GB leaves no headroom.
-- **Tests:** `$PY -m pytest tests/ -q` → 138 pass. One known failure,
+- **Tests:** `$PY -m pytest tests/ -q` → 143 pass. One known failure,
   `test_gated_encoder_sends_no_gradient_to_blank_pixels`, is the mask-aware encoder
   under timm 1.0; it affects no current run (`aerial_mask_mode` is off everywhere).
 
@@ -59,9 +59,20 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
 - **The gate weights positives, it does not mask inputs.** `overlap_gated_infonce` with
   `overlap_gate_measure="containment"` (default) is 1 for any pair with a full 360° side,
   so **only `loss6` is gated**; `"circle"` (`inter/360`) weights every term.
-- **InfoNCE takes a weighted *mean*, so a gate weight constant across a batch cancels.**
-  `r1-r2` and `r2-q1` can therefore never be gated — the wedge sector is a per-epoch
-  curriculum value. `q1-q2` and `r1-q2` only vary under per-sample FoV.
+- **InfoNCE takes a weighted *mean*, so a gate weight constant across a batch cancels**
+  (default path). `r1-r2` and `r2-q1` can therefore never be gated — the wedge sector is
+  a per-epoch curriculum value. `q1-q2` and `r1-q2` only vary under per-sample FoV.
+- **The gate and the term weights act on different axes.** The gate is *within*-term (how
+  much sample *j* counts inside term *i*); `infonce_term_weights` is *between*-term. The
+  weighted mean is what severs them, so **no gate setting can substitute for the
+  hierarchy** — unless you change the denominator:
+- **`infonce_gate_scales_terms=True`** divides each term by `B` instead of `w.sum()`, so a
+  batch-shared gate survives and the overlap sets the between-term balance too. Keeps the
+  per-sample weighting; at `w ≡ 1` it is bit-identical to the ungated loss, so
+  `rnc_weight` keeps its meaning. **Needs `overlap_gate_measure="circle"`** —
+  `containment` is 1.0 for five of six terms, so no hierarchy can appear — and pair it
+  with flat `infonce_term_weights`, or geometry and the hand-set tuple multiply together.
+  Both are checked at startup (error on gate off, warnings otherwise).
 - **Disable RnC with `rnc_weight=0`, never `use_rnc=False`** — the latter also removes the
   wedge, the recorded arcs and the gate.
 - **RnC reads orderings only**; `rnc_positive_scale` and `rnc_negative_margin` are inert
@@ -111,10 +122,20 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
   "wedge is destructive" gap. Keep it off; it is off by default.
 - **Circular conv padding hurts** (P7 −9.0 vs P2). It wraps both axes, joining unrelated
   crop edges and folding sky onto road.
-- **SinGeo's per-term weight hierarchy is not load-bearing** once the gate is on (−0.17).
+- **SinGeo's per-term weight hierarchy is not load-bearing** once the gate is on (−0.17,
+  P10a → P10b). It is also **close to derivable from view geometry**: the mean `circle`
+  overlap per term under P12's curriculum is (1.00, .44, .50, .44, .50, .22) against the
+  hand-set (1, .5, .5, .25, .25, .25) — four of six within 0.06. Only the cross terms
+  `r1-q2` and `r2-q1` are discounted ~2× harder than overlap justifies. roundP14 tests
+  whether the gate can replace the tuple outright; see `EXPERIMENTS.md`.
 
 ## Gotchas
 
+- **Two `roundP12` runs exist** — `_20261007-100406` (`quarter`, **81.24**, what
+  `./run.sh roundP12` gives) and `_20261010-101612` (`continuous`, **81.91**, launched with
+  an override). Always name the timestamp. P13/P14 use the continuous one as control.
+  On CVUSA continuous beats quarter by **+0.67**; on CVACT the same change is worth
+  **−0.06**, i.e. nothing (C1 52.50 vs C3 52.44, both final).
 - **Two evaluation protocols.** `fov_pad=True` and the unpadded/bordered paths feed
   different tensors; **never mix them in one column**. round4a scores 82.01 padded and
   64.78 unpadded — the same weights.

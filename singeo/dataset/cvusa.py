@@ -10,6 +10,7 @@ import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
+                               draw_gaussian_fov,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
                                scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
@@ -443,6 +444,32 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.fov_batch_size = None
         self.fov_epoch = 0
 
+        # Gaussian curriculum. When `ground_fov_mean` is set the FoV is drawn
+        # per sample from N(mean, std) clipped to [fov_lo, fov_hi], instead of
+        # log-uniformly from [floor, 360]. The band is narrow and slides down,
+        # rather than a widening support, so an epoch trains on a tight range of
+        # widths. Takes precedence over the log-uniform path when set.
+        #
+        # The Generator is built lazily in __getitem__, never here: this object
+        # is created in the parent process and forked into every dataloader
+        # worker, so a Generator made now would be copied and all workers would
+        # draw the same sequence.
+        self.ground_fov_mean = None
+        self.ground_fov_std = 20.0
+        self.fov_lo = 70.0
+        self.fov_hi = 360.0
+        self._fov_rng = None
+
+        # Written BY the trainer, read by the training script -- the one piece
+        # of curriculum state that flows outward rather than in. After each
+        # epoch `train_contrast_singeo_rnc` stores the mean realised crop extent
+        # here (from meta[M_GROUND_EXTENT], so it is the quantised width the
+        # encoder actually saw), and the script uses it to aim dynamic
+        # similarity sampling at the FoV the epoch really trained on instead of
+        # an analytic stand-in. `None` until the first epoch completes; readers
+        # must tolerate that, and `dss_fov_from_measured=False` ignores it.
+        self.measured_ground_fov = None
+
         self.sat_arc = 360.0           # aerial sector width in degrees
         # Bounds two things, both widening over the curriculum: the tile's
         # continuous rotation, and how far the aerial sector's heading may
@@ -552,7 +579,24 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
-            if self.ground_fov_floor is None:
+            if self.ground_fov_mean is not None:
+                if self.fov_batch_size:
+                    # One Gaussian draw per batch, seeded from (epoch, batch) so
+                    # every worker agrees on it. Same trick as the log-uniform
+                    # batch path, and the reason it matters is the same: equal
+                    # widths inside a batch collate without padding, which keeps
+                    # the 64 px border protocol available to a narrowing band.
+                    batch = index // self.fov_batch_size
+                    seed = (self.fov_epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi,
+                                            rng=np.random.default_rng(seed))
+                else:
+                    if self._fov_rng is None:
+                        self._fov_rng = np.random.default_rng()
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi, rng=self._fov_rng)
+            elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
                 batch = index // self.fov_batch_size

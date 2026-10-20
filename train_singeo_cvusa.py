@@ -16,7 +16,7 @@ from transformers import get_constant_schedule_with_warmup, get_polynomial_decay
 from singeo.dataset.cvusa import BatchMaxPadCollate, CVUSADatasetEval, CVUSADatasetTrainSinGeo
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor
+from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor, get_gaussian_fov_mean
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
@@ -389,9 +389,34 @@ class Configuration:
     #                        discriminates sample i from sample j inside one
     #                        batch, and if they share a FoV it cannot be used to
     #                        tell them apart.
-    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "deterministic"
+    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "gaussian" | "deterministic"
+
+    # "gaussian": per-sample FoV from N(mean, fov_gaussian_std) clipped to
+    # [fov_curriculum_end, 360], with the mean walked linearly 360 -> end across
+    # the run. A narrow band that slides, where loguniform is a widening support:
+    # late in a loguniform run an epoch still mixes 70 and 360 deg crops, whereas
+    # this trains a tight range of widths that migrates toward the eval FoV.
+    fov_gaussian_std: float = 20.0
+
+    # Paces the Gaussian mean's descent, as fov_ramp_frac paces the log-uniform
+    # floor. 1.0 (default) spreads it over the whole run, so the mean only
+    # reaches fov_curriculum_end in the final epoch and the narrow views arrive
+    # with the cosine LR nearly spent. Lower it to buy epochs at the narrow end:
+    # 0.75 lands at epoch 60 of 80 and holds for the last 20. `<= 0` starts at
+    # fov_curriculum_end immediately. Inert unless fov_sampling="gaussian".
+    fov_gaussian_ramp_frac: float = 1.0
     fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
     fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
+
+    # Lower clip bound for the Gaussian band, decoupled from the mean endpoint.
+    # `None` keeps the original behaviour, clipping at `fov_curriculum_end`,
+    # which centres the settled band exactly on its own clip and so pins ~50% of
+    # every late batch to that one width. Setting it BELOW the mean endpoint
+    # leaves the lower tail intact: a mean of 90 with std 30 clipped at 70 keeps
+    # roughly a quarter of samples at or under 70, so the narrowest evaluated
+    # FoV is still represented in training instead of being unreachable.
+    # Inert unless fov_sampling is a Gaussian mode.
+    fov_gaussian_clip_lo: Optional[float] = None
 
     # GridDropout/CoarseDropout severity on the *cropped* views (q2 and r2).
     # Those views have already lost most of the image to the FoV crop and the
@@ -508,6 +533,45 @@ class Configuration:
     # leaves loss6 as the only term the gate can move; r1-r2 and r2-q1 never vary
     # within a batch under any protocol, since the wedge sector is per-epoch.
     overlap_gate_measure: str = "containment"
+
+    # Let the overlap gate set the BETWEEN-term balance as well as the
+    # within-term one, replacing the hand-set infonce_term_weights hierarchy.
+    #
+    # Each term is currently a weighted mean, normalised by the gate's own sum,
+    # so a gate shared by the whole batch cancels exactly and the gate can only
+    # reweight samples inside a term. Normalising by the batch size instead lets
+    # the term shrink with the share of the compass the two views see. Measured
+    # over P12's curriculum the resulting scalars land at
+    #   q1-r1 1.00  q1-q2 0.44  r1-r2 0.50  r1-q2 0.44  r2-q1 0.50  r2-q2 0.22
+    # against SinGeo's hand-set 1, .5, .5, .25, .25, .25 -- four of six within
+    # 0.06, with the two cross terms r1-q2 and r2-q1 about twice as heavy.
+    #
+    # Needs overlap_gated_infonce=True and is only informative with
+    # overlap_gate_measure="circle"; pair it with uniform infonce_term_weights
+    # so the geometry is the only thing setting the balance.
+    infonce_gate_scales_terms: bool = False
+
+    # Renormalise the six gate-derived weights onto a fixed total each batch, so
+    # the geometry sets how weight is DISTRIBUTED without also setting how much
+    # there is. Without it the total falls 5.83 -> 3.11 across the run (measured
+    # on P12's curriculum), a 47% loss-scale decay stacked on the cosine LR --
+    # an unintended second change bundled into the mechanism.
+    #
+    # The target defaults to sum(SINGEO_TERM_WEIGHTS) = 2.75, which is nothing
+    # but SinGeo's hierarchy added up. Any constant removes the drift; this one
+    # also leaves InfoNCE on the baseline's scale, so rnc_weight keeps meaning
+    # what it meant in roundP12. Needs infonce_gate_scales_terms.
+    # Rank dynamic similarity sampling at the FoV the epoch ACTUALLY trained on,
+    # measured from the recorded crop extents, instead of an analytic stand-in.
+    # The stand-ins are central values, not means: the log-uniform geometric
+    # mean sits ~19 deg below the arithmetic mean all run, and the Gaussian
+    # pre-clip mean is 8 deg low at epoch 80 once the clip piles mass at 70.
+    # Measured during training and applied before calc_sim in the SAME epoch, so
+    # it costs no lag. Off by default so earlier runs stay reproducible.
+    dss_fov_from_measured: bool = True
+
+    infonce_gate_normalise_mass: bool = False
+    infonce_gate_mass_target: Optional[float] = None
 
     conv_padding_mode: str = "zeros"
 
@@ -742,12 +806,25 @@ def write_run_info(path, cfg, run_name, note, overrides):
             rotation_text,
             ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
         lines.append("InfoNCE overlap gating: {}".format(
-            "ON  - each positive weighted by the containment overlap of the two views' arcs,"
+            "ON  - each positive weighted by the {} overlap of the two views' arcs,".format(
+                cfg.overlap_gate_measure)
             if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
         lines.append("  {}".format(
             "so a wedge pointing away from the ground crop cannot assert a false positive."
             if cfg.overlap_gated_infonce
             else "including the ~31% that share no azimuth at all late in the curriculum."))
+        if getattr(cfg, "infonce_gate_scales_terms", False):
+            lines.append("  the gate also scales each TERM (divided by batch size, not by the gate")
+            lines.append("  sum), so a batch-shared overlap no longer cancels and the geometry sets")
+            lines.append("  the between-term balance in place of the hand-set hierarchy.")
+            tgt = getattr(cfg, "infonce_gate_mass_target", None)
+            if getattr(cfg, "infonce_gate_normalise_mass", False):
+                tgt = sum((1.0, 0.5, 0.5, 0.25, 0.25, 0.25)) if tgt is None else tgt
+                lines.append("  mass renormalised to a fixed total of {:.2f} every batch, so this run".format(tgt))
+                lines.append("  differs from the hierarchy ONLY in how that mass is distributed.")
+            else:
+                lines.append("  mass NOT renormalised: the six weights sum to ~5.8 early and ~3.1 late,")
+                lines.append("  so the loss scale drifts down ~47% on top of the cosine LR schedule.")
     default_terms = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
     if tuple(cfg.infonce_term_weights) != default_terms:
         names = ("q1-r1", "q1-q2", "r1-r2", "r1-q2", "r2-q1", "r2-q2")
@@ -759,7 +836,31 @@ def write_run_info(path, cfg, run_name, note, overrides):
     lines.append("")
 
     lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))
-    if cfg.fov_sampling.startswith("loguniform"):
+    if cfg.fov_sampling.startswith("gaussian"):
+        lines.append("  fresh FoV per {} from N(mean, {}) clipped to [{}, 360],".format(
+            "BATCH" if cfg.fov_sampling == "gaussian_batch" else "SAMPLE",
+            cfg.fov_gaussian_std,
+            cfg.fov_gaussian_clip_lo if cfg.fov_gaussian_clip_lo is not None
+            else cfg.fov_curriculum_end))
+        if cfg.fov_gaussian_clip_lo is not None and cfg.fov_gaussian_clip_lo < cfg.fov_curriculum_end:
+            lines.append("  clip floor {} sits BELOW the mean endpoint {}, so the lower tail".format(
+                cfg.fov_gaussian_clip_lo, cfg.fov_curriculum_end))
+            lines.append("  survives instead of piling on one width.")
+        if cfg.fov_sampling == "gaussian_batch":
+            lines.append("  one draw per batch, so unpadded crops of equal width still collate.")
+        if cfg.fov_gaussian_ramp_frac >= 1.0:
+            lines.append("  with the mean walked linearly 360 -> {} deg across the whole run,".format(
+                cfg.fov_curriculum_end))
+            lines.append("  so it only reaches {} deg in the final epoch.".format(
+                cfg.fov_curriculum_end))
+        else:
+            lines.append("  with the mean walked linearly 360 -> {} deg over the first {:.0%}".format(
+                cfg.fov_curriculum_end, cfg.fov_gaussian_ramp_frac))
+            lines.append("  of the run (epoch {:.0f}), then held there for the rest.".format(
+                cfg.epochs * cfg.fov_gaussian_ramp_frac))
+        lines.append("  A narrow band that slides, not a widening support: an epoch trains on a")
+        lines.append("  tight range of widths instead of mixing 70 and 360 deg crops throughout.")
+    elif cfg.fov_sampling.startswith("loguniform"):
         lines.append("  fresh FoV per {} from [floor, 360], floor ramping 360 -> {} deg".format(
             "batch" if cfg.fov_sampling == "loguniform_batch" else "sample",
             cfg.fov_curriculum_end))
@@ -770,6 +871,10 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    lines.append("DSS ranking FoV: {}".format(
+        "measured from the epoch's own crop extents, applied before calc_sim in the same epoch"
+        if getattr(cfg, "dss_fov_from_measured", False)
+        else "analytic representative (log-uniform geometric mean / Gaussian pre-clip mean)"))
     if cfg.overlap_gated_infonce and cfg.overlap_gate_measure != "containment":
         lines.append("InfoNCE gate measure: {} (every term weighted, not just loss6)".format(
             cfg.overlap_gate_measure))
@@ -1155,7 +1260,11 @@ if __name__ == '__main__':
     print("Using InfoNCE Loss")
     loss_function = InfoNCE(loss_function=loss_fn,
                         device=config.device,
+                        gate_scales_terms=config.infonce_gate_scales_terms,
                         )
+    if config.infonce_gate_scales_terms:
+        print("InfoNCE gate scales the terms: each term is normalised by the batch size, "
+              "not by the gate sum, so the overlap sets the between-term balance too")
 
     rnc_loss = None
     distance_builder = None
@@ -1203,12 +1312,35 @@ if __name__ == '__main__':
     if not config.use_rnc:
         print("InfoNCE overlap gating: n/a (no RNC -> no recorded arcs)")
     elif config.overlap_gated_infonce:
-        print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
+        print("InfoNCE overlap gating: on, measure {!r} ({})".format(
+            config.overlap_gate_measure,
+            "every term weighted by the share of the compass both views see"
+            if config.overlap_gate_measure == "circle"
+            else "1.0 for any pair with a full 360 deg side, so only loss6 is gated"))
     else:
         print("InfoNCE overlap gating: off")
     if config.rnc_hardest_negative and not config.rnc_positives_only:
         raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
                          "every negative is already in the rank sets")
+
+    if config.infonce_gate_normalise_mass and not config.infonce_gate_scales_terms:
+        raise ValueError(
+            "infonce_gate_normalise_mass needs infonce_gate_scales_terms=True: without it the "
+            "gate is normalised away inside each term, so there is no gate mass to rescale.")
+    if config.infonce_gate_scales_terms:
+        if not config.overlap_gated_infonce:
+            raise ValueError("infonce_gate_scales_terms needs overlap_gated_infonce=True: with no "
+                             "gate there are no per-pair weights for the terms to be scaled by")
+        if config.overlap_gate_measure != "circle":
+            print("!! WARNING: infonce_gate_scales_terms with overlap_gate_measure="
+                  "{!r}. 'containment' is 1.0 for any pair with a full 360 deg side, so five of "
+                  "the six terms would scale by 1.0 and no hierarchy can appear. Use 'circle'."
+                  .format(config.overlap_gate_measure))
+        if tuple(config.infonce_term_weights) != (1.0,) * 6:
+            print("!! WARNING: infonce_gate_scales_terms is on but infonce_term_weights is {}. "
+                  "The geometry and the hand-set hierarchy will both be applied, multiplying "
+                  "together. Set all six to 1.0 to let the gate alone set the balance."
+                  .format(config.infonce_term_weights))
 
     if config.fov_border_q1 and not config.fov_border_px:
         raise ValueError("fov_border_q1 needs fov_border_px > 0: there is no border to add")
@@ -1273,9 +1405,27 @@ if __name__ == '__main__':
             "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
             "on the dataset path, which return_meta enables).")
 
-    if config.fov_sampling not in ("loguniform", "loguniform_batch", "deterministic"):
-        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch' or "
-                         "'deterministic', got {!r}".format(config.fov_sampling))
+    if config.fov_sampling not in ("loguniform", "loguniform_batch", "gaussian",
+                                   "gaussian_batch", "deterministic"):
+        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch', 'gaussian', "
+                         "'gaussian_batch' or 'deterministic', got {!r}".format(config.fov_sampling))
+    if config.fov_sampling.startswith("gaussian"):
+        if config.fov_sampling == "gaussian" and not (config.fov_pad or config.fov_pad_batch_max):
+            raise ValueError(
+                "fov_sampling='gaussian' needs fov_pad=True: the draw is per sample, so crop "
+                "widths differ inside a batch and default_collate cannot stack them. Use "
+                "'gaussian_batch' to run a Gaussian band unpadded, e.g. under a border.")
+        if not config.use_rnc:
+            raise ValueError(
+                "fov_sampling='gaussian' needs use_rnc=True (the per-sample draw lives in "
+                "CVUSADatasetTrainSinGeo, which only crops when return_meta is on).")
+        if config.fov_gaussian_std <= 0:
+            raise ValueError("fov_gaussian_std must be > 0, got {}".format(config.fov_gaussian_std))
+        if config.fov_gaussian_ramp_frac > 1.0:
+            raise ValueError(
+                "fov_gaussian_ramp_frac must be <= 1.0 (a fraction of the run), got {}. "
+                "1.0 descends across every epoch; <= 0 starts at fov_curriculum_end."
+                .format(config.fov_gaussian_ramp_frac))
     if config.fov_sampling == "loguniform" and not (config.fov_pad or config.fov_pad_batch_max):
         raise ValueError(
             "fov_sampling='loguniform' needs fov_pad=True: per-sample draws give each sample a "
@@ -1421,7 +1571,19 @@ if __name__ == '__main__':
         # representative value used for the sim-sampling loader (which needs one
         # fixed FoV to rank with) and for logging. The geometric mean of the
         # draw is the honest representative, so use that.
-        if config.fov_sampling.startswith("loguniform"):
+        fov_mean = None
+        if config.fov_sampling.startswith("gaussian"):
+            # The band centre. `fov_dynamic` is the representative the
+            # sim-sampling loader and the logs need, and for a symmetric draw
+            # the mean is that representative -- clipped, since the loader
+            # cannot be handed a FoV outside the legal range.
+            fov_mean = get_gaussian_fov_mean(epoch, config.epochs,
+                                             fov_start=360.0,
+                                             fov_end=config.fov_curriculum_end,
+                                             ramp_frac=config.fov_gaussian_ramp_frac)
+            fov_floor = None
+            fov_dynamic = min(360.0, max(config.fov_curriculum_end, fov_mean))
+        elif config.fov_sampling.startswith("loguniform"):
             fov_floor = get_dynamic_fov_floor(epoch, config.epochs,
                                               fov_start=360.0,
                                               fov_end=config.fov_curriculum_end,
@@ -1458,7 +1620,13 @@ if __name__ == '__main__':
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
         
-        if fov_floor is None:
+        if fov_mean is not None:
+            settled = "" if config.fov_gaussian_ramp_frac >= 1.0 else (
+                ", mean settles at e{:.0f}".format(config.epochs * config.fov_gaussian_ramp_frac))
+            print(f"For Epoch {epoch}: Ground FOV ~ N({fov_mean:.2f}, {config.fov_gaussian_std:.1f}) "
+                  f"clipped to [{(config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None else config.fov_curriculum_end):.0f}, 360]{settled}"
+                  f"{', padded to full width' if config.fov_pad else ''}")
+        elif fov_floor is None:
             print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
                   f"{' (padded to full width)' if config.fov_pad else ''}")
         else:
@@ -1475,8 +1643,17 @@ if __name__ == '__main__':
             # Per-batch mode needs the batch width and the epoch so the draw is
             # reproducible from the batch index in every worker.
             train_dataloader.dataset.fov_batch_size = (
-                config.batch_size if config.fov_sampling == "loguniform_batch" else None)
+                config.batch_size
+                if config.fov_sampling in ("loguniform_batch", "gaussian_batch") else None)
             train_dataloader.dataset.fov_epoch = epoch
+            # Gaussian band. `None` outside that mode, which keeps the
+            # log-uniform path in the dataset untouched.
+            train_dataloader.dataset.ground_fov_mean = fov_mean
+            train_dataloader.dataset.ground_fov_std = config.fov_gaussian_std
+            train_dataloader.dataset.fov_lo = (
+                config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None
+                else config.fov_curriculum_end)
+            train_dataloader.dataset.fov_hi = 360.0
             train_dataloader.dataset.fov_border_px = config.fov_border_px
             train_dataloader.dataset.fov_border_q1 = config.fov_border_q1
 
@@ -1559,6 +1736,25 @@ if __name__ == '__main__':
                 print(f"Extra eval with FoV {extra_fov}: R@1 = {r1_test_extra:.4f}")
             # after we evaluate, we update the similiarity sampling dictionary for training the dataset.
             if config.sim_sample:
+                # Re-aim the sim-sampling crop at the FoV this epoch really
+                # trained on. The transform set before training used an analytic
+                # representative; the trainer has since published the measured
+                # mean, and calc_sim has not run yet, so applying it here costs
+                # no epoch of lag.
+                measured = getattr(train_dataloader.dataset, "measured_ground_fov", None)
+                if config.dss_fov_from_measured and measured:
+                    _, ground_transforms_measured = get_transforms_val(
+                        image_size_sat, img_size_ground, mean=mean, std=std,
+                        fov=measured,
+                        fov_pad=config.fov_pad,
+                        fov_pad_random_start=config.fov_pad_random_start,
+                        fov_border_px=config.fov_border_px,
+                        fov_scatter_pad=config.fov_pad_batch_max,
+                        fov_gap_segments=config.fov_gap_segments,
+                    )
+                    query_dataloader_train.dataset.transforms = ground_transforms_measured
+                    print("DSS FoV: measured {:.2f} deg this epoch "
+                          "(analytic representative was {:.2f})".format(measured, fov_dynamic))
                 r1_train, sim_dict = calc_sim(config=config, # Update the sim_dict when training with dynamic_fov
                                               model=model,
                                               reference_dataloader=reference_dataloader_train,

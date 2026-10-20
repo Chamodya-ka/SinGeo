@@ -5,11 +5,18 @@ import torch.distributed.nn
 
 class InfoNCE(nn.Module):
 
-    def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, loss_function, device='cuda' if torch.cuda.is_available() else 'cpu',
+                 gate_scales_terms=False):
         super().__init__()
 
         self.loss_function = loss_function
         self.device = device
+        # See the `weights` note in forward(): dividing by w.sum() makes each
+        # term a weighted MEAN, which normalises the gate away and leaves the
+        # between-term balance entirely to infonce_term_weights. Dividing by the
+        # batch size instead keeps it, so the same gate sets both how much a
+        # sample counts inside a term and how much the term counts overall.
+        self.gate_scales_terms = gate_scales_terms
 
     def forward(self, image_features1, image_features2, logit_scale, weights=None):
         """
@@ -60,7 +67,20 @@ class InfoNCE(nn.Module):
 
         # Weighted mean of each direction, then averaged -- which is what the
         # unweighted branch above computes when every weight is 1.
-        denominator = w.sum().clamp(min=1e-6)
+        #
+        # `gate_scales_terms` divides by the batch size instead. The per-sample
+        # weighting is unchanged; what changes is that a gate shared by the whole
+        # batch no longer cancels, so the term shrinks in proportion to how much
+        # compass the two views actually share. That is the between-term job
+        # `infonce_term_weights` does by hand, handed back to the geometry.
+        #
+        # Only informative under the 'circle' measure: 'containment' returns 1.0
+        # for any pair with a full 360 degree side, so five of the six terms
+        # would scale by 1.0 and no hierarchy could appear.
+        if self.gate_scales_terms:
+            denominator = float(w.numel())
+        else:
+            denominator = w.sum().clamp(min=1e-6)
         loss = ((w * per_sample1).sum() + (w * per_sample2).sum()) / (2.0 * denominator)
 
         return loss

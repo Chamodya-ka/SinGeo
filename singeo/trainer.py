@@ -958,6 +958,15 @@ def train_contrast_singeo(train_config, model, dataloader, loss_function, optimi
 
 
 
+# SinGeo's published per-term weight hierarchy. Named because three places need
+# it: the default for `infonce_term_weights`, the info.txt comparison, and the
+# mass target below -- and because its SUM, 2.75, is the budget the gate-scaled
+# weights are renormalised onto. Nothing derives 2.75; it is simply this tuple
+# added up, and it is the right budget only because matching the baseline's
+# total keeps `rnc_weight` meaning the same thing in both objectives.
+SINGEO_TERM_WEIGHTS = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+
+
 def _pair_overlap_gate(arc_a, arc_b, measure="containment"):
     """`[B]` weight for each aligned (view a, view b) pair, from their arcs.
 
@@ -1048,13 +1057,40 @@ def _singeo_infonce_terms(train_config, model, loss_function,
     # default path stays bit-identical; `tests/test_rnc.py` pins that. Zeroed
     # terms are still computed (they are 16x16 matmuls) so the per-term logging
     # keeps reporting what the dropped pairs would have cost.
-    weights = getattr(train_config, 'infonce_term_weights',
-                      (1.0, 0.5, 0.5, 0.25, 0.25, 0.25))
+    weights = getattr(train_config, 'infonce_term_weights', SINGEO_TERM_WEIGHTS)
     if len(weights) != 6:
         raise ValueError("infonce_term_weights needs 6 entries (loss1..loss6), got {}"
                          .format(len(weights)))
 
     total = sum(w * t for w, t in zip(weights, terms))
+
+    # Renormalise the gate's total mass.
+    #
+    # With `infonce_gate_scales_terms` each term carries its own mean gate, so
+    # the objective is sum_i mean(w_i) * L_i. Those scalars set two things at
+    # once: how weight is DISTRIBUTED across terms, which is the point, and how
+    # much weight there is in TOTAL, which is not. Measured over P12's
+    # curriculum the total falls from 5.83 at epoch 1 to 3.11 at epoch 80 -- a
+    # 47% decay in loss scale stacked on the cosine LR schedule, which is an
+    # unintended second change rather than part of the mechanism.
+    #
+    # Rescaling onto a fixed budget keeps the geometry setting the proportions
+    # while pinning the sum, so a run differs from the hand-set hierarchy ONLY
+    # in how the mass is shared out. Any constant removes the drift; the sum of
+    # SINGEO_TERM_WEIGHTS is the one that also leaves InfoNCE on the same scale
+    # it had in the baseline, so rnc_weight keeps its meaning.
+    #
+    # The gates come from recorded arc metadata, not from model outputs, so
+    # `scale` carries no gradient and needs no detach. Kept as a tensor rather
+    # than a float to avoid a device sync every step.
+    if (gate and getattr(train_config, 'infonce_gate_scales_terms', False)
+            and getattr(train_config, 'infonce_gate_normalise_mass', False)):
+        target = getattr(train_config, 'infonce_gate_mass_target', None)
+        if target is None:
+            target = sum(SINGEO_TERM_WEIGHTS)
+        gate_mass = sum(w.mean() for w in (w1, w2, w3, w4, w5, w6))
+        total = total * (float(target) / gate_mass.clamp(min=1e-6))
+
     return total, terms
 
 
@@ -1099,6 +1135,22 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
 
     losses = AverageMeter()
     rnc_meters = {key: AverageMeter() for key in ('g2a', 'g2g', 'a2g', 'a2a')}
+    # Realised ground FoV, averaged over every sample the epoch actually trained
+    # on. `meta[M_GROUND_EXTENT]` is the extent AFTER column quantisation, so
+    # this is the width the encoder saw, not the width that was drawn.
+    #
+    # Dynamic similarity sampling needs one representative FoV to rank with, and
+    # the analytic stand-ins diverge from the realised distribution: the
+    # log-uniform geometric mean sits ~19 deg below the arithmetic mean for a
+    # whole run, and the Gaussian pre-clip mean is 8 deg low at epoch 80 once
+    # the clip piles mass on the floor. Measuring removes the need for a
+    # closed form per distribution.
+    # Plain accumulators, not AverageMeter: that class's update() takes no
+    # sample count, so averaging batch means would silently assume every batch
+    # is the same size. Summing extents and dividing by the sample count is
+    # exact whatever the batch sizes are.
+    fov_extent_sum = 0.0
+    fov_extent_n = 0
 
     use_rnc = rnc_loss is not None and distance_builder is not None
     rnc_weight = getattr(train_config, 'rnc_weight', 1.0)
@@ -1135,6 +1187,9 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     # for loop over one epoch
     for batch in bar:
         query1, query2, reference1, reference2, ids, meta = batch[:6]
+        if meta is not None and meta.numel():
+            fov_extent_sum += float(meta[:, M_GROUND_EXTENT].sum())
+            fov_extent_n += int(meta.shape[0])
         # Present only when the dataset emits it. batch[7], the wedge coverage, is
         # carried for later loss work and not used here.
         aerial_mask = batch[6] if len(batch) > 6 else None
@@ -1260,6 +1315,16 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     if use_rnc:
         print("RNC epoch averages - " + " ".join(
             "{}: {:.4f}".format(key, rnc_meters[key].avg) for key in ('g2a', 'g2g', 'a2g', 'a2a')))
+
+    # Published on the dataset rather than returned, so the signature stays
+    # compatible with every existing caller (train_singeo_cvact.py included).
+    # The training script reads it after this returns and before calc_sim runs,
+    # which is why using it costs no epoch of lag.
+    if fov_extent_n:
+        try:
+            dataloader.dataset.measured_ground_fov = fov_extent_sum / fov_extent_n
+        except AttributeError:
+            pass
 
     return losses.avg
 

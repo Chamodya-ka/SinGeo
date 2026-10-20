@@ -1,12 +1,15 @@
 import math
 import ast
 import os
+import numpy as np
+import scipy.io as sio
 import time
 import shutil
 import sys
 import torch
 import pickle
 from dataclasses import dataclass
+from typing import Optional
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -31,7 +34,8 @@ from singeo.model import TimmModel_SinGeo
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
 from singeo.loss import InfoNCE, RankNContrast
-from singeo.distances import GeoNeighbourRanks, GeoCoordinates, SatelliteEmbeddings, RnCDistanceBuilder
+from singeo.distances import (GeoNeighbourRanks, GeoCoordinates, ProjectedCoordinates,
+                              SatelliteEmbeddings, RnCDistanceBuilder)
 from singeo.model import PADDING_MODES, TimmModel_SinGeo, set_conv_padding_mode
 from singeo.visualize import RnCSampleVisualizer
 from singeo.evaluate.cvusa_and_cvact import evaluate, calc_sim
@@ -98,6 +102,20 @@ class Configuration:
     rnc_negative_margin: float = 2e-1
     rnc_positive_overlap: str = "circle"
     negative_tiering: str = "none"
+    # "geo" tiering on CVACT reads UTM eastings/northings straight out of
+    # ACT_data.mat -- the release carries no latitude/longitude at all, so the
+    # haversine path CVUSA uses has nothing to consume. Within zone 55S the
+    # plane is metric, so the planar distance is exact, not an approximation.
+    # Rank dynamic similarity sampling at the FoV the epoch ACTUALLY trained on,
+    # measured from the recorded crop extents, instead of an analytic stand-in.
+    # The stand-in is a central value, not a mean: the log-uniform geometric
+    # mean sits ~19 deg below the arithmetic mean for a whole run. Measured
+    # during training and applied before calc_sim in the SAME epoch, so it costs
+    # no lag. Off by default so earlier runs stay reproducible.
+    dss_fov_from_measured: bool = False
+
+    rnc_geo_source: str = "utm"            # CVACT has only the one source
+    rnc_geo_max_km: Optional[float] = None  # None -> normalise by the batch max
     
     aerial_ramp_frac: float = 1.0
     aerial_rotation: str = "continuous"
@@ -338,7 +356,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
             rotation_text,
             ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
         lines.append("InfoNCE overlap gating: {}".format(
-            "ON  - each positive weighted by the containment overlap of the two views' arcs,"
+            "ON  - each positive weighted by the {} overlap of the two views' arcs,".format(
+                cfg.overlap_gate_measure)
             if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
         lines.append("  {}".format(
             "so a wedge pointing away from the ground crop cannot assert a false positive."
@@ -366,6 +385,10 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    lines.append("DSS ranking FoV: {}".format(
+        "measured from the epoch's own crop extents, applied before calc_sim in the same epoch"
+        if getattr(cfg, "dss_fov_from_measured", False)
+        else "analytic representative (the log-uniform geometric mean)"))
     if cfg.overlap_gated_infonce and cfg.overlap_gate_measure != "containment":
         lines.append("InfoNCE gate measure: {} (every term weighted, not just loss6)".format(
             cfg.overlap_gate_measure))
@@ -706,6 +729,34 @@ if __name__ == '__main__':
     geo_ranks = None
     geo_coords = None
     sat_embeddings = None
+
+    # Geographic tiering ranks negatives by how far apart they really are,
+    # instead of flattening every negative onto 1.0. On CVACT that ordering is
+    # the whole point: the GPS sampler fills each batch from an anchor's 128
+    # nearest neighbours, which on a single-city dataset sit a median 9.9 m
+    # (nearest) to 278.7 m (128th) away. Telling the loss that a 10 m negative
+    # is not as negative as a 5 km one is the difference between a graded
+    # target and label noise.
+    if config.use_rnc and not config.rnc_positives_only \
+            and config.negative_tiering == "geo":
+        anu = sio.loadmat("{}/ACT_data.mat".format(config.data_folder))
+        sel = np.asarray(anu["trainSet"][0][0][1] - 1).squeeze()
+        sel_ids, sel_utm = anu["panoIds"][sel].squeeze(), anu["utm"][sel].squeeze()
+        # Walk the split exactly as CVACTDatasetTrainSinGeo does, skipping the
+        # pairs missing from disk, so row i here is the label i the dataset emits.
+        coords, i = {}, 0
+        for pid, (east, north) in zip(sel_ids, sel_utm):
+            pid = str(pid)
+            grd = "{}/ANU_data_small/streetview/{}_grdView.jpg".format(config.data_folder, pid)
+            sat = "{}/ANU_data_small/satview_polish/{}_satView_polish.jpg".format(config.data_folder, pid)
+            if os.path.exists(grd) and os.path.exists(sat):
+                coords[i] = (float(east), float(north))
+                i += 1
+        geo_coords = ProjectedCoordinates(coords)
+        print("RNC geo tiering: {} UTM coordinates from ACT_data.mat (max {})".format(
+            len(coords), "batch max" if config.rnc_geo_max_km is None
+            else "{:.0f} km".format(config.rnc_geo_max_km)))
+
     if config.use_rnc:
         rnc_loss = RankNContrast(temperature=config.rnc_tau,
                                     similarity=config.rnc_similarity,
@@ -720,7 +771,7 @@ if __name__ == '__main__':
                                                 negative_margin=config.rnc_negative_margin,
                                                 geo_ranks=geo_ranks,
                                                 geo_coords=geo_coords,
-                                                geo_max_km=None,
+                                                geo_max_km=config.rnc_geo_max_km,
                                                 positive_overlap=config.rnc_positive_overlap,
                                                 sat_embeddings=sat_embeddings)
         print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
@@ -750,7 +801,11 @@ if __name__ == '__main__':
     if not config.use_rnc:
         print("InfoNCE overlap gating: n/a (no RNC -> no recorded arcs)")
     elif config.overlap_gated_infonce:
-        print("InfoNCE overlap gating: on (loss6 weighted by q2/r2 arc containment)")
+        print("InfoNCE overlap gating: on, measure {!r} ({})".format(
+            config.overlap_gate_measure,
+            "every term weighted by the share of the compass both views see"
+            if config.overlap_gate_measure == "circle"
+            else "1.0 for any pair with a full 360 deg side, so only loss6 is gated"))
     else:
         print("InfoNCE overlap gating: off")
     if config.rnc_hardest_negative and not config.rnc_positives_only:
@@ -1100,6 +1155,24 @@ if __name__ == '__main__':
                 print(f"Extra eval with FoV {extra_fov}: R@1 = {r1_test_extra:.4f}")
             
             if config.sim_sample:
+                # Re-aim the sim-sampling crop at the FoV this epoch really
+                # trained on. The transform set before training used an analytic
+                # representative; the trainer has since published the measured
+                # mean, and calc_sim has not run yet, so this costs no lag.
+                measured = getattr(train_dataloader.dataset, "measured_ground_fov", None)
+                if config.dss_fov_from_measured and measured:
+                    _, ground_transforms_measured = get_transforms_val(
+                        image_size_sat, img_size_ground, mean=mean, std=std,
+                        fov=measured,
+                        fov_pad=config.fov_pad,
+                        fov_pad_random_start=config.fov_pad_random_start,
+                        fov_border_px=config.fov_border_px,
+                        fov_scatter_pad=config.fov_pad_batch_max,
+                        fov_gap_segments=config.fov_gap_segments,
+                    )
+                    query_dataloader_train.dataset.transforms = ground_transforms_measured
+                    print("DSS FoV: measured {:.2f} deg this epoch "
+                          "(analytic representative was {:.2f})".format(measured, fov_dynamic))
                 r1_train, sim_dict = calc_sim(config=config,
                                               model=model,
                                               reference_dataloader=reference_dataloader_train,

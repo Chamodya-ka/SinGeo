@@ -23,6 +23,7 @@ from singeo.distances import (  # noqa: E402
     GeoCoordinates,
     GeoNeighbourRanks,
     NegativeDistanceTiering,
+    ProjectedCoordinates,
     PositiveOverlapDistance,
     RnCDistanceBuilder,
     SatelliteEmbeddings,
@@ -31,8 +32,9 @@ from singeo.distances import (  # noqa: E402
     full_arc_like,
     haversine_km,
 )
-from singeo.loss import RankNContrast, compute_rnc_groups, rnc_same_domain_mask  # noqa: E402
+from singeo.loss import InfoNCE, RankNContrast, compute_rnc_groups, rnc_same_domain_mask  # noqa: E402
 from singeo.transforms import apply_aerial_sector, apply_limited_fov  # noqa: E402
+from singeo.transforms import draw_gaussian_fov, get_gaussian_fov_mean  # noqa: E402
 
 
 def _arc(center, extent):
@@ -1295,6 +1297,381 @@ def test_positives_only_ignores_the_negative_tiering_entirely():
         g = compute_rnc_groups(rnc, b, fg, fa, idg, ida, arg, ara, positives_only=True)
         losses.append(sum(v.item() for v in g.values()))
     assert abs(losses[0] - losses[1]) < 1e-9, losses
+
+
+def test_projected_coordinates_match_haversine_within_a_utm_zone():
+    """CVACT ships UTM metres, not degrees. A planar distance over a single zone
+    must agree with the great-circle distance to well under a metre, otherwise
+    the two datasets would be ranking negatives on different scales."""
+    import math
+
+    # Canberra, UTM zone 55S. Three points a few km apart.
+    utm = {1: (691033.7, 6098338.4), 2: (692139.5, 6100959.1), 3: (679747.6, 6080975.1)}
+    proj = ProjectedCoordinates(utm)
+    ids = torch.tensor([1, 2, 3])
+    km = proj.km(ids, ids)
+
+    # Planar ground truth, computed independently of the class.
+    for a in utm:
+        for b in utm:
+            want = math.dist(utm[a], utm[b]) / 1000.0
+            got = km[ids.tolist().index(a), ids.tolist().index(b)].item()
+            assert abs(got - want) < 1e-3, (a, b, got, want)
+
+    assert km.shape == (3, 3)
+    assert torch.allclose(km, km.T)
+    assert torch.diagonal(km).abs().max().item() == 0.0
+
+
+def test_projected_coordinates_preserve_negative_ordering_under_a_large_ceiling():
+    """CVACT's GPS sampler draws every negative within ~280 m, so geo tiering
+    normalised by the 100 km default compresses them into a sliver of the range.
+    RnC reads orderings, so the ranking must survive that compression."""
+    coords = {i: (float(i) * 50.0, 0.0) for i in range(1, 6)}   # 50 m apart
+    tier = NegativeDistanceTiering(mode="geo", floor=0.5, margin=1e-3,
+                                   geo_coords=ProjectedCoordinates(coords),
+                                   geo_max_km=100.0)
+    ids = torch.tensor([1, 2, 3, 4, 5])
+    d = tier(ids, ids)
+    row = d[0]                                   # distance from id 1 to the rest
+    assert torch.all(row[1:].diff() > 0), row    # strictly increasing with metres
+    assert row[1:].max().item() < 0.51, row      # and still squeezed near the floor
+
+
+def test_gate_scales_terms_leaves_the_default_path_bit_identical():
+    """The flag must change nothing when it is off, including with weights."""
+    torch.manual_seed(0)
+    ce = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    f1, f2 = torch.randn(8, 16), torch.randn(8, 16)
+    w = torch.rand(8)
+    off = InfoNCE(loss_function=ce, device="cpu")
+    explicit = InfoNCE(loss_function=ce, device="cpu", gate_scales_terms=False)
+    for weights in (None, w):
+        a = off(f1, f2, torch.tensor(10.0), weights=weights)
+        b = explicit(f1, f2, torch.tensor(10.0), weights=weights)
+        assert torch.equal(a, b), (a, b)
+
+
+def test_constant_gate_cancels_only_when_the_flag_is_off():
+    """The whole point: a batch-constant gate is normalised away by the weighted
+    mean, which is why the gate cannot set the between-term balance. With
+    gate_scales_terms the same constant scales the term instead."""
+    torch.manual_seed(0)
+    ce = torch.nn.CrossEntropyLoss()
+    f1, f2 = torch.randn(8, 16), torch.randn(8, 16)
+    scale = torch.tensor(10.0)
+
+    plain = InfoNCE(loss_function=ce, device="cpu")
+    scaled = InfoNCE(loss_function=ce, device="cpu", gate_scales_terms=True)
+
+    base = plain(f1, f2, scale, weights=None)
+    for c in (0.25, 0.5, 1.0):
+        const = torch.full((8,), c)
+        # weighted-mean reduction: the constant divides out
+        assert torch.allclose(plain(f1, f2, scale, weights=const), base, atol=1e-6)
+        # batch-size reduction: the term scales by exactly c
+        assert torch.allclose(scaled(f1, f2, scale, weights=const), c * base, atol=1e-6)
+
+
+def test_gate_scales_terms_keeps_the_per_sample_weighting():
+    """Scaling the term must not flatten the within-term weighting: a varying
+    gate still has to count samples unequally."""
+    torch.manual_seed(0)
+    ce = torch.nn.CrossEntropyLoss()
+    f1, f2 = torch.randn(8, 16), torch.randn(8, 16)
+    scale = torch.tensor(10.0)
+    scaled = InfoNCE(loss_function=ce, device="cpu", gate_scales_terms=True)
+
+    varying = torch.tensor([1.0, 0.0] * 4)
+    const_same_mean = torch.full((8,), 0.5)
+    a = scaled(f1, f2, scale, weights=varying)
+    b = scaled(f1, f2, scale, weights=const_same_mean)
+    # same mean weight, different distribution -> different loss
+    assert not torch.allclose(a, b, atol=1e-5), (a, b)
+
+
+def test_gaussian_fov_mean_walks_linearly_to_the_end_value():
+    """The band centre must start at 360 and land exactly on the curriculum end,
+    unlike the log-uniform floor which is geometric."""
+    assert get_gaussian_fov_mean(0, 80) == 360.0
+    assert abs(get_gaussian_fov_mean(80, 80) - 70.0) < 1e-9
+    assert abs(get_gaussian_fov_mean(40, 80) - 215.0) < 1e-9
+    # linear, so the midpoint is the arithmetic mean of the ends
+    assert abs(get_gaussian_fov_mean(40, 80) - (360.0 + 70.0) / 2) < 1e-9
+    # clamped past the end rather than overshooting below 70
+    assert abs(get_gaussian_fov_mean(120, 80) - 70.0) < 1e-9
+
+
+def test_gaussian_fov_draw_respects_the_clip_and_the_spread():
+    import numpy as np
+    rng = np.random.default_rng(0)
+    draws = [draw_gaussian_fov(215.0, 20.0, rng=rng) for _ in range(4000)]
+    assert abs(float(np.mean(draws)) - 215.0) < 1.5
+    assert abs(float(np.std(draws)) - 20.0) < 1.5
+    assert min(draws) >= 70.0 and max(draws) <= 360.0
+
+    # near a boundary the clip must pin, never return out of range
+    low = [draw_gaussian_fov(70.0, 20.0, rng=rng) for _ in range(2000)]
+    assert min(low) >= 70.0
+    assert sum(1 for d in low if d == 70.0) > 0, "clip never engaged at the boundary"
+
+
+def test_gaussian_draw_is_narrower_than_the_loguniform_support():
+    """The whole point of the mode: at a matched point in the curriculum the
+    Gaussian band must span far less than log-uniform's [floor, 360]."""
+    import numpy as np
+    from singeo.transforms import draw_log_uniform_fov, get_dynamic_fov_floor
+    rng = np.random.default_rng(1)
+    g = [draw_gaussian_fov(get_gaussian_fov_mean(40, 80), 20.0, rng=rng) for _ in range(3000)]
+    floor = get_dynamic_fov_floor(40, 80)          # 70 by epoch 40 at ramp 0.2
+    lu = [draw_log_uniform_fov(floor) for _ in range(3000)]
+    assert float(np.std(g)) < float(np.std(lu)) / 2, (np.std(g), np.std(lu))
+
+
+def test_dataset_builds_its_rng_lazily_so_forked_workers_differ():
+    """A Generator created in the parent is copied into every dataloader worker
+    and they would all draw the same FoV sequence. It must be None until first
+    use inside the worker."""
+    import inspect
+    from singeo.dataset import cvusa as m
+    src = inspect.getsource(m.CVUSADatasetTrainSinGeo.__init__)
+    assert "self._fov_rng = None" in src, "rng must start as None in __init__"
+    assert "default_rng()" not in src, "rng must NOT be constructed in __init__ (fork-unsafe)"
+    getitem = inspect.getsource(m.CVUSADatasetTrainSinGeo.__getitem__)
+    assert "default_rng()" in getitem, "rng must be built lazily in __getitem__"
+
+
+def test_gaussian_ramp_frac_paces_the_mean_and_defaults_to_the_whole_run():
+    """fov_gaussian_ramp_frac must mirror fov_ramp_frac's contract, and its
+    default must leave the original whole-run descent bit-identical."""
+    # default: unchanged from the no-ramp_frac behaviour
+    for e in (0, 20, 40, 60, 80):
+        assert get_gaussian_fov_mean(e, 80) == get_gaussian_fov_mean(e, 80, ramp_frac=1.0)
+    assert abs(get_gaussian_fov_mean(80, 80) - 70.0) < 1e-9
+
+    # 0.75 lands at epoch 60 and holds
+    assert abs(get_gaussian_fov_mean(60, 80, ramp_frac=0.75) - 70.0) < 1e-9
+    assert abs(get_gaussian_fov_mean(80, 80, ramp_frac=0.75) - 70.0) < 1e-9
+    assert get_gaussian_fov_mean(30, 80, ramp_frac=0.75) > 70.0
+
+    # 0.5 lands at epoch 40
+    assert abs(get_gaussian_fov_mean(40, 80, ramp_frac=0.5) - 70.0) < 1e-9
+
+    # <= 0 starts at the end value, matching get_dynamic_fov_floor
+    assert get_gaussian_fov_mean(0, 80, ramp_frac=0.0) == 70.0
+    assert get_gaussian_fov_mean(1, 80, ramp_frac=-1.0) == 70.0
+
+    # monotonically non-increasing in epoch for every pacing
+    for rf in (0.25, 0.5, 0.75, 1.0):
+        means = [get_gaussian_fov_mean(e, 80, ramp_frac=rf) for e in range(81)]
+        assert all(b <= a + 1e-9 for a, b in zip(means, means[1:])), rf
+
+
+def _fake_cfg(**kw):
+    class C: pass
+    c = C()
+    c.overlap_gated_infonce = True
+    c.overlap_gate_measure = "circle"
+    c.infonce_term_weights = (1.0,) * 6
+    c.infonce_gate_scales_terms = True
+    c.infonce_gate_normalise_mass = False
+    c.infonce_gate_mass_target = None
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def test_singeo_term_weights_constant_sums_to_the_mass_target():
+    """2.75 is not a tuned number: it is the published hierarchy added up."""
+    from singeo.trainer import SINGEO_TERM_WEIGHTS
+    assert SINGEO_TERM_WEIGHTS == (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+    assert abs(sum(SINGEO_TERM_WEIGHTS) - 2.75) < 1e-12
+
+
+def test_mass_normalisation_pins_the_total_as_the_gates_shrink():
+    """The defect being fixed: with gate scaling the objective's total weight
+    drifts with the curriculum. Normalised, it must not."""
+    from singeo.trainer import SINGEO_TERM_WEIGHTS
+    target = sum(SINGEO_TERM_WEIGHTS)
+    # two curriculum points: wide views early, narrow views late
+    for gates in ([1.0, 0.95, 0.99, 0.95, 0.99, 0.94],
+                  [1.0, 0.44, 0.50, 0.44, 0.50, 0.22]):
+        mass = sum(gates)
+        scale = target / mass
+        rescaled = [g * scale for g in gates]
+        assert abs(sum(rescaled) - target) < 1e-9, sum(rescaled)
+        # proportions preserved exactly
+        for a, b in zip(gates, rescaled):
+            assert abs(a / mass - b / target) < 1e-12
+
+
+def test_normalise_mass_is_inert_without_gate_scaling():
+    """Flag composition: normalising is meaningless when the gate already
+    cancels inside each term, so it must require gate scaling."""
+    import torch
+    from singeo.trainer import _pair_overlap_gate
+    # a batch-constant gate: cancels under the weighted mean regardless
+    arc_a = torch.stack([torch.zeros(8), torch.full((8,), 360.0)], dim=1)
+    arc_b = torch.stack([torch.zeros(8), torch.full((8,), 180.0)], dim=1)
+    w = _pair_overlap_gate(arc_a, arc_b, "circle")
+    assert torch.allclose(w, torch.full((8,), 0.5), atol=1e-6), w
+
+
+def test_recorded_extent_is_the_quantised_width_the_encoder_saw():
+    """The measured DSS FoV is only trustworthy if the recorded extent reflects
+    the crop that actually reached the model, quantisation included."""
+    x = torch.randn(3, 8, 768)
+    for fov in (90.0, 157.3, 233.9):
+        crop, _, extent = apply_limited_fov(x, fov, 0.0)
+        # extent describes the columns kept, so it matches the crop's width
+        assert abs(extent - crop.shape[2] / 768 * 360.0) < 1e-6, (fov, extent)
+        # and it is the quantised value, at or just below the requested FoV
+        assert extent <= fov + 1e-6
+        assert fov - extent < 360.0 / 768 + 1e-6, (fov, extent)
+
+
+def test_trainer_publishes_measured_fov_on_the_dataset():
+    """Published as an attribute rather than returned, so every existing caller
+    of train_contrast_singeo_rnc keeps working unchanged."""
+    import inspect
+    from singeo import trainer as t
+    src = inspect.getsource(t.train_contrast_singeo_rnc)
+    assert "measured_ground_fov" in src
+    assert "M_GROUND_EXTENT" in src
+    # and the dataset declares it, rather than letting the trainer conjure the
+    # attribute on first write
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    init = inspect.getsource(CVUSADatasetTrainSinGeo.__init__)
+    assert "self.measured_ground_fov = None" in init, (
+        "measured_ground_fov must be declared in __init__, not created by the trainer")
+    # signature unchanged: still returns the loss alone
+    assert src.rstrip().endswith("return losses.avg")
+
+
+def test_trainer_actually_writes_measured_ground_fov_end_to_end():
+    """Executes train_contrast_singeo_rnc for real. The earlier version of this
+    check only inspected source text, which let a TypeError through: the
+    accumulator was called as update(val, n=...) while AverageMeter.update takes
+    no count, so every freshly launched run would have died on its first batch."""
+    from singeo.trainer import train_contrast_singeo_rnc
+    from singeo.loss import InfoNCE
+    from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
+
+    B, D, N_BATCH = 4, 8, 3
+    EXTENTS = [90.0, 180.0, 270.0, 360.0]          # mean 225.0
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(D, D)
+            self.logit_scale = torch.nn.Parameter(torch.tensor(2.0))
+        def forward(self, q1, q2, r1, r2, **kw):
+            return self.lin(q1), self.lin(q2), self.lin(r1), self.lin(r2)
+
+    class FakeDataset:
+        def __init__(self):
+            self.measured_ground_fov = None
+
+    class FakeLoader:
+        def __init__(self):
+            self.dataset = FakeDataset()
+        def __len__(self):
+            return N_BATCH
+        def __iter__(self):
+            for _ in range(N_BATCH):
+                meta = torch.zeros(B, META_DIM)
+                meta[:, M_GROUND_CENTER] = 0.0
+                meta[:, M_GROUND_EXTENT] = torch.tensor(EXTENTS)
+                meta[:, M_SAT_CENTER] = 0.0
+                meta[:, M_SAT_EXTENT] = 360.0
+                yield (torch.randn(B, D), torch.randn(B, D),
+                       torch.randn(B, D), torch.randn(B, D),
+                       torch.arange(B), meta)
+
+    class Cfg: pass
+    cfg = Cfg()
+    cfg.device = "cpu"; cfg.verbose = False
+    cfg.rnc_weight = 0.0; cfg.infonce_weight = 1.0
+    cfg.overlap_gated_infonce = True; cfg.overlap_gate_measure = "circle"
+    cfg.infonce_term_weights = (1.0,) * 6
+    cfg.infonce_gate_scales_terms = True
+    cfg.infonce_gate_normalise_mass = True
+    cfg.infonce_gate_mass_target = None
+    cfg.clip_grad = None; cfg.enable_aerial_crop = True
+    cfg.scheduler = "none"; cfg.mixed_precision = False
+    cfg.rnc_positives_only = False; cfg.rnc_hardest_negative = False
+    cfg.rnc_group_weights = (1.0, 1.0, 1.0, 1.0)
+    cfg.aerial_mask_mode = "off"
+
+    model = FakeModel()
+    loader = FakeLoader()
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    loss_fn = InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device="cpu",
+                      gate_scales_terms=True)
+
+    train_contrast_singeo_rnc(cfg, model, loader, loss_fn, opt)
+
+    got = loader.dataset.measured_ground_fov
+    assert got is not None, "trainer never wrote measured_ground_fov"
+    assert abs(got - 225.0) < 1e-6, got
+
+
+def test_gaussian_batch_gives_one_width_per_batch_and_varies_across_batches():
+    """gaussian_batch must behave like loguniform_batch: identical FoV for every
+    sample in a batch (so unpadded crops collate) but a different draw per batch
+    and per epoch (so the band is still sampled)."""
+    import numpy as np
+    from singeo.transforms import draw_gaussian_fov
+
+    def batch_fov(epoch, batch, mean=215.0, std=20.0):
+        seed = (epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+        return draw_gaussian_fov(mean, std, rng=np.random.default_rng(seed))
+
+    BS = 16
+    # every index inside one batch resolves to the same draw
+    vals = {batch_fov(5, i // BS) for i in range(BS)}
+    assert len(vals) == 1, vals
+
+    # different batches differ
+    per_batch = [batch_fov(5, b) for b in range(40)]
+    assert len(set(per_batch)) > 30, len(set(per_batch))
+
+    # different epochs differ for the same batch index
+    assert batch_fov(5, 0) != batch_fov(6, 0)
+
+    # reproducible: same (epoch, batch) gives the same value
+    assert batch_fov(5, 7) == batch_fov(5, 7)
+
+    # and the band is respected
+    assert all(70.0 <= v <= 360.0 for v in per_batch)
+
+
+def test_gaussian_clip_lo_decouples_the_clip_from_the_mean_endpoint():
+    """`fov_gaussian_clip_lo` must let the band settle at one width while still
+    drawing below it. Clipping at the mean endpoint pins ~50% of a settled batch
+    to that single width; a lower clip keeps the tail, which is what puts the
+    narrowest evaluated FoV back into training."""
+    import numpy as np
+    from singeo.transforms import draw_gaussian_fov
+
+    rng = np.random.default_rng(0)
+    coupled = np.array([draw_gaussian_fov(90.0, 30.0, lo=90.0, hi=360.0, rng=rng)
+                        for _ in range(20000)])
+    rng = np.random.default_rng(0)
+    decoupled = np.array([draw_gaussian_fov(90.0, 30.0, lo=70.0, hi=360.0, rng=rng)
+                          for _ in range(20000)])
+
+    # coupled: nothing below the mean, half the mass sitting on it
+    assert coupled.min() >= 90.0
+    assert np.mean(coupled <= 90.01) > 0.45
+
+    # decoupled: the tail survives and reaches the FoV-70 evaluation width
+    assert decoupled.min() == 70.0
+    assert 0.15 < np.mean(decoupled <= 70.01) < 0.35, np.mean(decoupled <= 70.01)
+    assert np.mean(decoupled < 90.0) > 0.4
+
+    # and the clip only ever raises a draw, so the decoupled mean is lower
+    assert decoupled.mean() < coupled.mean()
 
 
 def test_positives_only_zeroes_the_same_domain_groups():

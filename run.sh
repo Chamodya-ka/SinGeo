@@ -33,6 +33,17 @@
 #   roundP10c positives-only RnC on P10b: (c) loss6 zeroed (d) loss6 kept, the +RnC delta
 #   roundP12  RnC over positives + the hardest negative, on the P4 protocol
 #   roundP12bc  P12 under the padded per-sample protocol (b) and at rnc_weight 0.5 (c)
+#   roundP13  P12 with all six InfoNCE term weights 1: what the hierarchy is worth
+#   roundP14  the gate sets the between-term balance instead of fixed weights
+#   roundP14warm  P14 warm started from its own e40 weights after a disk stall
+#   roundP15  P14 mechanism under panoramic padding + a narrow Gaussian FoV band
+#   roundP16  P14 with the gate's total mass renormalised: the clean version
+#   roundP17  P14 with a narrowing Gaussian FoV band instead of log-uniform
+#   roundP18  P16 on the padded protocol with per-SAMPLE Gaussian FoV draws
+#   roundP19  P18 with the Gaussian mean settling at epoch 24 instead of 80
+#   roundP20  padded masked learning, gate-share weights, 90 deg end sector
+#   roundP21  P20 with the Gaussian band and both curricula front-loaded
+#   roundP22  P19 without mass renormalisation, wider band centred at 90
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -43,7 +54,11 @@ set -euo pipefail
 REPO="/home/71/25021871/SinGeo"
 PY="/home/71/25021871/data/chamodya/venv/bin/python"
 OUT="/home/71/25021871/data/chamodya/Singeo_data"
-LOGS="$REPO/run_logs"
+# Console logs live on /data, not in the repo: the repo sits on the root
+# filesystem, which is shared and runs near full. A failed tqdm write there
+# deadlocked roundP14 at epoch 44 on 2026-10-15. log.txt in the checkpoint
+# directory stays the authoritative record either way.
+LOGS="/home/71/25021871/data/chamodya/Singeo_data/run_logs"
 
 cd "$REPO"
 mkdir -p "$LOGS"
@@ -1454,6 +1469,508 @@ crop, per batch log uniform FoV, wedge on with the aligned heading, quarter turn
 r2, disc mask off, no q1 roll, weight 0.25, tau 0.5, batch 16, 80 epochs.'
     ;;
 
+roundP14warm)
+    echo "Round P14warm - roundP14 restarted from its own epoch 40 weights [80 ep]"
+    echo "  NOT a clean control against roundP12: the LR and curriculum restart at epoch 1"
+    launch roundP14w-warmstart-e40 \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_CHECKPOINT_START=/home/71/25021871/data/chamodya/Singeo_data/convnext_base.fb_in22k_ft_in1k_384/roundP14-gate-scales-terms_20261014-151420/weights_e40_67.3570.pth \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P14warm. The original roundP14 deadlocked at epoch 44 when a console write
+failed on the full root filesystem on 2026-10-15. Its dataloader hung and the
+process could not be recovered. This run restarts the same configuration from
+roundP14 own best checkpoint, weights_e40_67.3570.pth.
+
+READ THIS BEFORE COMPARING IT TO roundP12. It is NOT a clean control.
+checkpoint_start restores model weights only; the optimiser, the cosine LR
+schedule and the epoch counter all begin again at epoch 1, and so does the FoV
+curriculum, which replays from 360 deg with the floor landing at epoch 16. The
+model therefore sees a second full schedule on top of the 40 epochs already
+trained. A result at or above roundP12 81.24 cannot be attributed to the gate
+mechanism alone, because the extra training is a confound. Only a from scratch
+roundP14 settles that.
+
+WHAT IT IS STILL GOOD FOR. It recovers the 22 hours already spent and shows
+whether the gate driven between term balance keeps improving a model that has
+already trained under it, rather than leaving the question untouched.
+
+THE MECHANISM UNDER TEST, unchanged from roundP14: infonce_gate_scales_terms
+divides each InfoNCE term by the batch size rather than by the gate sum, so a
+batch constant overlap no longer cancels and the geometry sets the between term
+balance. Paired with circle measure and flat term weights.'
+    ;;
+roundP15)
+    echo "Round P15 - P14 mechanism, panoramic padding, Gaussian FoV band [80 ep]"
+    echo "  per-sample FoV ~ N(mean, 20) clipped to [70, 360], mean 360 -> 70 linearly"
+    launch roundP15-gauss-padded \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian SINGEO_FOV_GAUSSIAN_STD=20.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P15. roundP14 moved to panoramic width padding and given a much stricter
+ground FoV schedule. Two changes from P14, both deliberate.
+
+PADDING. fov_pad true and fov_border_px 0, so every crop is filled out to the
+panorama full width instead of carrying a 64 px border. The two are mutually
+exclusive in apply_limited_fov. This is the P1 and P2 protocol, not the P3 and
+P4 one, so P15 is NOT directly comparable to roundP12 or roundP14 on the border
+protocol. Padding is also what makes a per sample draw possible at all, since
+unpadded crops of different widths cannot be collated.
+
+THE FoV BAND. fov_sampling gaussian draws a fresh FoV PER SAMPLE from a normal
+distribution, mean walked linearly from 360 down to 70 across the run, standard
+deviation 20, clipped to 70 and 360. Where the log uniform curriculum widens the
+SUPPORT, so that even a late epoch still mixes 70 and 360 degree crops, this is
+a narrow band that slides. An epoch trains on a tight range of widths and that
+range migrates toward the evaluation FoV.
+
+ONE CONSEQUENCE OF THE CLIP, measured before launch: the mean lands exactly on
+70 at the final epoch, so about half the draws in the last epoch pin to exactly
+70, and about 18 pct at epoch 75. Mass piles up at the boundary by construction.
+
+THE MECHANISM UNDER TEST is unchanged from P14: infonce_gate_scales_terms with
+the circle measure and flat term weights, so the overlap geometry sets the
+between term balance. Note P14 scored 80.93 against 81.91 for its hand set
+hierarchy control, so the mechanism cost 0.98 on the border protocol.'
+    ;;
+roundP22)
+    echo "Round P22 - P19 minus mass renormalisation, band N(90, 30) clipped [70, 360] [80 ep]"
+    echo "  control roundP19 80.21; P20 79.70; P14 80.93 bordered; P12cont 81.91 hand-set"
+    launch roundP22-band90-nonorm \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=30.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P22. roundP19 with two changes, both to parameters this work adds rather
+than to anything of SinGeos. No learning rate, epoch count, batch size, backbone
+or image size has been altered in any run on this machine, and that stays true.
+
+CHANGE ONE: mass renormalisation OFF. roundP19 carried it from roundP16 because
+that round was the agreed base at the time, but it is measured to cost 0.65 on a
+matched pair, roundP14 80.93 against roundP16 80.28. Its only real effect is to
+multiply the whole InfoNCE sum by 2.75 over gate mass, which made RnC up to 2.12x
+stronger relative to InfoNCE early in the run. The relative term shares are
+identical with it on or off, so nothing about the hand set free weighting changes.
+
+CHANGE TWO: a wider band, centred above its own clip. roundP19 ran N(mean, 20)
+with the mean walking to 70 and the clip ALSO at 70, because one config field
+drove both. That centres the settled band exactly on its floor, so about half of
+every late batch is pinned to the single width 70 and nothing is narrower. It
+also left the band with zero coverage near 180 deg, which is where roundP19 lost
+1.11 against log uniform while gaining 0.98 at 90 and 2.23 at 70.
+
+fov_gaussian_clip_lo is new and decouples the two. The mean now settles at 90,
+the primary evaluation FoV, with standard deviation 30 and the clip still at 70.
+The settled distribution is median 90, quartiles 70 and 110, 95th percentile 139,
+with 25 pct of samples at or below 70 rather than 50 pct pinned exactly on it,
+and 3 pct within a fifth of 180 rather than none. So the narrowest evaluated
+width stays reachable in training while the mid range regains some coverage.
+
+NOT CHANGED, deliberately. aerial_arc_end stays at its 180 default and
+aerial_ramp_frac at 1.0. roundP21 front loaded the aerial schedule at 0.4 and
+collapsed to about 65, with FoV 360 peaking at epoch 20 and then falling 7.7
+points as the 90 deg sector starved the aerial encoder of full tile statistics.
+round2a had already shown the same thing at 0.35 before the heading fix. Two
+independent results, so that schedule stays where SinGeo leaves it.
+
+CONTROLS. roundP19 80.21 is this configuration with renormalisation on and the
+narrow band pinned at 70. roundP20 79.70 is log uniform on the same padded
+protocol. roundP14 80.93 is the bordered protocol. roundP12 continuous 81.91 is
+the hand set hierarchy the whole line is measured against.'
+    ;;
+roundP21)
+    echo "Round P21 - Gaussian band + both curricula finishing by epoch 32 [80 ep]"
+    echo "  padded controls: P19 80.21 (gauss, arc180), P20 79.70 (logU, arc90 ramp1.0)"
+    launch roundP21-gauss-frontload \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=20.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_AERIAL_ARC_END=90.0 \
+        SINGEO_AERIAL_RAMP_FRAC=0.4 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P21. Masked learning on both branches, padded to 360 width, with NO hand
+set InfoNCE weights: flat term weights and the circle overlap gate setting the
+between term balance. Mass renormalisation OFF, because roundP14 at 80.93 beat
+roundP16 at 80.28 and the cause was a shift in the InfoNCE to RnC balance rather
+than anything about the weighting.
+
+TWO CHANGES FROM roundP20, both about TIMING.
+
+First, the ground schedule becomes the migrating Gaussian band from roundP19
+rather than log uniform. On the matched padded protocol the band was worth plus
+2.23 at FoV 70 and plus 0.98 at FoV 90, and cost only minus 0.07 at FoV 360. The
+FoV 360 deficit seen earlier against the bordered runs was entirely the padding,
+which roundP20 confirmed by scoring 94.39 there with log uniform against roundP19
+94.33 with the band. The one real cost is FoV 180, minus 1.11, the width the band
+passes through and leaves behind.
+
+Second, aerial_ramp_frac 1.0 to 0.4, so the sector reaches its 90 deg minimum at
+epoch 32 instead of epoch 80. roundP20 showed why this matters: it peaked at
+epoch 64 on 79.78 and then DRIFTED DOWN to 79.70, because the sector kept
+narrowing while the learning rate fell from 1.0e-5 to 1.0e-6. The curriculum was
+still moving after the optimiser had stopped. The share redistribution that the
+narrowing drives, weight moving off the three r2 terms and onto loss4 r1-q2 which
+is the FoV 90 and 70 evaluation pairing, did real work over epochs 48 to 60 but
+arrived as the learning rate expired.
+
+With the band settling at epoch 24 and the sector at epoch 32, both curricula
+finish while the LR is still 10 to 20 times higher, and 48 epochs remain to
+consolidate at the final geometry instead of chasing it.
+
+THE RISK. round2a tried aerial_ramp_frac 0.35 and lost 13.9 against round1a, but
+that was before the 2026-09-19 heading fix, when the wedge pointed 180 deg the
+wrong way, so front loading amplified a bug. Never tested since. A collapse would
+be visible by epoch 20, inside two hours.
+
+CONTROLS. roundP19 80.21 is the band with arc_end 180 and mass normalisation on.
+roundP20 79.70 is log uniform with arc_end 90 and ramp 1.0. roundP14 80.93 is the
+bordered protocol. roundP12 continuous 81.91 is the hand set hierarchy.'
+    ;;
+roundP20)
+    echo "Round P20 - padded 360, loguniform ramp 0.2, gate-share weights, 90 deg end sector [80 ep]"
+    echo "  padded hand-set reference roundP2 81.57; gate line P14 80.93, P16 80.28, P19 80.21"
+    launch roundP20-arc90-gateshare \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=loguniform \
+        SINGEO_FOV_RAMP_FRAC=0.2 \
+        SINGEO_AERIAL_ARC_END=90.0 \
+        SINGEO_AERIAL_RAMP_FRAC=1.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P20. Masked learning on both branches with NO hand set InfoNCE weights.
+The ground panorama is padded to full 360 width, which is the masked learning
+protocol rather than a concession: every ground tensor is the same width, so the
+FoV must be read from content instead of from the tensor shape. Per sample log
+uniform draws with the floor ramping over the first 20 pct. The six InfoNCE
+terms are flat at 1.0 and the circle overlap gate sets the between term balance,
+so the weight hierarchy is derived from view geometry rather than hand set. Mass
+renormalisation is OFF: roundP14 at 80.93 beat roundP16 at 80.28, and the cause
+was that renormalising multiplied the whole InfoNCE sum by 2.75 over gate mass,
+which made RnC 2.12x stronger relative to InfoNCE at epoch 1, not anything about
+the weighting.
+
+THE CHANGE. aerial_arc_end 180 to 90 with aerial_ramp_frac at 1.0, so the sector
+starts at 360 deg in epoch 1 and reaches its 90 deg minimum only at epoch 80.
+This halves the r2 gate mass at the end of the run, from 1.246 to 0.623, while
+leaving epoch 1 untouched at about 2.93. The reduction therefore grows with
+epoch rather than applying early.
+
+WHY IT SHOULD HELP. The previous three runs showed the gate over weights exactly
+two terms against the hand set tuple, and the worst was loss5 r2-q1 at 2.05x.
+That pair is wedge against panorama, and neither view exists at evaluation. A 90
+deg end sector pulls the loss5 gate to 0.25 at epoch 80, which is precisely the
+hand set value, and lowers the run averaged mean deviation from the hand set
+shares from 0.392 to 0.359.
+
+CONTROLS. roundP2 at 81.57 is the nearest padded hand set run but is not matched:
+it used quarter rotation, all pairs RnC with GEE embedding tiering, and a 180 deg
+end sector. The gate line to beat is roundP14 80.93 bordered, roundP16 80.28
+bordered, roundP19 80.21 padded. roundP19 is the closest protocol match at 94.33,
+89.12, 73.17, 64.23.'
+    ;;
+roundP19)
+    echo "Round P19 - roundP18 with a steeper FoV ramp, narrowest at epoch 24 [80 ep]"
+    echo "  P18 stopped at e68 on 69.91; controls P16 80.28, P14 80.93, P12cont 81.91"
+    launch roundP19-gauss-ramp03 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=20.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_GATE_NORMALISE_MASS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P19. Exactly roundP18 with one field changed:
+fov_gaussian_ramp_frac 1.0 to 0.3, so the Gaussian mean walks 360 to 70 over the
+first 24 epochs and then holds there for the remaining 56. Everything else is
+P18: padded to panorama width, per sample draws, standard deviation 20, and the
+P16 gate mechanism with circle measure, flat term weights and the mass
+renormalised.
+
+WHY. P18 was stopped at epoch 68 on 69.91, about 10 below its controls, and it
+was losing at BOTH ends: FoV 70 reached only 46.14 against P16 62.21. Under ramp
+1.0 the mean never settles, so the model chases a target that moves every epoch
+and converges at no width at all. Ramp 0.3 settles the band at epoch 24 and
+leaves 56 epochs to converge there, which is the same reasoning that made the log
+uniform floor ramp at 0.2 worth plus 1.54 over the deterministic schedule.
+
+WHAT TO WATCH. The narrow end is the test: if the band is sound and P18 simply
+never settled, FoV 70 and FoV 90 should climb well past P18 and toward P16 62.21
+and 72.75. FoV 360 is the opposite risk, since after epoch 24 the model sees
+essentially nothing above about 110 deg, with the 95th percentile of the band at
+103 deg. P18 held 92.12 at FoV 360 while still passing through wide crops early,
+so a sharp drop below that is the signal that the band starves the wide end.
+Read the four FoV columns separately, not just Avg4.
+
+CONTROLS. roundP18 69.91 at epoch 68, same recipe with ramp 1.0. roundP16 80.28
+is the border plus loguniform_batch base. roundP12 continuous 81.91 is the hand
+set hierarchy the whole line is measured against.'
+    ;;
+roundP18)
+    echo "Round P18 - roundP16 + panoramic padding + per-sample Gaussian FoV [80 ep]"
+    echo "  control roundP16 80.28 (border, loguniform_batch); P14 80.93; P12cont 81.91"
+    launch roundP18-gauss-persample \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=20.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_GATE_NORMALISE_MASS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P18. roundP16 moved to the padded protocol and given per SAMPLE Gaussian
+FoV draws. The gate mechanism is unchanged from P16: circle measure, flat term
+weights, the gate scaling each term, and the mass renormalised to 2.75 per batch.
+
+TWO CHANGES FROM P16, and they are one decision. fov_pad true with
+fov_border_px 0 fills every crop out to the panorama full 768 columns instead of
+adding a 64 px border, because the two are mutually exclusive in
+apply_limited_fov. Padding is also what makes a PER SAMPLE draw possible at all:
+each image then gets its own width, which default_collate cannot stack unless
+every tensor is padded to the same size. fov_sampling gaussian draws one FoV per
+image from a normal distribution, mean walked linearly 360 to 70 across the whole
+run, standard deviation 20, clipped to 70 and 360.
+
+WHAT THE BAND DOES. log uniform widens a SUPPORT and then stops: from epoch 16 on
+the distribution is frozen, every later epoch mixing 70 and 360 degree crops at a
+steady 15 pct at or below 90. The Gaussian band MIGRATES, so the model trains on
+a tight range of widths that slides toward the evaluation FoV and the samples get
+genuinely harder late.
+
+TWO THINGS TO WATCH. First, the padded protocol is worth about minus 0.5 against
+the 64 px border on every pair measured so far, P3 80.61 vs P1 80.08 and P4 82.09
+vs P2 81.57, so P18 carries that handicap before the FoV change is counted.
+Second, with ramp_frac at 1.0 the mean only reaches 70 in the final epoch, so
+about half the draws in epoch 80 pin to exactly 70 while the cosine LR is nearly
+spent. SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.75 would land it at epoch 60 instead and
+hold, giving roughly 24 epochs at the narrow end rather than 6.
+
+CONTROLS. roundP16 80.28 on the border protocol with loguniform_batch is the
+direct base. roundP14 80.93 is the same without mass normalisation, and
+roundP12 continuous 81.91 is the hand set hierarchy this whole line is measured
+against.'
+    ;;
+roundP16)
+    echo "Round P16 - roundP14 with the gate's total mass renormalised [80 ep]"
+    echo "  control roundP12(continuous) 81.91; roundP14 unnormalised scored 80.93"
+    launch roundP16-gate-normalised \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_GATE_NORMALISE_MASS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P16. roundP14 with exactly one field added,
+infonce_gate_normalise_mass. It removes a confound that was bundled into P14.
+
+THE CONFOUND. With gate scaling the objective is sum over i of mean(w_i) times
+L_i, so the six gate scalars set two things at once: how weight is DISTRIBUTED
+across the terms, which is the mechanism, and how much weight there is in
+TOTAL, which is not. Measured on this curriculum the total falls from 5.83 at
+epoch 1 to 3.11 at epoch 80, a 47 pct decay in loss scale stacked on top of the
+cosine LR schedule. P14 therefore tested the mechanism PLUS an unintended
+learning rate change, and its slower tail climb is consistent with being over
+annealed: over the last five evals P14 gained 0.105 Avg per four epochs against
+0.188 for its control.
+
+THE FIX. Each batch the six weights are rescaled onto a fixed budget,
+scale = target / sum of the six mean gates, with target defaulting to
+sum(SINGEO_TERM_WEIGHTS) = 2.75. Nothing derives 2.75, it is the published
+hierarchy 1, .5, .5, .25, .25, .25 added up. Any constant removes the drift;
+this one also leaves InfoNCE on the same scale it had in roundP12, so
+rnc_weight 0.25 buys the same share of the objective in both runs.
+
+WHAT THIS MAKES IT. P16 against roundP12 continuous differs ONLY in how a fixed
+mass of 2.75 is distributed across the six terms, hand set hierarchy versus
+geometry. That is the controlled comparison the paper needs, and it is the one
+roundP14 could not provide.
+
+EXPECTED READING. P14 lost 0.98 entirely at the narrow end, FoV 90 minus 1.78
+and FoV 70 minus 1.85, while 360 and 180 were unchanged. If normalising recovers
+most of that, the gap was the loss scale. If it does not, what remains is the
+task role factor the geometry cannot see: SinGeo discounts the cross domain
+partial pairs r1-q2 and r2-q1 to 0.25 where overlap alone says 0.44 and 0.50.'
+    ;;
+roundP17)
+    echo "Round P17 - roundP14 with a narrowing Gaussian FoV band [80 ep]"
+    echo "  per-BATCH FoV ~ N(mean, 20) clipped [70,360], mean 360->70 by epoch 60"
+    launch roundP17-gauss-band \
+        SINGEO_FOV_PAD=false SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_FOV_SAMPLING=gaussian_batch \
+        SINGEO_FOV_GAUSSIAN_STD=20.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.75 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P17. roundP14 with the ground FoV distribution replaced. Everything
+else is roundP14: 64 px border, continuous rotation, RnC over positives plus the
+hardest negative at 0.25, and the gate scaling the terms with circle measure and
+flat term weights. The mass is NOT renormalised, because roundP16 tried that and
+scored 80.28 against roundP14 80.93, so normalising cost 0.65.
+
+THE CHANGE. log uniform draws from [floor, 360] and only lowers the floor, so it
+WIDENS A SUPPORT: from epoch 16 on, the distribution stops moving and every later
+epoch still mixes 70 and 360 degree crops, a steady 15 pct at or below 90. The
+Gaussian band instead MIGRATES: mean walked linearly 360 to 70, standard
+deviation 20, clipped, so the model trains on a tight range of widths that slides
+toward the evaluation FoV. At epoch 56 the median is 89 deg and 53 pct of samples
+sit at or below 90; by epoch 64 that is 85 pct, and it holds for the last 16
+epochs.
+
+WHY gaussian_batch AND NOT gaussian. Per sample draws give every image a
+different width, which cannot be collated unpadded, so plain gaussian forces
+fov_pad and the padded protocol. Padding is worth about minus 0.5 against the 64
+px border (P3 80.61 vs P1 80.08, P4 82.09 vs P2 81.57), which would confound the
+test. gaussian_batch draws once per batch, seeded from epoch and batch, so widths
+are uniform inside a batch and the border protocol is preserved. It also keeps
+FoV from acting as an in batch cue, since InfoNCE discriminates within a batch
+and a shared width cannot separate sample i from sample j.
+
+RAMP 0.75 reaches 70 deg at epoch 60 and holds for the last 20, rather than only
+arriving in the final epoch where the cosine LR is nearly spent.
+
+THE RISK. After epoch 56 the model sees almost nothing wide: with std 20 and the
+mean at 70 the 95th percentile is about 103 deg. FoV 360 and 180 may regress, and
+Avg4 weights all four FoVs equally, so gains at 90 and 70 could be cancelled.
+roundP14 is the control at 80.93, which is 96.20, 91.64, 72.97, 62.93. Read the
+four columns separately, not just the average.'
+    ;;
+roundP14)
+    echo "Round P14 - the overlap gate sets the between-term balance [80 ep]"
+    echo "  control is roundP12 at 81.24 Avg; no hand-set term hierarchy at all"
+    launch roundP14-gate-scales-terms \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P14. roundP12 with the per-term weight hierarchy deleted and the overlap
+gate asked to supply it instead. Three fields move together because they are one
+mechanism: infonce_term_weights flat at 1, overlap_gate_measure circle, and
+infonce_gate_scales_terms on.
+
+THE MECHANISM. Each InfoNCE term was reduced as a weighted mean, normalised by
+the gate sum, so a gate value shared by the whole batch cancelled exactly. The
+gate could only ever reweight samples INSIDE a term, never scale one term
+against another, which is why the hand-set hierarchy was still needed. P14
+normalises by the batch size instead. The per-sample weighting is untouched;
+what changes is that a term now shrinks in proportion to how much of the compass
+its two views actually share.
+
+WHY IT SHOULD WORK. Measured over this curriculum the scalars the geometry
+produces are q1-r1 1.00, q1-q2 0.44, r1-r2 0.50, r1-q2 0.44, r2-q1 0.50 and
+r2-q2 0.22, against SinGeo hand-set 1, .5, .5, .25, .25, .25. Four of the six
+land within 0.06. The two cross terms r1-q2 and r2-q1 come out about twice as
+heavy as SinGeo makes them, so this run also measures whether that extra
+discount was load bearing.
+
+IT IS ALSO CURRICULUM ADAPTIVE, which a fixed tuple cannot be. Early on every
+view is near full and all six scalars sit between 0.94 and 1.00, so the loss
+starts treating the pairs alike and concentrates on the full view term only as
+the views narrow.
+
+KNOWN CONFOUND. The six scalars sum to about 5.8 early and 3.1 late, so the
+total loss magnitude drifts down over the run, a mild implicit LR decay stacked
+on the cosine schedule. If P14 beats or matches P12 the next run should divide
+by the sum of the six weights to separate the balance from the scale.
+
+CONTROL. roundP12 at 81.24 Avg, which is 96.36, 91.21, 73.40, 63.99. The earlier
+pair P10a against P10b put flat weights at minus 0.17 under a different protocol,
+but that kept the weighted mean, so the gate was never supplying the hierarchy.'
+    ;;
+roundP13)
+    echo "Round P13 - roundP12 with all six InfoNCE term weights set to 1 [80 ep]"
+    echo "  control is roundP12 itself at 81.24 Avg; exactly one field differs"
+    launch roundP13-uniform-terms \
+        SINGEO_FOV_PAD=false SINGEO_FOV_SAMPLING=loguniform_batch \
+        SINGEO_FOV_BORDER_PX=64 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P13. Exactly roundP12 with infonce_term_weights moved from SinGeo
+hierarchy 1, 0.5, 0.5, 0.25, 0.25, 0.25 to a flat 1 on all six terms. Every other
+field is taken from what roundP12 RECORDED in its log, including
+aerial_rotation=continuous, which the roundP12 block in this file does not set.
+The overlap gate stays on at its default containment measure.
+
+WHAT IT QUANTIFIES. The value of the per-term weight hierarchy under the current
+best recipe. roundP12 scored 81.24 Avg, so the difference is what the hierarchy
+is worth. The earlier pair P10a against P10b gave minus 0.17 for the same change
+under the padded, no RnC protocol with circle gating, which is inside noise.
+
+WHAT IT DOES NOT SHOW, AND WHY. It cannot show that the gate REPLACES the
+weights, because the two act on different axes. Each InfoNCE term is reduced as
+a weighted mean over the batch, so a gate value shared by every sample cancels
+exactly and the gate only ever reweights samples WITHIN a term. The term weights
+multiply whole terms against each other, outside that mean. No gate setting
+changes the between term balance, so there is no mechanism by which gating could
+stand in for the hierarchy.
+
+Under this protocol the gate is also nearly inert on five of the six terms: with
+loguniform_batch the ground FoV is constant inside a batch and the aerial sector
+is a per epoch value, so the gates for loss1 to loss5 are batch constants and
+cancel. Only loss6, ground crop against aerial wedge, varies per sample.'
+    ;;
 roundP12bc)
     echo "Round P12b/c - the hardest-negative RnC under a padded protocol, and at weight 0.5"
     echo "  P12 81.24 (border64, per-batch, w 0.25) | P2 81.57 (padded, all-pairs RnC + GEE)"

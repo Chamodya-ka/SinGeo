@@ -89,6 +89,66 @@ def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_
     return fov_start * (fov_end / fov_start) ** progress
 
 
+def get_gaussian_fov_mean(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_frac=1.0):
+    """Centre of the Gaussian FoV draw at `epoch`, walked linearly start -> end.
+
+    The log-uniform curriculum (:func:`get_dynamic_fov_floor`) widens the
+    *support*: it keeps 360 degree views available all run and lowers only the
+    floor, so an epoch late in training still mixes very wide and very narrow
+    crops. This walks a narrow band instead -- a mean that slides down and a
+    fixed spread around it -- so the model trains on a tight range of widths at
+    any moment and that range migrates toward the evaluation FoV.
+
+    Linear rather than geometric because the mean is a location, not a floor:
+    there is no support to open, so the argument for front-loading the descent
+    (see `get_dynamic_fov_floor`) does not apply.
+
+    `ramp_frac` paces that descent, as `fov_ramp_frac` does for the log-uniform
+    floor: the mean reaches `fov_end` after that fraction of the run and holds
+    there. The default 1.0 spreads it over every epoch, so the mean only arrives
+    at `fov_end` in the final epoch -- which also means the narrow views land
+    when the cosine LR is nearly spent. Lower it to buy epochs at the narrow end:
+    0.75 reaches `fov_end` at epoch 60 of 80 and holds for the last 20.
+
+    Args:
+        epoch: 1-based epoch number.
+        max_epoch: total epochs in the run.
+        fov_start: mean at epoch 0.
+        fov_end: mean once the descent completes.
+        ramp_frac: fraction of the run spent descending. `<= 0` starts at
+            `fov_end` immediately, matching `get_dynamic_fov_floor`.
+
+    Returns:
+        The mean in degrees. Not clipped -- :func:`draw_gaussian_fov` clips the
+        draw, not the centre.
+    """
+    if ramp_frac <= 0:
+        return fov_end
+    progress = min(1.0, max(0.0, epoch / (float(max_epoch) * ramp_frac)))
+    return fov_start - (fov_start - fov_end) * progress
+
+
+def draw_gaussian_fov(mean, std=20.0, lo=70.0, hi=360.0, rng=None):
+    """One FoV drawn from `N(mean, std)` and clipped to `[lo, hi]`.
+
+    `rng` is a `numpy.random.Generator`; one is created from OS entropy when it
+    is None. Create it lazily per worker process rather than once in the parent:
+    a Generator built before `fork` is copied into every worker, and all of them
+    would then draw the identical sequence.
+
+    Clipping, not rejection: a draw outside the range is pinned to the boundary,
+    so mass piles up at 70 and 360 once the mean approaches either end. That is
+    intended -- the evaluation FoVs sit at the boundaries.
+
+    Returns:
+        A float in `[lo, hi]`.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    draw = float(rng.normal(loc=mean, scale=std, size=1)[0])
+    return float(min(hi, max(lo, draw)))
+
+
 def draw_log_uniform_fov(floor, fov_max=360.0, rng=None):
     """A single FoV drawn log-uniformly from `[floor, fov_max]`.
 

@@ -302,6 +302,16 @@ class CVACTDatasetTrainSinGeo(Dataset):
         self.fov_batch_size = None
         self.fov_epoch = 0
 
+        # Written BY the trainer, read by the training script -- the one piece
+        # of curriculum state that flows outward rather than in. After each
+        # epoch `train_contrast_singeo_rnc` stores the mean realised crop extent
+        # here (from meta[M_GROUND_EXTENT], so it is the quantised width the
+        # encoder actually saw), and the script uses it to aim dynamic
+        # similarity sampling at the FoV the epoch really trained on instead of
+        # an analytic stand-in. `None` until the first epoch completes; readers
+        # must tolerate that, and `dss_fov_from_measured=False` ignores it.
+        self.measured_ground_fov = None
+
         self.sat_arc = 360.0   
         self.sat_rot_max = 0.0
 

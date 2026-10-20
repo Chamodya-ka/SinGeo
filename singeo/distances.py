@@ -305,6 +305,49 @@ class GeoCoordinates:
         return haversine_km(coords[self._rows(ids_a)], coords[self._rows(ids_b)])
 
 
+class ProjectedCoordinates:
+    """`id -> (easting, northing)` in metres, for data already in a map projection.
+
+    The counterpart to :class:`GeoCoordinates` for datasets that ship projected
+    coordinates rather than degrees.  CVACT is the case this exists for: its
+    `ACT_data.mat` carries a `utm` array (zone 55S, Canberra) and no latitude or
+    longitude anywhere in the release, so haversine has nothing to consume.
+
+    Within a single UTM zone the plane is metric to well under a metre over the
+    ~25 km CVACT spans, so a Euclidean distance here is not an approximation
+    worth worrying about -- it is more accurate than haversine on a sphere.
+
+    Args:
+        coords_by_id: `{location_id: (easting_m, northing_m)}`.
+    """
+
+    def __init__(self, coords_by_id):
+        if not coords_by_id:
+            raise ValueError("coordinate table is empty")
+
+        ids = sorted(int(i) for i in coords_by_id)
+        self.id2row = {idx: row for row, idx in enumerate(ids)}
+        self.coords = torch.tensor([list(coords_by_id[idx]) for idx in ids],
+                                   dtype=torch.float64)
+
+    def _rows(self, ids):
+        try:
+            return [self.id2row[int(i)] for i in ids.tolist()]
+        except KeyError as missing:
+            raise KeyError(
+                "location id {} has no coordinates. The table must cover every "
+                "id the dataset can emit.".format(missing)
+            )
+
+    def km(self, ids_a, ids_b):
+        """`[N, M]` planar separation in kilometres."""
+        coords = self.coords
+        a = coords[self._rows(ids_a)].unsqueeze(1)
+        b = coords[self._rows(ids_b)].unsqueeze(0)
+        out = torch.linalg.norm(a - b, dim=-1) / 1000.0
+        return out.to(dtype=torch.float32, device=ids_a.device)
+
+
 class SatelliteEmbeddings:
     """`id -> 64-d Google Satellite Embedding`, cosine computed on demand.
 
