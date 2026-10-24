@@ -44,6 +44,12 @@
 #   roundP20  padded masked learning, gate-share weights, 90 deg end sector
 #   roundP21  P20 with the Gaussian band and both curricula front-loaded
 #   roundP22  P19 without mass renormalisation, wider band centred at 90
+#   roundP22r resume of roundP22 from its e76 checkpoint for epochs 77-80
+#   roundP23  P22 with std 40 and no global RNG seed
+#   roundP24  P23 ablation: aerial sector pinned at 360, no wedge crop
+#   roundP25  P23 with a polynomial LR, power 0.5, so the LR survives to e80
+#   roundP26  P23 with rnc_weight 0.4, filling the RnC dose-response
+#   roundP27  P23 with a 4-epoch seamless-rolled-panorama warm-up on q2
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -1544,6 +1550,332 @@ THE MECHANISM UNDER TEST is unchanged from P14: infonce_gate_scales_terms with
 the circle measure and flat term weights, so the overlap geometry sets the
 between term balance. Note P14 scored 80.93 against 81.91 for its hand set
 hierarchy control, so the mechanism cost 0.98 on the border protocol.'
+    ;;
+roundP22r)
+    echo "Round P22-resume - continue roundP22 from e76 for epochs 77-80"
+    echo "  e76 row was 94.6871 / 90.6011 / 73.9307 / 64.4079 = 80.91 Avg4"
+    launch roundP22r-resume-e77 \
+        SINGEO_CHECKPOINT_START="/home/71/25021871/data/chamodya/Singeo_data/convnext_base.fb_in22k_ft_in1k_384/roundP22-band90-nonorm_20261021-094320/weights_e76_73.9307.pth" \
+        SINGEO_START_EPOCH=77 \
+        SINGEO_RESUME_DSS_FOV=94.14 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=30.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='Resume of roundP22 after an unintentional server reboot killed it during
+epoch 78. Loads weights_e76_73.9307.pth and runs epochs 77 to 80 only, with
+start_epoch 77 so both curricula and the cosine LR are evaluated at the right
+point rather than restarting.
+
+RECONSTRUCTED SCHEDULE for the remaining epochs, which matches what the original
+log printed for epoch 78 before it died, sector 184.5 and rotation 175.5:
+  epoch 77  sector 186.75 deg  drift 173.25  band mean 90  LR 6.31e-07
+  epoch 78  sector 184.50 deg  drift 175.50  band mean 90  LR 3.55e-07
+  epoch 79  sector 182.25 deg  drift 177.75  band mean 90  LR 1.58e-07
+  epoch 80  sector 180.00 deg  drift 180.00  band mean 90  LR 3.95e-08
+
+CAVEAT. A checkpoint holds model.state_dict only, so the optimizer moments and
+the scheduler position are not restored. The scheduler is fast forwarded by
+replaying 76 epochs of steps, but Adam restarts with zero moments. At a learning
+rate between 6e-7 and 4e-8 that is immaterial, roughly 1 over 160 to 1 over 2500
+of the peak 1e-4, and the original log had already printed Lr 0.000000 at epoch
+77. Resuming mid run would not be safe this way.
+
+EXPECTATION. The last three evals gained 0.40, 0.31 then 0.09 at FoV 90, so four
+epochs at a tenth of that learning rate should add on the order of 0.02. The
+point of this run is a complete 80 epoch row and weights_end.pth, not a changed
+result. The e76 numbers are effectively final: 80.91 Avg4, the best padded
+result, ahead of roundP19 80.21 on all four FoV columns and level with the
+bordered roundP14 80.93 while using no hand set InfoNCE weights.
+
+DSS ON RESUME. A similarity pass over the train set runs from the loaded
+checkpoint BEFORE epoch 77, with the crop aimed at 94.14 deg, the measured mean
+the interrupted run logged at its epoch 76 DSS. Without it sim_dict is None and
+all four epochs would get random batches instead of the similarity composed ones
+the original run had.
+
+NOTE. This writes to its own timestamped directory, so the 77 to 80 rows live in
+a separate log from epochs 1 to 77 of the original run.'
+    ;;
+roundP27)
+    echo "Round P27 - P23 with q2 forced to a seamless rolled 360 for epochs 1-4 [80 ep]"
+    echo "  control roundP23 80.80, FoV 360 = 95.14"
+    launch roundP27-fullpano-warmup \
+        SINGEO_SEED=None \
+        SINGEO_FOV_FULL_PANO_PROB=1.0 \
+        SINGEO_FOV_FULL_PANO_EPOCHS=4 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P27. roundP23 with a four epoch warm up in which every q2 is a SEAMLESS
+panorama rolled to a random azimuth, fov forced to exactly 360.
+
+THE GAP THIS CLOSES. The FoV 360 evaluation query is a seamless rolled panorama:
+LimitedFoVPad calls apply_limited_fov with fov 360 and a random angle, and at
+exactly 360 the panorama is rolled but not narrowed. Training never supplies that
+input once the band settles. q1 is never rolled, roll_q1 is off by default and
+measured harmful. And exactly 360 is the ONLY draw that fills all 768 columns:
+at 359.9 the crop already leaves one blank column and has two edges, so a near
+360 sample is a different KIND of input, not the same input slightly narrower.
+Verified: 360 gives 768 of 768 content columns, 359 gives 765, 330 gives 704.
+
+WHERE THE SUPPLY COMES FROM TODAY. Only the Gaussian clip at hi 360, which makes
+an atom there while the mean is high: 39.1 pct of draws at epoch 1, 13.1 at
+epoch 4, 1.3 at epoch 8, and 0 from epoch 12 onward. Log uniform is continuous on
+70 to 360 so it never lands on 360 at all, which means roundP20 and every earlier
+log uniform run had ZERO exposure to this input in every epoch.
+
+THE NEW PARAMETER. fov_full_pano_prob overrides the sampler for a fraction of
+samples, and fov_full_pano_epochs bounds the window. So this run is prob 1.0 with
+window 4, a warm up, and a steady injection is prob 0.1 with window 0, which is
+the next configuration to try with no further code. In batch sampling modes the
+draw is taken per batch, so unpadded crops still collate.
+
+WHAT TO WATCH. FoV 360 against roundP23 95.14. Note the padded protocol clusters
+tightly at FoV 360, roundP1 95.01, roundP23 95.14, roundP2 95.34, against the
+bordered cluster at 96.09 to 96.63, so there is only about 0.2 of headroom inside
+this protocol unless the orientation gap is itself what sets that ceiling. If it
+is, this run should break out of the padded cluster. The warm up also leaves
+epochs 12 to 80 with no exposure, so it tests whether an early panoramic
+representation is RETAINED, which the CVACT decline of 5.55 at FoV 360 after its
+band settled suggests may not hold.
+
+CONTROLS. roundP23 80.80 with FoV 360 95.14 is the identical configuration with
+no injection. roundP26 is the same recipe at rnc_weight 0.4.'
+    ;;
+roundP26)
+    echo "Round P26 - P23 with rnc_weight 0.4 [80 ep]"
+    echo "  control roundP23 80.80 at w=0.25; P12 81.24 at 0.25 and P12c 79.89 at 0.5 (bordered)"
+    launch roundP26-rncw04 \
+        SINGEO_SEED=None \
+        SINGEO_RNC_WEIGHT=0.4 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P26. roundP23 with rnc_weight 0.25 to 0.4. One field changed.
+
+WHY 0.4. The dose response on this RnC form, positives plus hardest negative, has
+three points and a peak that is only bracketed, not located: weight 0 scored
+78.80, weight 0.25 scored 81.24, weight 0.5 scored 79.89. Doubling from 0.25 cost
+1.35, so the optimum sits somewhere in between and 0.4 probes it. Weight 1.0 was
+considered and rejected: it would put RnC at 42 pct of the loss, it amplifies the
+undescendable 2 log 2 tie floor that covers 42.8 pct of g2a rows at epoch 48, and
+two prior runs already map that regime, all pairs at 1.0 losing about 13 and
+positives only at 2.0 losing 11.76.
+
+WHAT IT CHANGES, from roundP23 logged values. RnC share of the total loss:
+  epoch  1   6.2 pct at 0.25  ->   9.6 pct at 0.40
+  epoch 24  13.2 pct          ->  19.6 pct
+  epoch 80  15.4 pct          ->  22.6 pct
+
+CAVEAT ON THE EXISTING CURVE. Those three reference points were measured on the
+BORDERED protocol with log uniform ground sampling and the containment gate.
+roundP23 is padded with a migrating Gaussian band and the circle gate setting the
+between term balance, so the peak may not sit where it did. This run is as much a
+check that the curve still has the same shape as it is a search for its maximum.
+
+ALSO NOTE the mass is not renormalised here, so the effective weight relative to
+the hand set baseline drifts with the gate mass: 0.40 times 2.75 over mass gives
+0.19 at epoch 1 rising to 0.41 at epoch 80. The nominal 0.4 is therefore a
+late run figure, and the run spends its first half nearer 0.25 in effect.
+
+CONTROLS. roundP23 80.80 is the identical configuration at 0.25. roundP24 79.43
+is its no wedge crop ablation and roundP25 79.18 its polynomial LR variant, both
+of which lost, so 0.25 with cosine and the sector crop remains the best padded
+recipe at 80.80.'
+    ;;
+roundP25)
+    echo "Round P25 - P23 with polynomial LR, power 0.5, lr_end 1e-6 [80 ep]"
+    echo "  control roundP23 80.80 cosine (FoV360 95.14, still rising at e80)"
+    launch roundP25-poly05 \
+        SINGEO_SEED=None \
+        SINGEO_SCHEDULER=polynomial \
+        SINGEO_POLY_POWER=0.5 \
+        SINGEO_LR_END=0.0 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P25. roundP23 with the learning rate schedule changed from cosine to
+polynomial with power 0.5. Everything else is roundP23.
+
+WHY. Several runs have ended while still improving, which says the cosine LR
+expires before the model does. roundP12 and roundP14 were still gaining at epoch
+80. roundP23 FoV 360 went 94.87 at epoch 76 to 95.14 at epoch 80. roundP20
+peaked at epoch 64 and then DRIFTED DOWN while its aerial sector kept narrowing
+at a learning rate that had fallen to 1e-6, so the curriculum outlived the
+optimiser. Power below 1 decays slowly and leaves a usable rate late:
+
+  epoch    cosine      poly 0.5     ratio
+     40   5.30e-05     7.23e-05       1.4x
+     60   1.65e-05     5.20e-05       3.2x
+     70   4.71e-06     3.79e-05       8.1x
+     76   9.85e-07     2.59e-05      26.3x
+     80   3.95e-08     1.13e-05     284.6x
+  finish   8.02e-15     0.00e+00          --
+
+TWO TRAPS HANDLED. The power was hardcoded at 1.5, so poly_power is a new config
+field defaulting to 1.5, which leaves every earlier run reproducible. And lr_end
+defaults to 0.0001, the SAME value as lr, which would have made the polynomial
+schedule a CONSTANT 1e-4 for all 80 epochs rather than a decay. It is set to
+0.0 here, which is exactly where the cosine schedule ends, cos of pi being minus
+one, so the two schedules now share both endpoints, 1e-4 at the start and 0 at
+the finish, and differ ONLY in the shape of the decay between them. The script
+now warns when lr_end is not below lr.
+
+THE RISK. At 1.2e-5 the model is still moving meaningfully in the last epoch, so
+it may not settle. Expect a noisier tail than the cosine runs, and read the last
+three evals together rather than trusting epoch 80 alone. If the tail is still
+climbing, the honest follow up is more epochs rather than a flatter schedule.
+
+CONTROLS. roundP23 80.80, same config on cosine, is the direct comparison.
+roundP24 79.43 is the no wedge crop ablation of it. roundP22 80.91 is std 30.'
+    ;;
+roundP24)
+    echo "Round P24 - P23 with the aerial sector pinned at 360: no wedge CROP [80 ep]"
+    echo "  control roundP23 80.80 (arc_end 180, FoV360 95.14); roundP22 80.91"
+    launch roundP24-noaerialcrop \
+        SINGEO_SEED=None \
+        SINGEO_AERIAL_ARC_END=360.0 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P24. Ablation of the aerial sector CROP on roundP23, by pinning
+aerial_arc_end at 360 so the sector never narrows. One field changed from P23.
+
+WHAT IS AND IS NOT REMOVED. r2 still exists as a view, is still rotated
+continuously up to plus or minus 180 deg, and still carries recorded arcs, so all
+six InfoNCE terms and all four RnC groups stay in place. Only the azimuth
+narrowing is gone. This is deliberately NOT enable_aerial_crop false, which would
+delete r2 outright, drop the three terms that involve it, and collapse the RnC
+aerial side to a single view with no positives. So the question this answers is
+narrow and clean: given that the tile rotation is retained, does narrowing the
+sector buy anything?
+
+SIDE EFFECT TO READ WITH THE RESULT. With the sector at 360 the circle gate
+scores l3 r1-r2 and l5 r2-q1 at exactly 1.0, the same as l1 q1-r1, so three terms
+sit at the top instead of one and every share becomes CONSTANT after the ground
+band settles at epoch 24:
+  P23 at epoch 80   l1 0.373  l3 0.187  l5 0.187  l6 0.051   mass 2.68
+  P24 at epoch 80   l1 0.262  l3 0.262  l5 0.262  l6 0.071   mass 3.82
+That flattening is not a confound that could be removed, it is what the geometry
+says when two views fully overlap. It also pins the mass, so the effective
+rnc_weight stops drifting and sits constant at about 0.18 rather than rising to
+0.26.
+
+PRIOR EVIDENCE ON THE WEDGE. As an InfoNCE hard positive the wedge cost minus
+1.81, roundP3 to roundP9. Ranked instead as a graded positive by RnC it paid,
+plus 3.29 all pairs or plus 2.44 positives plus hardest negative. Those were
+measured on the bordered protocol with log uniform ground sampling and the
+containment gate, so none of them tested the wedge under the padded protocol with
+a migrating Gaussian band and the circle gate setting the term balance. That is
+what this run tests.
+
+CONTROLS. roundP23 80.80 with FoV 360 at 95.14 is the same configuration with the
+sector narrowing to 180. roundP22 80.91 is std 30. roundP12 continuous 81.91 is
+the hand set hierarchy on the bordered protocol.'
+    ;;
+roundP23)
+    echo "Round P23 - P22 with the band widened to std 40, global seeding OFF [80 ep]"
+    echo "  control roundP22 80.91 (std 30) = best padded run; P19 80.21; P14 80.93 bordered"
+    launch roundP23-band90-std40 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P23. roundP22 with two changes. roundP22 is the best padded run at 80.91,
+ahead of roundP19 80.21 on all four FoV columns and level with the bordered
+roundP14 80.93 while using no hand set InfoNCE weights.
+
+CHANGE ONE: fov_gaussian_std 30 to 40. The band keeps its mean endpoint at 90 and
+its clip at 70, so only the spread widens. Settled distribution against P22:
+  std 30   mean 94.6   quartiles  70 and 110   95th 139   25 pct at or below 70   4 pct near 180
+  std 40   mean 98.0   quartiles  70 and 117   95th 156   31 pct at or below 70   9 pct near 180
+So it buys more coverage at both evaluated extremes, 70 and 180, and trades away
+density at 90, from 45 pct within a fifth of 90 down to 35 pct. FoV 180 is where
+the band has been weakest, and widening from 20 to 30 already gained 1.48 there,
+so this tests whether that trend continues or turns.
+
+CHANGE TWO: global RNG seeding OFF, SINGEO_SEED=None. Previously every run
+seeded python, numpy, torch and cuda to 42 and forced cudnn deterministic. This
+run leaves all of that unseeded, so it is an independent sample rather than a
+reproducible replay, and cudnn is free to pick faster kernels.
+
+WHAT IS NOT REMOVED. The eval crop seed stays. The evaluation dataset seeds and
+restores the python random state around each crop from crop_seed plus the index,
+which is what makes the FoV 360, 180 and 70 columns the SAME crops in every run.
+Removing it would make each eval a different random crop and every comparison in
+the table meaningless. The per batch epoch and batch seeds in loguniform_batch
+and gaussian_batch also stay, and they never fire here, because this run draws
+per SAMPLE from an unseeded generator.
+
+CONTROLS. roundP22 80.91 is the same configuration at std 30. roundP19 80.21 is
+std 20 with the mean and clip both pinned at 70. roundP12 continuous 81.91 is the
+hand set hierarchy on the bordered protocol.'
     ;;
 roundP22)
     echo "Round P22 - P19 minus mass renormalisation, band N(90, 30) clipped [70, 360] [80 ep]"

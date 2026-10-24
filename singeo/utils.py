@@ -32,8 +32,23 @@ class AverageMeter:
 
 def setup_system(seed, cudnn_benchmark=True, cudnn_deterministic=True) -> None:
     '''
-    Set seeds for for reproducible training
+    Set seeds for for reproducible training.
+
+    `seed=None` skips seeding entirely: python, numpy and torch keep whatever
+    entropy they started with, so two runs of the same config differ. cudnn is
+    also left non-deterministic, which is faster. Use it when a run is meant to
+    be an independent sample rather than a reproducible one -- note that the
+    EVAL crops stay deterministic either way, because the eval dataset seeds
+    and restores the `random` state itself around each crop (`crop_seed`), which
+    is what keeps FoV columns comparable between runs.
     '''
+    if seed is None:
+        if torch.cuda.is_available():
+            torch.backends.cudnn_benchmark_enabled = True
+            torch.backends.cudnn.deterministic = False
+        print("Seeding: OFF - this run is an independent sample, not reproducible")
+        return
+
     # python
     random.seed(seed)
     

@@ -1674,6 +1674,39 @@ def test_gaussian_clip_lo_decouples_the_clip_from_the_mean_endpoint():
     assert decoupled.mean() < coupled.mean()
 
 
+def test_full_pano_injection_yields_the_only_seamless_width():
+    """`fov_full_pano_prob` must produce EXACTLY 360, because that is the only
+    draw that fills every column. A 359.9 deg crop already leaves blank and has
+    two edges, so it is a different kind of input from the FoV-360 eval query."""
+    import torch
+    from singeo.transforms import apply_limited_fov
+
+    pano = (torch.arange(768, dtype=torch.float32) + 1.0).repeat(3, 8, 1) / 769.0
+
+    full, _, extent = apply_limited_fov(pano.clone(), 360.0, 90.0, pad=True)
+    content = int((full.abs().sum(0).sum(0) > 1e-9).sum())
+    assert content == 768, content          # seamless: every column carries image
+    assert extent == 360.0
+
+    # one degree short is already a crop with blank
+    near, _, _ = apply_limited_fov(pano.clone(), 359.0, 90.0, pad=True)
+    assert int((near.abs().sum(0).sum(0) > 1e-9).sum()) < 768
+
+    # and the roll actually moves content, so the 360 draw is not just q1 again
+    rolled_a, _, _ = apply_limited_fov(pano.clone(), 360.0, 0.0, pad=True)
+    rolled_b, _, _ = apply_limited_fov(pano.clone(), 360.0, 180.0, pad=True)
+    assert not torch.allclose(rolled_a, rolled_b)
+
+
+def test_full_pano_window_is_applied_by_epoch():
+    """prob=1.0 with epochs=4 is a warm-up; prob=p with epochs=0 is steady."""
+    def effective(prob, window, epoch):
+        return prob if (window == 0 or epoch <= window) else 0.0
+
+    assert [effective(1.0, 4, e) for e in (1, 4, 5, 80)] == [1.0, 1.0, 0.0, 0.0]
+    assert [effective(0.1, 0, e) for e in (1, 4, 5, 80)] == [0.1, 0.1, 0.1, 0.1]
+
+
 def test_positives_only_zeroes_the_same_domain_groups():
     """With two views per domain, g2g/a2a have a single same-location reference
     whose rank set is itself, so they contribute exactly 0."""

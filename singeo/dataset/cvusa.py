@@ -459,6 +459,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
         self.fov_lo = 70.0
         self.fov_hi = 360.0
         self._fov_rng = None
+        # Probability that a sample's FoV is overridden to exactly 360, giving a
+        # seamless rolled panorama. The trainer sets this per epoch, so a window
+        # (warm-up) and a constant rate (injection) are both expressible.
+        self.fov_full_pano_prob = 0.0
 
         # Written BY the trainer, read by the training script -- the one piece
         # of curriculum state that flows outward rather than in. After each
@@ -604,6 +608,29 @@ class CVUSADatasetTrainSinGeo(Dataset):
                 fov = draw_log_uniform_fov(self.ground_fov_floor, rng=random.Random(seed))
             else:
                 fov = draw_log_uniform_fov(self.ground_fov_floor)
+
+            # Full-panorama injection, overriding whatever the sampler drew.
+            #
+            # Exact 360 is the ONLY draw that fills every column: at 359.9 the
+            # crop already leaves blank and has two edges, so a 359 deg sample is
+            # not the same KIND of input as the FoV-360 evaluation query, which is
+            # a seamless panorama rolled to an arbitrary azimuth. q1 is never
+            # rolled (`roll_q1` is off), and once the band settles nothing else
+            # produces one -- the Gaussian clip at 360 supplies them only while
+            # the mean is still high, and log-uniform is continuous so it never
+            # lands on 360 at all. This closes that gap.
+            #
+            # Drawn per BATCH when the sampler is a batch mode, so every sample in
+            # a batch still shares one width and unpadded crops keep collating.
+            if self.fov_full_pano_prob > 0.0:
+                if self.fov_batch_size:
+                    batch = index // self.fov_batch_size
+                    seed = (self.fov_epoch * 7_654_321 + batch * 2_654_435_761) % (2 ** 63)
+                    hit = random.Random(seed).random() < self.fov_full_pano_prob
+                else:
+                    hit = random.random() < self.fov_full_pano_prob
+                if hit:
+                    fov = 360.0
 
             angle = random.randint(0, 359)
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,

@@ -784,6 +784,104 @@ vs 79.98; FoV 70: 36.13 vs 26.45).
 
 ---
 
+## Training never supplies the FoV-360 evaluation input (roundP27)
+
+The FoV-360 column is evaluated on a **seamless panorama rolled to an arbitrary
+azimuth**. `LimitedFoVPad.apply` calls `apply_limited_fov(x, 360, random.randint(0,
+359), pad=True)`, and that function's docstring is explicit: "At exactly 360 the
+panorama is still rolled -- that is the arbitrary-orientation augmentation -- it
+just is not narrowed."
+
+Training does not produce that input once the ground band settles, and the reason
+is structural rather than a tuning accident:
+
+- **`q1` is never rolled.** `ground_roll_q1` is `False` by default, and turning it
+  on is measured harmful — it caps FoV 180 at ~80 and explains 91–99% of the old
+  "wedge is destructive" gap. So `q1` always sits in its native frame.
+- **`q2` is rolled but not panoramic.** `angle = random.randint(0, 359)` is drawn
+  per sample, so the crop takes a random heading, but once the Gaussian mean
+  settles at 90° the width is never near 360.
+
+### Exact 360 is a different kind of input, not a wider one
+
+This is the part that is easy to measure wrongly. "Wide FoV" and "seamless roll"
+are not the same thing, because `fov_index = int(fov/360 * 768)` truncates:
+
+| fov | content columns | blank | seamless |
+|---|---|---|---|
+| 360.0 | **768** | 0 | **yes** |
+| 359.9 | 767 | 1 | no |
+| 359.0 | 765 | 3 | no |
+| 330.0 | 704 | 64 | no |
+| 180.0 | 384 | 384 | no |
+
+A 330° draw is a crop with two tensor edges and 64 blank columns — the same
+*category* of input as a 90° crop, just less of it. Only an exact 360 fills every
+column. So any exposure metric phrased as "≥330°" measures the wrong thing, and an
+earlier analysis that used one reached the wrong conclusion.
+
+### Where the supply comes from today, and where it stops
+
+Only the Gaussian band produces exact-360 samples, and only as a side effect of
+clipping at `hi=360`, which piles an atom there while the mean is still high:
+
+```
+epoch   band mean   q2 = exactly 360
+    1       348.8              39.1%
+    4       315.0              13.1%
+    8       270.0               1.3%
+   12       225.0               0.0%
+  24+        90.0               0.0%
+```
+
+Log-uniform is continuous on `[70, 360]`, so `P(fov = exactly 360) = 0` — **every
+log-uniform run, roundP20 included, had zero exposure to this input in every
+epoch.** That also means roundP20 was never the natural experiment it looked like
+for this question.
+
+### The hypothesis, and the competing explanation
+
+The hypothesis: FoV 360 underperforms because the model is asked at evaluation for
+an input type it last saw around epoch 8.
+
+The competing explanation is the protocol. FoV 360 clusters tightly by protocol and
+barely moves with anything else:
+
+```
+padded     roundP1 95.01   roundP23 95.14   roundP2 95.34
+bordered   roundP4 96.09   roundP14 96.20   roundP12 96.49   roundP3 96.63
+```
+
+If the padded ceiling is ~95.3, the orientation gap costs little and the ~1.1 gap
+is the price of the masked-learning protocol. **roundP27 separates the two:** if
+the orientation gap sets that ceiling, the run breaks out of the padded cluster; if
+it lands inside it again, the padding is the binding constraint and this gap is not
+where the FoV-360 deficit lives.
+
+### `fov_full_pano_prob`, and the two configurations it expresses
+
+One probability plus a window, applied in the trainer so the dataset only sees the
+rate for the current epoch:
+
+```
+warm-up    FOV_FULL_PANO_PROB=1.0  FOV_FULL_PANO_EPOCHS=4    # roundP27
+injection  FOV_FULL_PANO_PROB=0.1  FOV_FULL_PANO_EPOCHS=0    # every epoch
+```
+
+In batch sampling modes the override is drawn per *batch*, so every sample in a
+batch keeps one width and unpadded crops still collate — the parameter stays usable
+with `loguniform_batch` and the 64 px border.
+
+### The retention question roundP27 also tests
+
+The warm-up gives 100% exposure for four epochs and then none for 76, so it assumes
+an early panoramic representation is **retained**. CVACT argues it may not be: there
+FoV 360 peaked at epoch 20 and fell 5.55 once the band settled, with training
+recall still climbing — so the wide representation can be given up while the
+objective improves. If roundP27 gains at FoV 360 but the gain decays over the run,
+the sustained injection at `p=0.1` is the follow-up rather than a longer warm-up.
+
+
 ## All runs
 
 | run | pad | FoV samp | wedge | mask | rncW | τ | q1 roll | FoV 360 | 180 | 90 | 70 | Avg | ep |

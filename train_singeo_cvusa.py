@@ -418,6 +418,19 @@ class Configuration:
     # Inert unless fov_sampling is a Gaussian mode.
     fov_gaussian_clip_lo: Optional[float] = None
 
+    # Probability a sample's ground FoV is overridden to EXACTLY 360, which is the
+    # only draw that yields a seamless panorama rolled to an arbitrary azimuth --
+    # the input the FoV-360 evaluation query is. Training otherwise never supplies
+    # one once the band settles: q1 is never rolled, the Gaussian clip at 360 only
+    # fires while the mean is high (39% of draws at epoch 1, 0% from epoch 12), and
+    # log-uniform is continuous so it never lands on 360.
+    #
+    # `fov_full_pano_epochs` bounds the window: 0 means every epoch, N means the
+    # first N only. So prob=1.0 with epochs=4 is a four-epoch warm-up, and
+    # prob=0.1 with epochs=0 is a steady 10% injection across the run.
+    fov_full_pano_prob: float = 0.0
+    fov_full_pano_epochs: int = 0
+
     # GridDropout/CoarseDropout severity on the *cropped* views (q2 and r2).
     # Those views have already lost most of the image to the FoV crop and the
     # aerial sector; GridDropout at ratio 0.5 then removes half of what is
@@ -437,6 +450,13 @@ class Configuration:
     scheduler: str = "cosine"          # "polynomial" | "cosine" | "constant" | None
     warmup_epochs: int = 1
     lr_end: float = 0.0001             #  only for "polynomial"
+    # Exponent of the polynomial decay. HF computes
+    #   lr = (lr - lr_end) * (1 - progress)**power + lr_end
+    # so power > 1 decays fast then flattens, power < 1 decays slowly and keeps a
+    # usable LR late. 1.5 was hardcoded before this field existed, so that stays
+    # the default. NOTE lr_end defaults to lr, which makes the schedule CONSTANT
+    # -- set lr_end below lr for the decay to do anything.
+    poly_power: float = 1.5
     
     # Dataset
     data_folder = "/home/71/25021871/data/chamodya/CVPR_subset"
@@ -454,6 +474,20 @@ class Configuration:
     
     # Checkpoint to start from
     checkpoint_start = None   
+
+    # Resume an interrupted run: skip to this epoch and fast-forward the LR
+    # schedule to match, so the curricula and the learning rate land where the
+    # original run left off. Only the model weights are in a checkpoint -- the
+    # optimizer moments and scheduler position are not saved -- so a resume is
+    # never bit-exact. Late in a cosine schedule that is immaterial because the
+    # LR is already near zero; resuming mid-run would not be.
+    start_epoch: int = 1
+
+    # On resume, aim the DSS sim-sampling crop at this FoV before rebuilding the
+    # similarity dict. Set it to the measured mean the interrupted run last
+    # logged, which is what dss_fov_from_measured would have applied at that
+    # epoch. None falls back to `fov`, the eval setting.
+    resume_dss_fov: Optional[float] = None
   
     # set num_workers to 0 if on Windows
     num_workers: int = 0 if os.name == 'nt' else 4 
@@ -472,7 +506,7 @@ class Configuration:
     # drives checkpoint selection; these are for reading robustness across the
     # range the curriculum now trains on rather than at one point on it.
     # Set to () to report only `fov`.
-    eval_fov_extra: tuple = (360.0, 180.0, 70.0)
+    eval_fov_extra: tuple = (360.0, 270, 180.0, 70.0)
     random_fov: bool=False
 
     # Keep every ground view at the panorama's full width, filling the azimuths
@@ -532,7 +566,7 @@ class Configuration:
     # same for every sample in a batch cancels. Under a per-batch FoV draw that
     # leaves loss6 as the only term the gate can move; r1-r2 and r2-q1 never vary
     # within a batch under any protocol, since the wedge sector is per-epoch.
-    overlap_gate_measure: str = "containment"
+    overlap_gate_measure: str = "circle"
 
     # Let the overlap gate set the BETWEEN-term balance as well as the
     # within-term one, replacing the hand-set infonce_term_weights hierarchy.
@@ -871,6 +905,13 @@ def write_run_info(path, cfg, run_name, note, overrides):
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
+    if getattr(cfg, "fov_full_pano_prob", 0.0) > 0.0:
+        lines.append("Full-panorama injection: p = {} of samples forced to EXACTLY 360 deg,".format(
+            cfg.fov_full_pano_prob))
+        lines.append("  a seamless roll -- the FoV-360 eval input, which the curriculum")
+        lines.append("  otherwise stops producing once the band settles.")
+        lines.append("  window: {}".format("every epoch" if cfg.fov_full_pano_epochs == 0
+                                           else "epochs 1-{} only".format(cfg.fov_full_pano_epochs)))
     lines.append("DSS ranking FoV: {}".format(
         "measured from the epoch's own crop extents, applied before calc_sim in the same epoch"
         if getattr(cfg, "dss_fov_from_measured", False)
@@ -1478,11 +1519,14 @@ if __name__ == '__main__':
     warmup_steps = len(train_dataloader) * config.warmup_epochs
        
     if config.scheduler == "polynomial":
-        print("\nScheduler: polynomial - max LR: {} - end LR: {}".format(config.lr, config.lr_end))  
+        print("\nScheduler: polynomial - max LR: {} - end LR: {} - power: {}".format(
+            config.lr, config.lr_end, config.poly_power))
+        if config.lr_end >= config.lr:
+            print("  WARNING: lr_end >= lr, so this schedule is CONSTANT at {}".format(config.lr))
         scheduler = get_polynomial_decay_schedule_with_warmup(optimizer,
                                                               num_training_steps=train_steps,
                                                               lr_end = config.lr_end,
-                                                              power=1.5,
+                                                              power=config.poly_power,
                                                               num_warmup_steps=warmup_steps)
         
     elif config.scheduler == "cosine":
@@ -1501,6 +1545,15 @@ if __name__ == '__main__':
         
     print("Warmup Epochs: {} - Warmup Steps: {}".format(str(config.warmup_epochs).ljust(2), warmup_steps))
     print("Train Epochs:  {} - Train Steps:  {}".format(config.epochs, train_steps))
+
+    # Resume: advance the scheduler to the step the original run had reached, so
+    # the LR continues the same cosine curve instead of restarting at warmup.
+    if config.start_epoch > 1 and scheduler is not None:
+        skip = (config.start_epoch - 1) * len(train_dataloader)
+        for _ in range(skip):
+            scheduler.step()
+        print("Resuming at epoch {}: fast-forwarded scheduler {} steps, LR now {:.3e}".format(
+            config.start_epoch, skip, optimizer.param_groups[0]["lr"]))
         
         
     #-----------------------------------------------------------------------------#
@@ -1528,6 +1581,40 @@ if __name__ == '__main__':
                                           cleanup=True)
                 
     #-----------------------------------------------------------------------------#
+    # Resume: rebuild the DSS similarity dict before the first shuffle            #
+    #-----------------------------------------------------------------------------#
+    # The only other pre-loop calc_sim sits inside the zero_shot block, so a
+    # resumed run would otherwise start with sim_dict None and get RANDOM batches
+    # for every epoch until the next eval rebuilt it -- four epochs of easier
+    # negatives than the interrupted run had. One similarity pass over the train
+    # set from the loaded checkpoint restores the composition.
+    # Fires whenever we resume, regardless of what sim_dict currently holds: with
+    # gps_sample on it holds the GEOGRAPHIC neighbour dict, which is SinGeo's
+    # cold-start composition, not the model-similarity ranking the interrupted
+    # run had built from its last eval.
+    if config.start_epoch > 1 and config.sim_sample:
+        dss_fov = config.resume_dss_fov if config.resume_dss_fov else config.fov
+        _, ground_transforms_resume = get_transforms_val(
+            image_size_sat, img_size_ground, mean=mean, std=std,
+            fov=dss_fov,
+            fov_pad=config.fov_pad,
+            fov_pad_random_start=config.fov_pad_random_start,
+            fov_border_px=config.fov_border_px,
+            fov_scatter_pad=config.fov_pad_batch_max,
+            fov_gap_segments=config.fov_gap_segments,
+        )
+        query_dataloader_train.dataset.transforms = ground_transforms_resume
+        print("\nResume DSS: sim-sampling crop aimed at {:.2f} deg, building "
+              "sim_dict before epoch {}".format(dss_fov, config.start_epoch))
+        r1_train, sim_dict = calc_sim(config=config,
+                                      model=model,
+                                      reference_dataloader=reference_dataloader_train,
+                                      query_dataloader=query_dataloader_train,
+                                      ranks=[1, 5, 10],
+                                      step_size=1000,
+                                      cleanup=True)
+
+    #-----------------------------------------------------------------------------#
     # Shuffle                                                                     #
     #-----------------------------------------------------------------------------#            
     if config.custom_sampling:
@@ -1540,7 +1627,7 @@ if __name__ == '__main__':
     #-----------------------------------------------------------------------------#
     best_score = 0
 
-    for epoch in range(1, config.epochs+1):
+    for epoch in range(config.start_epoch, config.epochs+1):
         
         # modulate the ratation prob of the satellite branch
         dataset_rotates_r2 = config.use_rnc and config.aerial_rotation != "continuous"
@@ -1654,6 +1741,17 @@ if __name__ == '__main__':
                 config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None
                 else config.fov_curriculum_end)
             train_dataloader.dataset.fov_hi = 360.0
+            # Full-panorama injection: the window is applied here, so the dataset
+            # only ever sees the probability that applies to THIS epoch.
+            in_window = (config.fov_full_pano_epochs == 0
+                         or epoch <= config.fov_full_pano_epochs)
+            full_pano_p = config.fov_full_pano_prob if in_window else 0.0
+            train_dataloader.dataset.fov_full_pano_prob = full_pano_p
+            if config.fov_full_pano_prob > 0.0:
+                print("For Epoch {}: full-panorama injection p = {:.2f}{}".format(
+                    epoch, full_pano_p,
+                    "" if config.fov_full_pano_epochs == 0
+                    else " (window: epochs 1-{})".format(config.fov_full_pano_epochs)))
             train_dataloader.dataset.fov_border_px = config.fov_border_px
             train_dataloader.dataset.fov_border_q1 = config.fov_border_q1
 
