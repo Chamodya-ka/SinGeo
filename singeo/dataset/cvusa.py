@@ -54,8 +54,9 @@ class BatchMaxPadCollate:
     through `default_collate` unchanged.
     """
 
-    def __init__(self, gap_segments=4):
+    def __init__(self, gap_segments=4, fill=None):
         self.gap_segments = gap_segments
+        self.fill = fill    # per-channel mask fill, see `mask_fill_values`
 
     def __call__(self, batch):
         widths = [sample[1].shape[2] for sample in batch]
@@ -63,7 +64,8 @@ class BatchMaxPadCollate:
 
         if min(widths) != target:
             batch = [(sample[0],
-                      scatter_blank_columns(sample[1], target, self.gap_segments),
+                      scatter_blank_columns(sample[1], target, self.gap_segments,
+                                            fill=self.fill),
                       *sample[2:]) for sample in batch]
 
         return default_collate(batch)
@@ -518,6 +520,13 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # paired rotate below. Off by default; see __getitem__ for why.
         self.roll_q1 = False
 
+        # Per-channel tensor value for every blank region this dataset writes:
+        # the ground crop's padding or border, the panorama border, the aerial
+        # wedge mask and its rotation corners. None is a tensor zero, the
+        # dataset mean colour (the historical fill); see `mask_fill_values`.
+        # Must match the eval transforms' `mask_fill`.
+        self.mask_fill = None
+
         # Also emit the aerial wedge's keep-mask and its coverage, so the encoder
         # can exclude blank positions (singeo.masked_encoder). Off by default: the
         # returned tuple and every random draw stay exactly as before.
@@ -636,7 +645,8 @@ class CVUSADatasetTrainSinGeo(Dataset):
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                pad=self.fov_pad,
                                                                pad_random_start=self.pad_random_start,
-                                                               border_px=self.fov_border_px)
+                                                               border_px=self.fov_border_px,
+                                                               fill=self.mask_fill)
             # Panorama frame -> compass bearing, the frame the wedge is placed in
             # and every arc comparison assumes. See CVUSA_PANO_COL0_BEARING.
             g_center = (g_center + CVUSA_PANO_COL0_BEARING) % 360.0
@@ -674,10 +684,12 @@ class CVUSADatasetTrainSinGeo(Dataset):
                 if self.return_aerial_mask:
                     reference_img2, aerial_mask = apply_aerial_sector(
                         reference_img2, rot, s_center, self.sat_arc,
-                        circular_mask=self.aerial_circular_mask, return_mask=True)
+                        circular_mask=self.aerial_circular_mask, return_mask=True,
+                        fill=self.mask_fill)
                 else:
                     reference_img2 = apply_aerial_sector(reference_img2, rot, s_center, self.sat_arc,
-                                                         circular_mask=self.aerial_circular_mask)
+                                                         circular_mask=self.aerial_circular_mask,
+                                                         fill=self.mask_fill)
                 meta[M_SAT_CENTER] = s_center
                 meta[M_SAT_EXTENT] = self.sat_arc
             else:
@@ -753,7 +765,7 @@ class CVUSADatasetTrainSinGeo(Dataset):
 
         # Last, so every roll above acts on the bare panorama.
         if self.fov_border_q1 and self.fov_border_px:
-            query_img1 = add_blank_border(query_img1, self.fov_border_px)
+            query_img1 = add_blank_border(query_img1, self.fov_border_px, fill=self.mask_fill)
 
         label = torch.tensor(idx, dtype=torch.long)
 

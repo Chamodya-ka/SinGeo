@@ -16,6 +16,7 @@ from transformers import get_constant_schedule_with_warmup, get_polynomial_decay
 from singeo.dataset.cvusa import BatchMaxPadCollate, CVUSADatasetEval, CVUSADatasetTrainSinGeo
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
+from singeo.transforms import MASK_FILL_MODES, mask_fill_values
 from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor, get_gaussian_fov_mean
 
 from singeo.utils import setup_system, Logger
@@ -431,6 +432,16 @@ class Configuration:
     fov_full_pano_prob: float = 0.0
     fov_full_pano_epochs: int = 0
 
+    # Hold the ground FoV schedule at its 360 deg start for this many epochs
+    # before the narrowing begins. Set it equal to `fov_full_pano_epochs` for a
+    # full-panorama warm-up, so the band does not advance underneath the warm-up
+    # and then hand over with a jump: without it a 4-epoch warm-up at 360 is
+    # followed by a band already centred at 303.75, because the schedule kept
+    # running while it was being overridden. The ramp still LASTS
+    # `ramp_frac * epochs`; it just starts later, so with delay 4 and ramp_frac
+    # 0.3 over 80 epochs the mean walks 360 -> 90 across epochs 5 to 28.
+    fov_ramp_delay_epochs: int = 0
+
     # GridDropout/CoarseDropout severity on the *cropped* views (q2 and r2).
     # Those views have already lost most of the image to the FoV crop and the
     # aerial sector; GridDropout at ratio 0.5 then removes half of what is
@@ -638,6 +649,20 @@ class Configuration:
     #
     # Applies to training and evaluation together, like `fov_pad` itself.
     fov_pad_random_start: bool=True
+
+    # Colour of every blank region the masks write: the ground crop's padding or
+    # border, the panorama border, the aerial wedge mask and its rotation corners.
+    #   "mean"   tensor zero after A.Normalize = the dataset mean colour,
+    #            RGB (124, 116, 104). The historical fill; bit-identical default.
+    #   "black"  pixel zero = (0 - mean) / std per channel, ~(-2.12, -2.04, -1.80).
+    # The mean colour sits close to real flat content (asphalt, dirt, overcast
+    # sky); flat black is rare in daytime CVUSA. If teaching the shared encoder to
+    # discount the fill also discounts real flat regions -- one candidate for the
+    # ~1.2 R@1 the padded protocol costs at FoV 360 -- black should leak less.
+    # Training and evaluation use the same value. Needs the RNC dataset path.
+    # The albumentations Coarse/GridDropout holes are pixel zeros (black)
+    # already and are not affected.
+    mask_fill: str = "mean"
 
     # Give the uncropped panorama (q1) its own uniform roll in training.
     #
@@ -912,6 +937,10 @@ def write_run_info(path, cfg, run_name, note, overrides):
         lines.append("  otherwise stops producing once the band settles.")
         lines.append("  window: {}".format("every epoch" if cfg.fov_full_pano_epochs == 0
                                            else "epochs 1-{} only".format(cfg.fov_full_pano_epochs)))
+    lines.append("Mask fill: {}".format({
+        "mean": "mean colour (tensor zero after Normalize), the historical fill",
+        "black": "BLACK (pixel zero) for every mask: ground pad/border, wedge, rotation corners",
+    }.get(getattr(cfg, "mask_fill", "mean"), getattr(cfg, "mask_fill", "mean"))))
     lines.append("DSS ranking FoV: {}".format(
         "measured from the epoch's own crop extents, applied before calc_sim in the same epoch"
         if getattr(cfg, "dss_fov_from_measured", False)
@@ -1116,13 +1145,17 @@ if __name__ == '__main__':
     train_dataset.pad_random_start = config.fov_pad_random_start
     train_dataset.roll_q1 = config.ground_roll_q1
     train_dataset.return_aerial_mask = config.aerial_mask_mode != "off"
+    # One fill for every mask (ground pad/border, wedge, rotation corners); the
+    # eval transforms below get the same `mask_fill`.
+    mask_fill = mask_fill_values(config.mask_fill, mean, std)
+    train_dataset.mask_fill = mask_fill
 
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
                                   pin_memory=True,
-                                  collate_fn=BatchMaxPadCollate(config.fov_gap_segments)
+                                  collate_fn=BatchMaxPadCollate(config.fov_gap_segments, fill=mask_fill)
                                   if config.fov_pad_batch_max else None)
 
 
@@ -1137,6 +1170,7 @@ if __name__ == '__main__':
                                                                fov_border_px=config.fov_border_px,
                                                                fov_scatter_pad=config.fov_pad_batch_max,
                                                                fov_gap_segments=config.fov_gap_segments,
+                                                               mask_fill=config.mask_fill,
                                                                )
 
 
@@ -1167,6 +1201,7 @@ if __name__ == '__main__':
                                                            fov_border_px=config.fov_border_px,
                                                            fov_scatter_pad=config.fov_pad_batch_max,
                                                            fov_gap_segments=config.fov_gap_segments,
+                                                           mask_fill=config.mask_fill,
                                                            )
         query_dataset_test_extra = CVUSADatasetEval(data_folder=config.data_folder ,
                                           split="test",
@@ -1412,6 +1447,19 @@ if __name__ == '__main__':
             "fov_border_px={} with fov_pad=True: they are alternatives. Padding already fills the "
             "crop out to the panorama width, so a border adds nothing.".format(config.fov_border_px))
 
+    if config.mask_fill not in MASK_FILL_MODES:
+        raise ValueError("mask_fill must be one of {}, got {!r}".format(MASK_FILL_MODES,
+                                                                          config.mask_fill))
+    if config.mask_fill != "mean" and not config.use_rnc:
+        raise ValueError(
+            "mask_fill={!r} is applied by the RNC dataset path (the training crop and wedge "
+            "live there); without use_rnc the training transforms would still pad with the "
+            "mean colour while evaluation used the new fill.".format(config.mask_fill))
+    print("Mask fill: {}".format(
+        "mean colour (tensor zero, historical)" if config.mask_fill == "mean"
+        else "{} -- tensor value {}".format(config.mask_fill, tuple(
+            round(v, 3) for v in mask_fill_values(config.mask_fill, mean, std)))))
+
     if config.aerial_rotation not in ("continuous", "discrete", "quarter"):
         raise ValueError("aerial_rotation must be 'continuous', 'discrete' or 'quarter', "
                          "got {!r}".format(config.aerial_rotation))
@@ -1602,6 +1650,7 @@ if __name__ == '__main__':
             fov_border_px=config.fov_border_px,
             fov_scatter_pad=config.fov_pad_batch_max,
             fov_gap_segments=config.fov_gap_segments,
+            mask_fill=config.mask_fill,
         )
         query_dataloader_train.dataset.transforms = ground_transforms_resume
         print("\nResume DSS: sim-sampling crop aimed at {:.2f} deg, building "
@@ -1659,19 +1708,25 @@ if __name__ == '__main__':
         # fixed FoV to rank with) and for logging. The geometric mean of the
         # draw is the honest representative, so use that.
         fov_mean = None
+        # Delay the narrowing so a full-panorama warm-up hands over smoothly: the
+        # schedule is evaluated at `epoch - delay`, held at 0 during the warm-up,
+        # so the ramp starts where the warm-up ends instead of having advanced
+        # underneath it. Duration is unchanged -- still ramp_frac * epochs.
+        ramp_epoch = max(0, epoch - config.fov_ramp_delay_epochs)
+
         if config.fov_sampling.startswith("gaussian"):
             # The band centre. `fov_dynamic` is the representative the
             # sim-sampling loader and the logs need, and for a symmetric draw
             # the mean is that representative -- clipped, since the loader
             # cannot be handed a FoV outside the legal range.
-            fov_mean = get_gaussian_fov_mean(epoch, config.epochs,
+            fov_mean = get_gaussian_fov_mean(ramp_epoch, config.epochs,
                                              fov_start=360.0,
                                              fov_end=config.fov_curriculum_end,
                                              ramp_frac=config.fov_gaussian_ramp_frac)
             fov_floor = None
             fov_dynamic = min(360.0, max(config.fov_curriculum_end, fov_mean))
         elif config.fov_sampling.startswith("loguniform"):
-            fov_floor = get_dynamic_fov_floor(epoch, config.epochs,
+            fov_floor = get_dynamic_fov_floor(ramp_epoch, config.epochs,
                                               fov_start=360.0,
                                               fov_end=config.fov_curriculum_end,
                                               ramp_frac=config.fov_ramp_frac)
@@ -1703,6 +1758,7 @@ if __name__ == '__main__':
                                                         fov_border_px=config.fov_border_px,
                                                         fov_scatter_pad=config.fov_pad_batch_max,
                                                         fov_gap_segments=config.fov_gap_segments,
+                                                        mask_fill=config.mask_fill,
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
@@ -1849,6 +1905,7 @@ if __name__ == '__main__':
                         fov_border_px=config.fov_border_px,
                         fov_scatter_pad=config.fov_pad_batch_max,
                         fov_gap_segments=config.fov_gap_segments,
+                        mask_fill=config.mask_fill,
                     )
                     query_dataloader_train.dataset.transforms = ground_transforms_measured
                     print("DSS FoV: measured {:.2f} deg this epoch "

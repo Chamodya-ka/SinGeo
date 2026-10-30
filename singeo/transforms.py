@@ -458,9 +458,45 @@ class Zoomin(ImageOnlyTransform):
         torch_tensor_resize = Resize([int(ratio*self.img_size[0]), int(ratio*self.img_size[1])])
         resized_tensor = torch_tensor_resize(x)
         
-        return resized_tensor   
+        return resized_tensor
 
-def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px=0):
+
+MASK_FILL_MODES = ("mean", "black")
+
+
+def mask_fill_values(mode, mean, std):
+    """Per-channel *tensor* value written into masked or padded positions.
+
+    Every mask in this repo is applied after `A.Normalize`, so the historical
+    fill -- a tensor zero -- decodes to the dataset mean colour, RGB
+    (124, 116, 104) for the ImageNet statistics. That is `"mean"`, and it is
+    returned as `None` so every caller keeps its original `torch.zeros` path
+    bit for bit.
+
+    `"black"` is a pixel zero instead: `(0 - mean) / std` per channel, about
+    (-2.12, -2.04, -1.80) for ImageNet. Flat black is rare in daytime street
+    and aerial imagery, where the mean colour sits close to asphalt, dirt and
+    overcast sky -- which is the point of trying it.
+    """
+    if mode == "mean":
+        return None
+    if mode == "black":
+        return tuple(-float(m) / float(s) for m, s in zip(mean, std))
+    raise ValueError("mask_fill must be one of {}, got {!r}".format(MASK_FILL_MODES, mode))
+
+
+def blank_canvas(channels, height, width, like, fill=None):
+    """`[channels, height, width]` filled with `fill` (per channel), or zeros.
+
+    `fill=None` is exactly `torch.zeros`, the historical mean-colour fill.
+    """
+    out = torch.zeros(channels, height, width, dtype=like.dtype, device=like.device)
+    if fill is not None:
+        out += torch.as_tensor(fill, dtype=like.dtype, device=like.device).view(-1, 1, 1)
+    return out
+
+
+def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px=0, fill=None):
     """Ground FoV crop that also reports the azimuth arc it kept.
 
     Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
@@ -506,6 +542,10 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
 
             Set it the same way for training and evaluation. Padding one side
             only trades the shortcut for a plain geometry mismatch.
+        border_px: fixed blank margin on each side of the crop instead of `pad`.
+        fill: per-channel tensor value for the padded or bordered columns, from
+            :func:`mask_fill_values`. `None` (default) is a tensor zero, the
+            dataset mean colour. Must match between training and evaluation.
 
     Returns:
         `(cropped, center_deg, extent_deg)` where the arc is expressed in the
@@ -538,7 +578,8 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
         # statistics this repo trains with -- not to black. Every pipeline that
         # reaches here crops after Normalize/ToTensorV2, so that holds
         # everywhere; move the crop before Normalize and it would not.
-        filled = torch.zeros_like(x)
+        # `fill` swaps that colour (see `mask_fill_values`); None keeps it.
+        filled = blank_canvas(x.shape[0], x.shape[1], width, x, fill)
 
         # Random start, but bounded so the block never wraps the tensor edge:
         # the kept azimuths stay one contiguous run of columns. See `pad` above
@@ -570,8 +611,7 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
         # Unlike `pad`, this keeps the width proportional to the FoV, so the
         # per-batch FoV draw still collates: every crop in a batch is the same
         # width, plus the same constant border.
-        bordered = torch.zeros(x.shape[0], x.shape[1], fov_index + 2 * border_px,
-                               dtype=x.dtype, device=x.device)
+        bordered = blank_canvas(x.shape[0], x.shape[1], fov_index + 2 * border_px, x, fill)
         bordered[:, :, border_px:border_px + fov_index] = cropped
         cropped = bordered
 
@@ -632,7 +672,8 @@ def draw_quarter_rotation(rng=None):
     return 90.0 * source.randint(0, 3)
 
 
-def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False):
+def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False,
+                        fill=None):
     """Aerial analogue of the ground FoV crop: rotate the tile, keep a wedge.
 
     The aerial branch's counterpart to a limited ground FoV is a limited
@@ -656,6 +697,9 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
             `CircularMask` in the existing continuous-rotation pipeline.
         return_mask: also return the `[1, H, W]` hard keep-mask (sector and
             disc, in the rotated frame), for mask-aware encoding of this view.
+        fill: per-channel tensor value for everything outside the kept region,
+            rotation corners included, from :func:`mask_fill_values`. `None`
+            (default) is a tensor zero, the dataset mean colour.
 
     Returns:
         `[C, H, W]` tensor, same shape as the input; with `return_mask`, the
@@ -673,7 +717,10 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
             # property of this code rather than of the library version.
             x = torch.rot90(x, k=int(float(rot_deg) // 90.0), dims=(1, 2))
         else:
-            x = TF.rotate(x.unsqueeze(0), float(rot_deg)).squeeze(0)
+            # The corners the rotation exposes take the mask fill too, so every
+            # blank region of this view has one colour.
+            x = TF.rotate(x.unsqueeze(0), float(rot_deg),
+                          fill=None if fill is None else [float(v) for v in fill]).squeeze(0)
 
     if arc_extent >= 360.0 and not circular_mask:
         return (x, torch.ones_like(x[:1])) if return_mask else x
@@ -700,30 +747,33 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
         mask &= dist <= radius
 
     keep = mask.unsqueeze(0).to(x.dtype)
+    out = x * keep
+    if fill is not None:
+        out = out + blank_canvas(x.shape[0], height, width, x, fill) * (1.0 - keep)
     if return_mask:
-        return x * keep, keep
-    return x * keep
+        return out, keep
+    return out
 
 
-def add_blank_border(x, border_px):
+def add_blank_border(x, border_px, fill=None):
     """`[C, H, W]` -> `[C, H, W + 2*border_px]`, the view centred on blank columns.
 
     The symmetric counterpart of `apply_limited_fov(..., border_px=...)`, for views
     that are never cropped -- the full panorama. Zero after `A.Normalize` is the
-    dataset mean colour, the same fill the crops get.
+    dataset mean colour, the same fill the crops get; `fill` overrides it the
+    same way it does there.
 
     Apply it LAST. The paired rotation block rolls the panorama, and rolling a
     bordered tensor would wrap the blank into the middle of the scene.
     """
     if border_px <= 0:
         return x
-    out = torch.zeros(x.shape[0], x.shape[1], x.shape[2] + 2 * border_px,
-                      dtype=x.dtype, device=x.device)
+    out = blank_canvas(x.shape[0], x.shape[1], x.shape[2] + 2 * border_px, x, fill)
     out[:, :, border_px:border_px + x.shape[2]] = x
     return out
 
 
-def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
+def scatter_blank_columns(crop, width, gap_segments=4, rng=None, fill=None):
     """Widen `crop` to `width` by inserting blank columns in 1..N random runs.
 
     The crop's own columns keep their order and spacing inside each run of scene;
@@ -740,10 +790,13 @@ def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
         gap_segments: maximum number of blank runs; the count is drawn uniformly
             from `1..min(gap_segments, budget)`.
         rng: optional `random.Random` for reproducible placement.
+        fill: per-channel value for the blank runs (see `mask_fill_values`);
+            `None` is a tensor zero.
 
     Returns:
         `[C, H, width]` with the crop's columns in order and the rest zero, which
-        after `A.Normalize` is the dataset mean colour, exactly like `fov_pad`.
+        after `A.Normalize` is the dataset mean colour, exactly like `fov_pad`
+        (or `fill`, when given).
     """
     source = rng if rng is not None else random
     budget = int(width) - crop.shape[2]
@@ -761,8 +814,7 @@ def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
     # after the last, so the ends stay reachable.
     points = sorted(source.randint(0, crop.shape[2]) for _ in range(count))
 
-    out = torch.zeros(crop.shape[0], crop.shape[1], int(width), dtype=crop.dtype,
-                      device=crop.device)
+    out = blank_canvas(crop.shape[0], crop.shape[1], int(width), crop, fill)
     written = 0      # columns of `out` already filled
     taken = 0        # columns of `crop` already copied
     for point, size in zip(points, sizes):
@@ -771,7 +823,7 @@ def scatter_blank_columns(crop, width, gap_segments=4, rng=None):
             out[:, :, written:written + chunk] = crop[:, :, taken:point]
             written += chunk
             taken = point
-        written += size          # the blank run: `out` is already zero there
+        written += size          # the blank run: `out` already holds the fill there
     if taken < crop.shape[2]:
         out[:, :, written:written + (crop.shape[2] - taken)] = crop[:, :, taken:]
     return out
@@ -785,16 +837,17 @@ class LimitedFoVScatterPad(ImageOnlyTransform):
     the full width, which is the top of that range.
     """
 
-    def __init__(self, fov=360., gap_segments=4):
+    def __init__(self, fov=360., gap_segments=4, fill=None):
         super(LimitedFoVScatterPad, self).__init__(fov)
         self.fov = fov
         self.gap_segments = gap_segments
+        self.fill = fill
 
     def apply(self, x, **params):
         if self.fov <= 0:
             return x
         cropped, _, _ = apply_limited_fov(x, self.fov, random.randint(0, 359))
-        return scatter_blank_columns(cropped, x.shape[2], self.gap_segments)
+        return scatter_blank_columns(cropped, x.shape[2], self.gap_segments, fill=self.fill)
 
 
 class LimitedFoV(ImageOnlyTransform):
@@ -804,16 +857,18 @@ class LimitedFoV(ImageOnlyTransform):
     changes the tensor the encoder sees, so training and evaluation have to agree.
     """
 
-    def __init__(self, fov=360., border_px=0):
+    def __init__(self, fov=360., border_px=0, fill=None):
         super(LimitedFoV, self).__init__(fov)
         self.fov = fov
         self.border_px = border_px
+        self.fill = fill
 
     def apply(self, x, **params):
         #print(x.shape)
         if self.fov > 0:
             angle = random.randint(0, 359)
-            cropped, _, _ = apply_limited_fov(x, self.fov, angle, border_px=self.border_px)
+            cropped, _, _ = apply_limited_fov(x, self.fov, angle, border_px=self.border_px,
+                                              fill=self.fill)
             return cropped
         else:
             return x
@@ -854,10 +909,11 @@ class LimitedFoVPad(ImageOnlyTransform):
     `fov=361.0` is a sentinel for "draw a fresh FoV in [180, 360] per sample".
     """
 
-    def __init__(self, fov=360., pad_random_start=True):
+    def __init__(self, fov=360., pad_random_start=True, fill=None):
         super(LimitedFoVPad, self).__init__(fov)
         self.fov = fov
         self.pad_random_start = pad_random_start
+        self.fill = fill
 
     def apply(self, x, **params):
         if self.fov <= 0:
@@ -865,7 +921,8 @@ class LimitedFoVPad(ImageOnlyTransform):
 
         fov = random.randint(180, 360) if self.fov == 361.0 else self.fov
         padded, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True,
-                                         pad_random_start=self.pad_random_start)
+                                         pad_random_start=self.pad_random_start,
+                                         fill=self.fill)
         return padded
 
 
@@ -962,9 +1019,11 @@ def get_transforms_val(image_size_sat,
                        fov_pad_random_start=True,
                        fov_border_px=0,
                        fov_scatter_pad=False,
-                       fov_gap_segments=4):
+                       fov_gap_segments=4,
+                       mask_fill="mean"):
 
-
+    # Colour of the padded / bordered columns. Must match training's `mask_fill`.
+    fill = mask_fill_values(mask_fill, mean, std)
 
     satellite_transforms = A.Compose([A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                                       A.Normalize(mean, std),
@@ -981,10 +1040,13 @@ def get_transforms_val(image_size_sat,
                                    # Must match the training crop: whichever of
                                    # the two is used here has to be used there,
                                    # `pad_random_start` included.
-                                   LimitedFoVScatterPad(fov=fov, gap_segments=fov_gap_segments)
+                                   LimitedFoVScatterPad(fov=fov, gap_segments=fov_gap_segments,
+                                                        fill=fill)
                                    if fov_scatter_pad else
-                                   LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start)
-                                   if fov_pad else LimitedFoV(fov=fov, border_px=fov_border_px),
+                                   LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start,
+                                                 fill=fill)
+                                   if fov_pad else LimitedFoV(fov=fov, border_px=fov_border_px,
+                                                              fill=fill),
                                   ])
             
                

@@ -1707,6 +1707,32 @@ def test_full_pano_window_is_applied_by_epoch():
     assert [effective(0.1, 0, e) for e in (1, 4, 5, 80)] == [0.1, 0.1, 0.1, 0.1]
 
 
+def test_fov_ramp_delay_hands_over_from_a_warm_up_without_a_jump():
+    """With a full-panorama warm-up, the band must be HELD at 360 while it is
+    being overridden, then resume where the warm-up left off. Without the delay
+    the schedule advances underneath the warm-up and epoch 5 resumes far below
+    360, which is a discontinuity in the input the model sees."""
+    from singeo.transforms import get_gaussian_fov_mean
+
+    E, END, RF, WARM = 80, 90.0, 0.3, 4
+    band = lambda e, delay: get_gaussian_fov_mean(
+        max(0, e - delay), E, fov_start=360.0, fov_end=END, ramp_frac=RF)
+
+    # held at the start value for the whole warm-up
+    assert all(band(e, WARM) == 360.0 for e in range(1, WARM + 1))
+
+    # resumes just below 360, not far below it
+    assert 340.0 < band(WARM + 1, WARM) < 360.0
+    assert band(WARM + 1, 0) < 310.0            # the unfixed behaviour
+
+    # duration is unchanged: ramp_frac * epochs == 24 epochs after the warm-up
+    assert band(WARM + int(RF * E), WARM) == END
+    assert band(WARM + int(RF * E) - 1, WARM) > END
+
+    # and it stays at the floor thereafter
+    assert band(E, WARM) == END
+
+
 def test_positives_only_zeroes_the_same_domain_groups():
     """With two views per domain, g2g/a2a have a single same-location reference
     whose rank set is itself, so they contribute exactly 0."""

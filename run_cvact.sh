@@ -12,6 +12,9 @@
 #   roundC3   the FAITHFUL P12 replica: continuous tile rotation, as P12 ran it
 #   roundC4   C3 but RnC ranks negatives by true ground distance (geo tiering)
 #   roundC5   C3 with the 40-epoch ramp: the missing cell of the ramp x rotation 2x2
+#   roundC7   the roundP23 recipe on CVACT, mean-colour fill (control for C8)
+#   roundC8   C7 with mask_fill black (CVUSA twin: roundP29)
+#   roundC9   C7 with RnC on the cross-domain groups only (CVUSA twin: roundP32)
 #
 # NOTE ON ROTATION. COMMON carries aerial_rotation=continuous, which is what
 # roundP12 actually ran. roundC1 and roundC2 were launched with quarter by
@@ -67,6 +70,34 @@ COMMON=(
     SINGEO_AERIAL_CIRCULAR_MASK=false
     SINGEO_CROP_DROPOUT_STRENGTH=0.5
     SINGEO_RNC_TAU=0.5
+    SINGEO_NUM_WORKERS=4
+)
+
+# The roundP23 recipe (CVUSA run.sh) for CVACT. Fields whose CVACT default
+# differs from the CVUSA default P23 ran on are set explicitly:
+# crop_dropout_strength (CVACT 1 vs 0.5), dss_fov_from_measured, the circle gate.
+# 270 is added to the extra evals to match P23's columns.
+P23=(
+    SINGEO_SEED=None
+    SINGEO_FOV_PAD=true
+    SINGEO_FOV_BORDER_PX=0
+    SINGEO_FOV_SAMPLING=gaussian
+    SINGEO_FOV_GAUSSIAN_STD=40.0
+    SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3
+    SINGEO_FOV_CURRICULUM_END=90.0
+    SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0
+    SINGEO_RNC_WEIGHT=0.25
+    SINGEO_RNC_TAU=0.5
+    SINGEO_RNC_POSITIVES_ONLY=true
+    SINGEO_RNC_HARDEST_NEGATIVE=true
+    SINGEO_AERIAL_ROTATION=continuous
+    SINGEO_AERIAL_CIRCULAR_MASK=false
+    SINGEO_OVERLAP_GATE_MEASURE=circle
+    SINGEO_INFONCE_GATE_SCALES_TERMS=true
+    SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)'
+    SINGEO_DSS_FOV_FROM_MEASURED=true
+    SINGEO_CROP_DROPOUT_STRENGTH=0.5
+    SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0)'
     SINGEO_NUM_WORKERS=4
 )
 
@@ -201,6 +232,81 @@ and continuous tile rotation, and this is the only cell of the grid missing. If
 C5 lands below C3 by roughly the same 2.65 the ramp effect is additive and the
 question is closed; if the gap shrinks or reverses, the two settings interact and
 the ramp conclusion from C1 against C2 does not generalise.'
+    ;;
+roundC7)
+    echo "Round C7 - roundP23 on CVACT, mean-colour fill: the control for C8 [80 ep]"
+    echo "  CVUSA reference: P23 80.80 Avg (FoV 360/180/90/70 = 95.14/90.62/73.55/63.89)"
+    launch roundC7-cvact-p23 "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RUN_NOTE='C7. The roundP23 recipe on CVACT with the historical mean colour fill: the
+control that roundC8 changes in one field. Padded to full width, per sample
+Gaussian FoV band N(mean, 40) clipped to 70 to 360 with the mean walking 360 to
+90 over the first 30 pct, wedge, positives plus hardest negative RnC at 0.25,
+circle gate scaling the terms with flat term weights. crop_dropout_strength is
+set to 0.5 explicitly because the CVACT default is 1 while P23 ran on the CVUSA
+default of 0.5; dss_fov_from_measured and the circle measure are also set
+because their CVACT defaults differ.
+
+WHY A NEW CONTROL. roundC6 ran the P22 recipe (std 30) on server A from code
+that never reached this repo, so it differs from C8 in the stack, the band width
+and possibly more. C7 differs from C8 only in the fill colour.
+
+ALSO WORTH READING ON ITS OWN. C7 against roundC3 (bordered P12 replica, 79.87
+at FoV 360) is the closest CVACT measurement yet of what the padded P23 recipe
+costs at 360, still bundled with the Gaussian band and the gate scaling.'
+    ;;
+roundC8)
+    echo "Round C8 - roundP23 on CVACT with mask_fill black [80 ep]"
+    echo "  control roundC7 (same recipe, mean fill); CVUSA twin roundP29"
+    launch roundC8-cvact-p23-black "${P23[@]}" \
+        SINGEO_MASK_FILL=black \
+        SINGEO_RUN_NOTE='C8. roundC7 with mask_fill black and nothing else changed. Every pad, wedge
+mask and rotation corner is a pixel zero instead of the mean colour RGB 124 116
+104.
+
+WHY CVACT. CVACT ground panoramas are full spheres squashed to 140 by 768, so the
+road under the car is a wide flat grey band almost exactly the mean colour.
+Measured on 300 images per set with 32 px patches: flat and within 30 of the mean
+colour, CVACT ground 3.5 pct against CVUSA ground 0.6 pct, about six times more;
+flat and near black, 0.0 pct in both. In road heavy CVACT views 19 to 21 of 96
+patches match the fill. Hypothesis: padded training teaches the shared encoder
+that flat mean coloured regions are fill, fill means a narrower view, so a CVACT
+panorama with a large road band reads as partly filled. FoV 360 is the only
+query with no real fill, which would make it the column that suffers, and it is:
+CVACT FoV 360 under the padded recipe fell 5.55 after epoch 20 in roundC6
+against 2.2 to 2.5 in the bordered runs.
+
+READING. Control roundC7. If FoV 360 rises clearly with 90 and 70 held, the fill
+colour is part of the CVACT 360 problem. Compare with the CVUSA twin roundP29: a
+larger gain here than there is what the hypothesis predicts. If nothing moves,
+the fixed share of fill in the descriptor is the cost, not its colour.
+
+CAVEATS. CVACT tiles hold a few real pure black pixels (3 to 359 per sampled
+tile, isolated, never a flat 32 px patch). Coarse and GridDropout holes are
+already black, so the masks now share their colour with that augmentation.'
+    ;;
+roundC9)
+    echo "Round C9 - roundP32 on CVACT: C7 with RnC on the cross-domain groups only [80 ep]"
+    echo "  control roundC7 (same recipe, all four RnC groups); CVUSA twin roundP32 82.58 vs P23 80.80"
+    launch roundC9-cvact-p32 "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RUN_NOTE='C9. The roundP32 recipe on CVACT: roundC7 (roundP23 on CVACT, mean fill) with
+rnc_group_weights (1, 0, 1, 0) and nothing else changed. RnC keeps only the
+cross-domain groups g2a and a2g; g2g and a2a are still computed and logged but
+leave the loss. rnc_weight stays 0.25.
+
+WHY. On CVUSA this one field took roundP23 80.80 to roundP32 82.58 Avg (FoV
+360/180/90/70 = 95.05/92.17/76.16/66.94 against 95.14/90.62/73.55/63.89), the
+best CVUSA result so far, with the gain at the narrow end. Under positives-only
+plus hardest negative the same-domain groups reduce to a soft triplet that never
+sees the crop FoV or wedge sector; the graded overlap ordering lives only in the
+cross-domain groups. This asks whether that transfers to CVACT.
+
+READING. The one-variable control is roundC7, which has not run yet. Until it
+has, the nearest CVACT references are the bordered runs roundC1 52.50 and
+roundC3 52.44 Avg, a different protocol. Read all four columns, and watch FoV 360:
+CVACT FoV 360 fell after epoch 20 under the padded recipe in roundC6.'
     ;;
 roundC0)
     echo "Round C0 - CVACT baseline: border only, no wedge, no RnC [80 ep]"

@@ -12,6 +12,7 @@ from glob import glob
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
+                               draw_gaussian_fov,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
                                scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
@@ -36,8 +37,9 @@ class BatchMaxPadCollate:
     through `default_collate` unchanged.
     """
 
-    def __init__(self, gap_segments=4):
+    def __init__(self, gap_segments=4, fill=None):
         self.gap_segments = gap_segments
+        self.fill = fill    # per-channel mask fill, see `mask_fill_values`
 
     def __call__(self, batch):
         widths = [sample[1].shape[2] for sample in batch]
@@ -45,7 +47,8 @@ class BatchMaxPadCollate:
 
         if min(widths) != target:
             batch = [(sample[0],
-                      scatter_blank_columns(sample[1], target, self.gap_segments),
+                      scatter_blank_columns(sample[1], target, self.gap_segments,
+                                            fill=self.fill),
                       *sample[2:]) for sample in batch]
 
         return default_collate(batch)
@@ -302,6 +305,23 @@ class CVACTDatasetTrainSinGeo(Dataset):
         self.fov_batch_size = None
         self.fov_epoch = 0
 
+        # Gaussian FoV band, as in CVUSADatasetTrainSinGeo. When the trainer sets
+        # `ground_fov_mean`, each crop's FoV is drawn from N(mean, std) clipped to
+        # [fov_lo, fov_hi]; per batch when `fov_batch_size` is set, else per
+        # sample. `None` (default) leaves the log-uniform / fixed paths untouched.
+        self.ground_fov_mean = None
+        self.ground_fov_std = 20.0
+        self.fov_lo = 70.0
+        self.fov_hi = 360.0
+        # Created lazily in each worker: a Generator built before fork would be
+        # copied into every worker, which would then all draw the same sequence.
+        self._fov_rng = None
+
+        # Per-channel tensor value for every blank region this dataset writes
+        # (ground pad/border, panorama border, wedge mask, rotation corners).
+        # None is a tensor zero, the dataset mean colour; see `mask_fill_values`.
+        self.mask_fill = None
+
         # Written BY the trainer, read by the training script -- the one piece
         # of curriculum state that flows outward rather than in. After each
         # epoch `train_contrast_singeo_rnc` stores the mean realised crop extent
@@ -408,7 +428,21 @@ class CVACTDatasetTrainSinGeo(Dataset):
 
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
-            if self.ground_fov_floor is None:
+            if self.ground_fov_mean is not None:
+                if self.fov_batch_size:
+                    # One Gaussian draw per batch, seeded from (epoch, batch) so
+                    # every worker agrees on it -- same as the log-uniform batch path.
+                    batch = index // self.fov_batch_size
+                    seed = (self.fov_epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi,
+                                            rng=np.random.default_rng(seed))
+                else:
+                    if self._fov_rng is None:
+                        self._fov_rng = np.random.default_rng()
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi, rng=self._fov_rng)
+            elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
                 batch = index // self.fov_batch_size
@@ -421,7 +455,8 @@ class CVACTDatasetTrainSinGeo(Dataset):
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                 pad=self.fov_pad,
                                                                 pad_random_start=self.pad_random_start,
-                                                                border_px=self.fov_border_px)
+                                                                border_px=self.fov_border_px,
+                                                                fill=self.mask_fill)
             # Panorama frame -> compass bearing, the frame the wedge is placed in
             # and every arc comparison assumes. See CVUSA_PANO_COL0_BEARING.
             g_center = (g_center + CVACT_PANO_COL0_BEARING) % 360.0
@@ -459,10 +494,12 @@ class CVACTDatasetTrainSinGeo(Dataset):
                 if self.return_aerial_mask:
                     reference_img2, aerial_mask = apply_aerial_sector(
                         reference_img2, rot, s_center, self.sat_arc,
-                        circular_mask=self.aerial_circular_mask, return_mask=True)
+                        circular_mask=self.aerial_circular_mask, return_mask=True,
+                        fill=self.mask_fill)
                 else:
                     reference_img2 = apply_aerial_sector(reference_img2, rot, s_center, self.sat_arc,
-                                                            circular_mask=self.aerial_circular_mask)
+                                                            circular_mask=self.aerial_circular_mask,
+                                                            fill=self.mask_fill)
                 meta[M_SAT_CENTER] = s_center
                 meta[M_SAT_EXTENT] = self.sat_arc
             else:
@@ -512,7 +549,7 @@ class CVACTDatasetTrainSinGeo(Dataset):
             width = query_img1.shape[2]
             query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
         if self.fov_border_q1 and self.fov_border_px:
-            query_img1 = add_blank_border(query_img1, self.fov_border_px)
+            query_img1 = add_blank_border(query_img1, self.fov_border_px, fill=self.mask_fill)
 
 
         label = torch.tensor(idnum, dtype=torch.long)  

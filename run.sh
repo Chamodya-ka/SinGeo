@@ -50,6 +50,11 @@
 #   roundP25  P23 with a polynomial LR, power 0.5, so the LR survives to e80
 #   roundP26  P23 with rnc_weight 0.4, filling the RnC dose-response
 #   roundP27  P23 with a 4-epoch seamless-rolled-panorama warm-up on q2
+#   roundP30  P23 with the two CROSS-DOMAIN terms halved: gate x role
+#   roundP28  P23 ablation: rnc_weight 0, RnC off on the final recipe
+#   roundP29  P23 with mask_fill black: every pad, border and wedge mask black
+#   roundP31  P23 with unpadded flush ground crops, Gaussian band drawn per batch
+#   roundP32  P23 with RnC on the cross-domain groups only (g2g and a2a weight 0)
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -1607,13 +1612,64 @@ the original run had.
 NOTE. This writes to its own timestamped directory, so the 77 to 80 rows live in
 a separate log from epochs 1 to 77 of the original run.'
     ;;
-roundP27)
-    echo "Round P27 - P23 with q2 forced to a seamless rolled 360 for epochs 1-4 [80 ep]"
-    echo "  control roundP23 80.80, FoV 360 = 95.14"
-    launch roundP27-fullpano-warmup \
+roundP31)
+    echo "Round P31 - P23 with NO ground padding: flush crops, Gaussian band drawn per batch [80 ep]"
+    echo "  control roundP23 80.80 (padded); priors B1 79.23 / B2fix 73.18 (flush, server A)"
+    launch roundP31-p23-nopad-batchfov \
         SINGEO_SEED=None \
-        SINGEO_FOV_FULL_PANO_PROB=1.0 \
-        SINGEO_FOV_FULL_PANO_EPOCHS=4 \
+        SINGEO_FOV_PAD=false SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian_batch \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P31. roundP23 with the ground crop left UNPADDED: no fill and no border, so a
+crop is a narrow tensor flush against both edges, the protocol SinGeo publishes
+under. Unpadded crops of different widths cannot collate, so the Gaussian band is
+drawn once per batch (gaussian_batch) instead of per sample. Everything else is
+roundP23, the aerial wedge included: masking stays on the aerial branch only.
+
+WHY. Padding costs about 1.2 R@1 at FoV 360 in every matched pair (P1 vs P3,
+P2 vs P4, P12b vs P12). Removing the fill entirely should recover it, as round4aB1
+did: flush, no wedge, FoV 360 96.32, level with the bordered runs.
+
+THE RISK, FROM PRIOR RUNS. Flush crops are what made the wedge destructive.
+round4aB1 (flush, no wedge) 79.23 against round4aB2fix (flush, wedge, all pairs
+RnC) 73.18, minus 6.05, at every FoV including 360 (89.55). The same wedge and
+RnC under a 64 px border gave roundP4 82.09, so B2fix minus P4 is minus 8.9 with
+only the protocol changed. And without the wedge, flush still trailed the border
+at the narrow end (B1 vs P3: minus 1.35 at 90, minus 2.86 at 70), the tensor edge
+artefact. Both B runs were on server A, all pairs RnC with GEE tiering, quarter
+rotation and the containment gate.
+
+WHAT IS NEW. The positives plus hardest negative RnC and the circle gate scaling
+the terms have never met flush crops. This run asks whether the current loss
+rescues the wedge on the unpadded protocol, and gives a number with no border or
+padding caveat attached.
+
+READING. Control roundP23 80.80 (95.14 / 90.62 / 73.55 / 63.89). Expect FoV 360
+up toward 96. If 90 and 70 hold near P23, the current loss has fixed what broke
+B2fix and padding is dispensable. If they fall several points, the flush edge
+still breaks the wedge and the 4 px border variant is the next step.
+
+CONTROLS. roundP23 80.80 padded. roundP30 running, P23 with cross domain terms
+halved. round4aB1 79.23 and round4aB2fix 73.18, flush, server A.'
+    ;;
+roundP29)
+    echo "Round P29 - P23 with mask_fill black: all padding and masks black, not mean colour [80 ep]"
+    echo "  control roundP23 80.80, FoV 360 = 95.14; one variable: the fill colour"
+    launch roundP29-maskfill-black \
+        TMPDIR=/home/71/25021871/data/chamodya/tmp \
+        SINGEO_SEED=None \
+        SINGEO_MASK_FILL=black \
         SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
         SINGEO_FOV_SAMPLING=gaussian \
         SINGEO_FOV_GAUSSIAN_STD=40.0 \
@@ -1628,41 +1684,250 @@ roundP27)
         SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
         SINGEO_DSS_FOV_FROM_MEASURED=true \
         SINGEO_NUM_WORKERS=4 \
-        SINGEO_RUN_NOTE='P27. roundP23 with a four epoch warm up in which every q2 is a SEAMLESS
-panorama rolled to a random azimuth, fov forced to exactly 360.
+        SINGEO_RUN_NOTE='P29. roundP23 with mask_fill black and nothing else changed. Every blank
+region the masks write, the ground crop padding, the aerial wedge mask and the
+tile rotation corners, is a pixel zero (black) instead of a tensor zero, which
+decodes to the dataset mean colour RGB 124 116 104. Training and evaluation use
+the same fill, so every FoV column is scored on the protocol it was trained on.
+
+WHY. The padded protocol costs about 1.2 R@1 at FoV 360 against the 64 px border
+in every pair measured (P1 95.01 vs P3 96.63, P12b 95.16 vs P12 96.36) and
+nothing at 90 or 70. A padded 90 deg crop pools about 45 pct of its last stage
+positions from fill that is identical for every image. One candidate mechanism:
+teaching the shared encoder to discount that mean coloured fill also discounts
+real flat regions of similar colour, asphalt, dirt, overcast sky, which full
+panoramas and tiles are full of. Flat black is rare in daytime CVUSA, so a black
+fill should leak less if that is the mechanism.
+
+READING. Control roundP23 80.80, FoV 360 95.14. If 360 moves toward the bordered
+cluster, 96.09 to 96.63, with 90 and 70 held, the fill colour was being confused
+with real content. If nothing moves, the colour is irrelevant: the fixed share
+of the descriptor is the cost, and the fix is a mask aware encoder rather than
+a different fill.
+
+CONFOUND TO READ WITH IT. GridDropout and CoarseDropout already punch pixel zero
+holes, so in this run the masks share their colour with the dropout augmentation,
+while in roundP23 they were a distinct grey. The model sees black holes on every
+view from epoch 1 either way.
+
+CONTROLS. roundP23 80.80 identical with the mean fill. roundP28 RnC off.
+roundP27 80.79 panorama injection. roundP24 79.43 no wedge narrowing.'
+    ;;
+roundP28)
+    echo "Round P28 - P23 ablation: RnC off (rnc_weight 0), everything else identical [80 ep]"
+    echo "  control roundP23 80.80; P24 79.43 (no wedge narrowing, RnC on)"
+    launch roundP28-p23-nornc \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P28. roundP23 with rnc_weight 0 and nothing else changed: the RnC ablation
+on the final recipe. The RnC groups are still computed and logged, so the ranking
+the model would have been asked for stays visible, but they add nothing to the
+loss. The wedge, the recorded arcs and the circle gate all stay on, which is why
+this uses rnc_weight 0 and not use_rnc false.
+
+WHY. The value of RnC was measured only on the bordered recipe with the
+containment gate: roundP9 78.80 to roundP12 81.24, plus 2.44. roundP23 differs in
+a way that may already cover part of that role. Its circle gate scales whole
+terms, and on the padded protocol the gate alone rescued the wedge without RnC:
+roundP10a 80.70 against roundP1 80.08. So this measures RnC on the recipe the
+thesis uses, and how much of its role the gate already does.
+
+READING. Control roundP23 80.80. Close to that means the gate carries the wedge
+on this recipe and RnC adds little. At or below roundP24 79.43, the no wedge
+narrowing ablation with RnC on, means the wedge again only pays as a graded
+positive, as on the bordered recipe. Read all four columns: RnC has carried its
+earlier gains at FoV 90 and 70.
+
+CONTROLS. roundP23 80.80 identical with RnC at 0.25. roundP26 80.50 at
+rnc_weight 0.4. roundP24 79.43 no wedge narrowing. roundP27 80.79 panorama
+injection.'
+    ;;
+roundP32)
+    echo "Round P32 - P23 with RnC on the cross-domain groups only: g2g, a2a weight 0 [80 ep]"
+    echo "  control roundP23 80.80 (all four groups); roundP28 79.69 (RnC off)"
+    launch roundP32-p23-rnc-crossonly \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P32. roundP23 with rnc_group_weights (1, 0, 1, 0): RnC keeps only the
+cross-domain groups g2a and a2g, and the same-domain groups g2g and a2a leave the
+loss. They are still computed and logged. rnc_weight stays 0.25, so this is one
+variable and the total RnC mass drops by about 30 percent (P23 e80: g2g 0.18 and
+a2a 0.18 of a 1.20 group sum).
+
+WHY. Under positives-only plus hardest negative, a same-domain row has exactly two
+references: the other view of its own location and one mined negative. The anchor
+is itself one of the two views, so there is nothing left to rank by overlap. g2g
+reduces to softplus((cos(anchor, negative) - cos(anchor, other view)) / tau), a soft
+triplet with hardest-negative mining, and the crop FoV and wedge sector never enter
+it (verified: every crop at FoV 10 gives a bit-identical g2g). The graded ordering
+panorama > crop > negative and tile > wedge > negative lives only in a2g and g2a,
+where the anchor is a third view. This tests whether the RnC gain on P23 (plus 1.11
+over roundP28) is the overlap ranking or the extra same-domain triplet.
+
+READING. Control roundP23 80.80. Close to that means the cross-domain ranking
+carries the RnC gain and the same-domain groups are redundant with InfoNCE loss2
+and loss3. Near roundP28 79.69 means the gain came from the same-domain hardest
+negative triplet, not from ranking overlap. Read all four columns.
+
+CONTROLS. roundP23 80.80 all four groups. roundP28 79.69 RnC off. roundP26 80.50
+rnc_weight 0.4.'
+    ;;
+roundP30)
+    echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"
+    echo "  control roundP23 80.80 (flat weights); hand-set reference P2 81.57 padded"
+    launch roundP30-gate-x-role \
+        SINGEO_SEED=None \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 0.5, 0.5, 1.0)' \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P30. roundP23 with infonce_term_weights 1, 1, 1, 0.5, 0.5, 1 instead of
+flat. One field changed. The startup WARNING about non flat term weights with
+gate_scales_terms is expected here: multiplying geometry by a second factor is
+the point of the run, not an accident.
+
+THE QUESTION. The circle gate is a function of the two ARCS alone, and the
+trainer assigns q1 and r1 the identical arc, 0 and 360 from FULL_ARC, so the gate
+cannot tell a ground panorama from an aerial tile. That forces two collisions in
+every epoch: l2 q1-q2 equals l4 r1-q2, both being fov over 360, and l3 r1-r2
+equals l5 r2-q1, both being sector over 360. Verified identical under circle, iou
+and containment alike, because all three read only the arcs.
+
+SinGeo distinguishes exactly those two pairs, 0.5 against 0.25 in both cases, and
+the separating variable is same domain versus cross domain. That information is
+not in the arcs. This run supplies it as a single declared factor, halve the two
+cross domain terms, rather than as six fitted numbers.
+
+PREDICTION, from the run averaged shares. Mean deviation from the hand set shares
+falls from 0.382 to 0.282, only 26 pct closer, and the worst term moves from l5 at
+2.29x to l3 at 1.36x. The factor is cross domain only, so it cannot touch l2,
+which the gate UNDER weights at 0.57x, or l3, over weighted at 1.15x. Both are
+same domain and their error comes from the geometric axis. So expect PART of the
+0.8 to 1.0 gap, not all of it. If most of it comes back anyway, l5 was carrying
+the bulk of the damage.
+
+l6 IS ALSO CROSS DOMAIN and is left at 1.0 on purpose. A strict halve per crossing
+rule would discount it too, but SinGeo does not, placing it at 0.25 alongside l4
+and l5 rather than below them, and the gate already scores it close at 1.05x. The
+l6 variant is a separate question.
+
+WHAT THIS RUN IS FOR. It is a measurement, not a proposed method. If it recovers
+the gap then the missing information is located and a parameter free version is
+worth building, either learned per term scales following the logit_scale
+precedent, or the measured ratio of cross to same domain similarity which
+RankNContrast already names as not comparable. If it does not recover the gap, no
+derived version will either, since they all supply the same one bit.
+
+CONTROLS. roundP23 80.80 is identical with flat weights. roundP2 81.57 is the best
+padded hand set run. roundP12 81.91 bordered hand set against roundP14 80.93
+bordered gate share is where the 0.98 figure comes from.'
+    ;;
+roundP27)
+    echo "Round P27 - P23 with 10% of q2 samples forced to a seamless rolled 360 [80 ep]"
+    echo "  control roundP23 80.80, FoV 360 = 95.14; one variable: the injection"
+    launch roundP27-fullpano-p10 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_FULL_PANO_PROB=0.1 \
+        SINGEO_FOV_FULL_PANO_EPOCHS=0 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P27. roundP23 with 10 pct of q2 samples overridden to EXACTLY 360, a
+seamless panorama rolled to a random azimuth, in EVERY epoch. One variable: the
+window is 0 so there is no warm up phase and no ramp delay, which means the band
+schedule is bit identical to roundP23 and the injection is the only difference.
 
 THE GAP THIS CLOSES. The FoV 360 evaluation query is a seamless rolled panorama:
 LimitedFoVPad calls apply_limited_fov with fov 360 and a random angle, and at
-exactly 360 the panorama is rolled but not narrowed. Training never supplies that
-input once the band settles. q1 is never rolled, roll_q1 is off by default and
-measured harmful. And exactly 360 is the ONLY draw that fills all 768 columns:
-at 359.9 the crop already leaves one blank column and has two edges, so a near
-360 sample is a different KIND of input, not the same input slightly narrower.
-Verified: 360 gives 768 of 768 content columns, 359 gives 765, 330 gives 704.
+exactly 360 the panorama is rolled but not narrowed. Training stops supplying it.
+q1 is never rolled, roll_q1 is off by default and measured harmful. And exactly
+360 is the ONLY draw that fills all 768 columns: 360 gives 768 content columns,
+359.9 gives 767, 330 gives 704. So a near 360 sample is a different KIND of
+input, a crop with two edges, not the same input slightly narrower.
 
-WHERE THE SUPPLY COMES FROM TODAY. Only the Gaussian clip at hi 360, which makes
-an atom there while the mean is high: 39.1 pct of draws at epoch 1, 13.1 at
+WHERE THE SUPPLY STOPS. Only the Gaussian clip at hi 360 produces exact 360
+samples, as an atom while the mean is high: 39.1 pct of draws at epoch 1, 13.1 at
 epoch 4, 1.3 at epoch 8, and 0 from epoch 12 onward. Log uniform is continuous on
-70 to 360 so it never lands on 360 at all, which means roundP20 and every earlier
-log uniform run had ZERO exposure to this input in every epoch.
+70 to 360 so it never lands on 360, meaning every log uniform run had zero
+exposure in every epoch.
 
-THE NEW PARAMETER. fov_full_pano_prob overrides the sampler for a fraction of
-samples, and fov_full_pano_epochs bounds the window. So this run is prob 1.0 with
-window 4, a warm up, and a steady injection is prob 0.1 with window 0, which is
-the next configuration to try with no further code. In batch sampling modes the
-draw is taken per batch, so unpadded crops still collate.
+WHY SUSTAINED RATHER THAN A WARM UP. A four epoch warm up was built first and
+discarded before launching: epochs 1 to 4 already carry the heaviest exposure in
+the run, 39 pct down to 13 pct, so forcing 100 pct there raises the window that
+already has the most and leaves epochs 12 to 80 at zero. It also assumes the
+representation is retained, which CVACT argues against, FoV 360 there peaking at
+epoch 20 and falling 5.55 once the band settled while training recall kept
+climbing. A constant 10 pct supplies the input in every epoch instead.
 
-WHAT TO WATCH. FoV 360 against roundP23 95.14. Note the padded protocol clusters
-tightly at FoV 360, roundP1 95.01, roundP23 95.14, roundP2 95.34, against the
-bordered cluster at 96.09 to 96.63, so there is only about 0.2 of headroom inside
-this protocol unless the orientation gap is itself what sets that ceiling. If it
-is, this run should break out of the padded cluster. The warm up also leaves
-epochs 12 to 80 with no exposure, so it tests whether an early panoramic
-representation is RETAINED, which the CVACT decline of 5.55 at FoV 360 after its
-band settled suggests may not hold.
+SIDE EFFECT TO READ WITH THE RESULT. Injected samples have fov 360, so their q2
+gates are 1.0 and the mean gates on the q2 terms rise. At epoch 80, l2 and l4 go
+from 0.272 to 0.344 and l6 from 0.136 to 0.172, lifting the mass from 2.68 to
+2.86. So loss1 share falls slightly, from 0.373 to 0.350. That is the geometry
+handling the injected samples correctly with no special casing, but it does mean
+the between term balance shifts a little alongside the input change.
 
-CONTROLS. roundP23 80.80 with FoV 360 95.14 is the identical configuration with
-no injection. roundP26 is the same recipe at rnc_weight 0.4.'
+WHAT TO WATCH. FoV 360 against roundP23 95.14. The padded runs cluster tightly
+there, roundP1 95.01, roundP23 95.14, roundP2 95.34, against the bordered cluster
+96.09 to 96.63, so about 0.2 of headroom exists inside this protocol UNLESS the
+orientation gap is itself what sets that ceiling. If it is, this run breaks out of
+the padded cluster. If it lands inside it again, the padding is the binding
+constraint and the 1.1 gap is the price of the masked learning protocol.
+
+COST. 10 pct of samples leave the narrow end, so FoV 70 and 90 may give a little
+back. Read all four columns.
+
+CONTROLS. roundP23 80.80 is identical without the injection. roundP26 80.50 is the
+same recipe at rnc_weight 0.4, which lost 0.30 and confirms 0.25 is at or near the
+optimum. roundP24 79.43 is the no wedge crop ablation and roundP25 79.18 the
+polynomial LR variant.'
     ;;
 roundP26)
     echo "Round P26 - P23 with rnc_weight 0.4 [80 ep]"
