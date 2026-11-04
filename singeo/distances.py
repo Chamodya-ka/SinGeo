@@ -179,20 +179,46 @@ class PositiveOverlapDistance:
 
     VALID_MEASURES = ("iou", "containment", "circle")
 
-    def __init__(self, scale=0.5, measure="iou"):
+    def __init__(self, scale=0.5, measure="iou", tie_break=0.0):
+        """`tie_break` (eps >= 0) adds a small penalty to a NARROWER reference:
+
+            dist = scale * (1 - overlap) + eps * (1 - extent_b / 360)
+
+        Under ``"circle"`` a ground crop shares exactly its own arc with the full
+        tile and with any wedge that contains it, so the two tie and RnC's `>=`
+        rank set pulls them to EQUAL similarity (~30% of draws); float rounding
+        also turns ~4.5% of those ties into a strict order in a random direction.
+        The penalty resolves both: the full view always ranks strictly first. It
+        cannot reorder anything else, because in every row the full view already
+        has the largest intersection and only the narrower view is penalised.
+        Two references of equal extent (e.g. q1 and a full rolled q2) still tie.
+        Positives can now reach `scale + eps`; RnCDistanceBuilder checks that this
+        stays below the nearest negative. 0 is the original formula, bit-identical.
+        """
         if measure not in self.VALID_MEASURES:
             raise ValueError(
                 "measure must be one of {}, got {!r}".format(self.VALID_MEASURES, measure)
             )
+        if float(tie_break) < 0.0:
+            raise ValueError("tie_break must be >= 0, got {!r}".format(tie_break))
 
         self.scale = float(scale)
         self.measure = measure
+        self.tie_break = float(tie_break)
 
     def __call__(self, arcs_a, arcs_b):
-        """Args: `[N, 2]` and `[M, 2]` tensors of (center, extent) in degrees."""
+        """Args: `[N, 2]` and `[M, 2]` tensors of (center, extent) in degrees.
+
+        `arcs_b` are the references (counterparts); only their extent enters the
+        tie-break.
+        """
         overlap = angular_overlap(arcs_a[:, 0], arcs_a[:, 1], arcs_b[:, 0], arcs_b[:, 1],
                                   measure=self.measure)
-        return self.scale * (1.0 - overlap)
+        dist = self.scale * (1.0 - overlap)
+        if self.tie_break:
+            narrow = 1.0 - arcs_b[:, 1].to(dist.dtype).clamp(0.0, 360.0) / 360.0   # [M]
+            dist = dist + self.tie_break * narrow.unsqueeze(0)
+        return dist
 
 
 class GeoNeighbourRanks:
@@ -679,8 +705,9 @@ class RnCDistanceBuilder:
 
     def __init__(self, positive_scale=0.5, negative_tiering="geo", negative_margin=1e-3,
                  geo_ranks=None, geo_max_km=100.0, geo_coords=None,
-                 positive_overlap="iou", sat_embeddings=None):
-        self.positive = PositiveOverlapDistance(scale=positive_scale, measure=positive_overlap)
+                 positive_overlap="iou", sat_embeddings=None, positive_tie_break=0.0):
+        self.positive = PositiveOverlapDistance(scale=positive_scale, measure=positive_overlap,
+                                                tie_break=positive_tie_break)
         self.negative = NegativeDistanceTiering(
             mode=negative_tiering,
             floor=positive_scale,
@@ -690,6 +717,14 @@ class RnCDistanceBuilder:
             geo_coords=geo_coords,
             sat_embeddings=sat_embeddings,
         )
+        # The tie-break lifts positives to at most scale + eps; they must still
+        # sit strictly below every negative, or a narrow view would rank behind one.
+        nearest_negative = 1.0 if self.negative.mode == "none" else self.negative.low
+        if self.positive.scale + self.positive.tie_break >= nearest_negative:
+            raise ValueError(
+                "positive_scale + positive_tie_break = {} reaches the nearest negative "
+                "distance {}; lower the tie-break or raise negative_margin".format(
+                    self.positive.scale + self.positive.tie_break, nearest_negative))
 
     @property
     def mode(self):

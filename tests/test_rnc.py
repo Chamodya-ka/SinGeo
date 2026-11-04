@@ -1428,17 +1428,49 @@ def test_gaussian_draw_is_narrower_than_the_loguniform_support():
     assert float(np.std(g)) < float(np.std(lu)) / 2, (np.std(g), np.std(lu))
 
 
-def test_dataset_builds_its_rng_lazily_so_forked_workers_differ():
-    """A Generator created in the parent is copied into every dataloader worker
-    and they would all draw the same FoV sequence. It must be None until first
-    use inside the worker."""
+class _GaussianFovToyDataset(torch.utils.data.Dataset):
+    """Draws a per-sample FoV the way the training datasets do (no rng passed)."""
+
+    def __len__(self):
+        return 16
+
+    def __getitem__(self, index):
+        return torch.tensor(draw_gaussian_fov(90.0, 30.0, lo=0.0, hi=1000.0))
+
+
+def test_datasets_keep_no_fov_generator():
+    """A Generator stored on the dataset is fork-unsafe: if the parent builds it
+    (an input collage calls dataset[i] before the workers fork), every worker
+    inherits the same copy and draws the same FoVs."""
     import inspect
-    from singeo.dataset import cvusa as m
-    src = inspect.getsource(m.CVUSADatasetTrainSinGeo.__init__)
-    assert "self._fov_rng = None" in src, "rng must start as None in __init__"
-    assert "default_rng()" not in src, "rng must NOT be constructed in __init__ (fork-unsafe)"
-    getitem = inspect.getsource(m.CVUSADatasetTrainSinGeo.__getitem__)
-    assert "default_rng()" in getitem, "rng must be built lazily in __getitem__"
+    from singeo.dataset import cvact, cvusa
+    for module in (cvusa, cvact):
+        assert "_fov_rng" not in inspect.getsource(module), module.__name__
+
+
+def test_gaussian_fov_draws_differ_across_workers_and_epochs():
+    """Default draws follow the global numpy stream, which the DataLoader reseeds
+    per worker and per epoch -- even when the parent draws first, as a collage
+    does."""
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    np.random.seed(0)
+    draw_gaussian_fov(90.0, 30.0)          # the parent draws before forking
+    loader = DataLoader(_GaussianFovToyDataset(), batch_size=4, num_workers=2,
+                        multiprocessing_context="fork")
+    epochs = [[batch.tolist() for batch in loader] for _ in range(2)]
+
+    for batches in epochs:
+        # batches 0 and 1 come from different workers
+        assert batches[0] != batches[1], "workers drew the same FoV sequence"
+    assert epochs[0] != epochs[1], "every epoch repeated the same FoVs"
+
+    # the default path follows np.random.seed, so a seeded run is reproducible
+    np.random.seed(7)
+    first = [draw_gaussian_fov(90.0, 30.0) for _ in range(5)]
+    np.random.seed(7)
+    assert [draw_gaussian_fov(90.0, 30.0) for _ in range(5)] == first
 
 
 def test_gaussian_ramp_frac_paces_the_mean_and_defaults_to_the_whole_run():
@@ -2353,3 +2385,169 @@ def test_hardest_negative_adds_exactly_one_reference_per_row():
         counts = seen[0].sum(dim=1)                      # g2a: refs allowed per anchor row
         expected = 2 + (1 if flag else 0)                # own r1 and r2, plus one negative
         assert (counts == expected).all(), (flag, counts)
+
+
+# --------------------------------------------------------------------------- #
+# Blank fill: "mean" (zeros after Normalize) vs "black" (RGB 0)                #
+# --------------------------------------------------------------------------- #
+
+_IMNET_MEAN = (0.485, 0.456, 0.406)
+_IMNET_STD = (0.229, 0.224, 0.225)
+
+
+def _black():
+    from singeo.transforms import blank_fill_value
+    return blank_fill_value("black", _IMNET_MEAN, _IMNET_STD)
+
+
+def _is_fill(t, fill):
+    """`[C, ...]` tensor where every pixel equals `fill` per channel."""
+    value = torch.tensor(fill, dtype=t.dtype).view(-1, *([1] * (t.dim() - 1)))
+    return torch.allclose(t, value.expand_as(t))
+
+
+def test_blank_fill_value_black_decodes_to_rgb_zero():
+    from singeo.transforms import blank_fill_value
+    assert blank_fill_value("mean", _IMNET_MEAN, _IMNET_STD) is None
+    black = _black()
+    for v, m, s in zip(black, _IMNET_MEAN, _IMNET_STD):
+        assert abs(v * s + m) < 1e-6, "black must denormalise to pixel value 0"
+    with pytest.raises(ValueError):
+        blank_fill_value("grey", _IMNET_MEAN, _IMNET_STD)
+
+
+def test_ground_pad_uses_the_fill_and_none_keeps_zeros():
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, 360)
+    black = _black()
+    random.seed(3)
+    out_mean, c0, e0 = apply_limited_fov(x, 90, 40, pad=True)
+    random.seed(3)
+    out_black, c1, e1 = apply_limited_fov(x, 90, 40, pad=True, fill=black)
+    assert (c0, e0) == (c1, e1), "the fill must not move the arc"
+
+    content = (out_mean != 0).flatten(0, 1).any(dim=0)  # kept columns (randn is never 0)
+    assert int(content.sum()) == 90
+    assert torch.equal(out_black[:, :, content], out_mean[:, :, content])
+    assert (out_mean[:, :, ~content] == 0).all(), "None must keep the zero fill"
+    assert _is_fill(out_black[:, :, ~content], black)
+
+    with pytest.raises(ValueError):
+        apply_limited_fov(x, 90, 40, border_px=8, fill=black)
+
+
+def test_aerial_sector_fill_covers_the_wedge_and_the_rotation_corners():
+    import torchvision.transforms.functional as TF
+    torch.manual_seed(0)
+    x = torch.randn(3, 64, 64)
+    black = _black()
+
+    # wedge only (no rotation): outside the kept sector is the fill, inside unchanged
+    out, keep = apply_aerial_sector(x, 0.0, 0.0, 90.0, circular_mask=False,
+                                    return_mask=True, fill=black)
+    inside = keep[0].bool()
+    assert 0 < int(inside.sum()) < inside.numel()
+    assert torch.equal(out[:, inside], x[:, inside])
+    assert _is_fill(out[:, ~inside], black)
+
+    # continuous rotation, full arc: the exposed corners are the fill
+    out = apply_aerial_sector(x, 30.0, 0.0, 360.0, circular_mask=False, fill=black)
+    assert _is_fill(out[:, :2, :2], black), "rotation corner was not filled"
+
+    # None reproduces the original operation exactly
+    ref = TF.rotate(x.unsqueeze(0), 30.0).squeeze(0)
+    _, keep = apply_aerial_sector(x, 30.0, 10.0, 120.0, circular_mask=True, return_mask=True)
+    assert torch.equal(apply_aerial_sector(x, 30.0, 10.0, 120.0, circular_mask=True),
+                       ref * keep)
+
+
+def test_eval_transform_pads_with_the_fill_and_rejects_other_protocols():
+    from singeo.transforms import get_transforms_val
+    black = _black()
+    img = np.random.RandomState(0).randint(1, 255, size=(70, 384, 3)).astype(np.uint8)
+    _, ground = get_transforms_val((64, 64), (70, 384), fov=90.0, fov_pad=True, fov_fill=black)
+    out = ground(image=img)["image"]
+    blank = sum(_is_fill(out[:, :, c], black) for c in range(out.shape[2]))
+    assert blank == 384 - 96, "eval pad must use the training fill"
+
+    with pytest.raises(ValueError):
+        get_transforms_val((64, 64), (70, 384), fov=90.0, fov_pad=False, fov_fill=black)
+
+
+def test_cvact_dataset_passes_its_fill_to_every_blank_source():
+    import inspect
+    from singeo.dataset import cvact
+    src = inspect.getsource(cvact.CVACTDatasetTrainSinGeo.__getitem__)
+    assert src.count("fill=self.blank_fill") == 3, "q2 pad and both wedge calls"
+    assert "self.blank_fill = None" in inspect.getsource(cvact.CVACTDatasetTrainSinGeo.__init__)
+
+
+# --------------------------------------------------------------------------- #
+# RnC tie-break: eps * (1 - extent/360) on same-location distances             #
+# --------------------------------------------------------------------------- #
+
+def _arc(center, extent):
+    return torch.tensor([[float(center), float(extent)]])
+
+
+def test_tie_break_off_is_bit_identical():
+    from singeo.distances import PositiveOverlapDistance, angular_overlap
+    torch.manual_seed(0)
+    a = torch.stack([torch.rand(20) * 360, torch.rand(20) * 290 + 70], dim=1)
+    b = torch.stack([torch.rand(30) * 360, torch.rand(30) * 290 + 70], dim=1)
+    for measure in ("iou", "containment", "circle"):
+        old = 0.5 * (1.0 - angular_overlap(a[:, 0], a[:, 1], b[:, 0], b[:, 1], measure=measure))
+        assert torch.equal(PositiveOverlapDistance(0.5, measure)(a, b), old)
+        assert torch.equal(PositiveOverlapDistance(0.5, measure, tie_break=0.0)(a, b), old)
+
+
+def test_tie_break_puts_the_full_tile_ahead_of_a_containing_wedge():
+    from singeo.distances import PositiveOverlapDistance
+    pos = PositiveOverlapDistance(0.5, "circle", tie_break=0.01)
+    refs = torch.cat([_arc(0, 360), _arc(0, 180)])          # R1 full tile, R2 wedge on the crop
+    d = pos(_arc(0, 90), refs)[0]                           # anchor Q2, 90 deg crop
+    assert abs(float(d[0]) - 0.375) < 1e-6 and abs(float(d[1]) - 0.380) < 1e-6
+    # without the tie-break the two tie, which is the case being fixed
+    d0 = PositiveOverlapDistance(0.5, "circle")(_arc(0, 90), refs)[0]
+    assert float(d0[0]) == float(d0[1])
+
+
+def test_tie_break_never_reorders_and_keeps_negatives_last():
+    """Over curriculum-like draws: for a ground crop the full tile is strictly
+    closer than the wedge (tied or not); for an aerial wedge the panorama is
+    strictly closer than a narrower crop; equal extents still tie; every
+    positive stays below the negative."""
+    from singeo.distances import RnCDistanceBuilder
+    builder = RnCDistanceBuilder(positive_scale=0.5, negative_tiering="none",
+                                 positive_overlap="circle", positive_tie_break=0.01)
+    rng = random.Random(0)
+    ids_a, ids_r = torch.tensor([0]), torch.tensor([0, 0, 1])
+    for _ in range(3000):
+        c, crop = rng.uniform(0, 360), rng.uniform(70, 359)
+        wedge = rng.uniform(90, 357.75)
+        w = (c + rng.uniform(-110, 110)) % 360
+        # g2a: anchor crop, refs full tile, wedge, negative tile
+        d = builder(ids_a, _arc(c, crop), ids_r,
+                    torch.cat([_arc(0, 360), _arc(w, wedge), _arc(0, 360)]))[0]
+        assert d[0] < d[1] < d[2], (c, crop, w, wedge, d)
+        # a2g: anchor wedge, refs panorama, crop, negative pano
+        d = builder(ids_a, _arc(w, wedge), ids_r,
+                    torch.cat([_arc(0, 360), _arc(c, crop), _arc(0, 360)]))[0]
+        assert d[0] < d[1] < d[2], (c, crop, w, wedge, d)
+
+    # equal extents keep their tie: a full tile against q1 and a rolled 360 q2
+    d = builder(ids_a, _arc(0, 360), ids_r,
+                torch.cat([_arc(0, 360), _arc(123, 360), _arc(0, 360)]))[0]
+    assert float(d[0]) == float(d[1]) == 0.0
+
+
+def test_tie_break_must_stay_below_the_nearest_negative():
+    from singeo.distances import RnCDistanceBuilder, PositiveOverlapDistance
+    with pytest.raises(ValueError):
+        RnCDistanceBuilder(positive_scale=0.5, negative_tiering="none",
+                           positive_overlap="circle", positive_tie_break=0.5)
+    with pytest.raises(ValueError):    # tiered negatives start at 0.5 + margin
+        RnCDistanceBuilder(positive_scale=0.5, negative_tiering="geo", negative_margin=1e-3,
+                           positive_overlap="circle", positive_tie_break=0.01)
+    with pytest.raises(ValueError):
+        PositiveOverlapDistance(0.5, "circle", tie_break=-0.1)

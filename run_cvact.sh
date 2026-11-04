@@ -12,6 +12,27 @@
 #   roundC3   the FAITHFUL P12 replica: continuous tile rotation, as P12 ran it
 #   roundC4   C3 but RnC ranks negatives by true ground distance (geo tiering)
 #   roundC5   C3 with the 40-epoch ramp: the missing cell of the ramp x rotation 2x2
+#   roundC6   roundP22 transplanted to CVACT: padded, Gaussian FoV N(90, 30) clipped
+#             at 70, gate-scaled uniform InfoNCE terms, no mass renormalisation
+#   roundC6b  roundC6 on the fixed trainer (no unrecorded +-90 tile rotation)
+#   roundC7   roundC6b with a 4-epoch warm-up in which every q2 is a seamless rolled
+#             360 panorama, FoV narrowing starting after it (cf. roundP27)
+#   roundC8   roundC7 with every blank pixel black (RGB 0) instead of the mean
+#             colour: q2 pad, r2 wedge and rotation corners, train and eval
+#   roundC9   roundC8 with the same-domain RnC groups (g2g, a2a) weighted 0, so
+#             RnC ranks only across domains (g2a, a2g), plus the RnC tie-break
+#             (full view ahead of a partial view with equal overlap)
+#   roundC10  roundC9 with the original SinGeo FoV schedule (one FoV per epoch,
+#             360 -> 70 linearly over 80 epochs, padded) and no full-panorama
+#             warm-up; logs an aligned FoV 360 eval (FoV 0)
+#   roundC11  roundC10 with an exponential fast-to-slow FoV schedule, lam = 5
+#   roundC12  roundC11 with no ground padding: q2 is a narrower tensor, flush,
+#             train and eval (stock SinGeo protocol); wedge fill stays black
+#
+# NOTE ON THE TILE ROTATION BUG. Until 2026-10-23 train_singeo_cvact.py left the
+# satellite +-90 augmentation on its 1.0 -> 0.25 schedule with the wedge on, so
+# up to 75% of wedges were cut 90 deg off their recorded bearing. C1-C6 ran with
+# it (their train.py snapshots show it); relaunching them now runs the fix.
 #
 # NOTE ON ROTATION. COMMON carries aerial_rotation=continuous, which is what
 # roundP12 actually ran. roundC1 and roundC2 were launched with quarter by
@@ -31,14 +52,26 @@
 
 set -euo pipefail
 
-REPO="/home/71/25021871/SinGeo"
-PY="/home/71/25021871/data/chamodya/venv/bin/python"
-OUT="/home/71/25021871/data/chamodya/Singeo_data/CVACT"
+# Paths differ per server. OUT must match train_singeo_cvact.py's model_path,
+# which is where the checkpoints actually go; here it only feeds list/tail.
 # Console logs live on /data, not in the repo: the repo sits on the root
 # filesystem, which is shared and runs near full. A failed tqdm write there
 # deadlocked roundP14 at epoch 44 on 2026-10-15. log.txt in the checkpoint
 # directory stays the authoritative record either way.
-LOGS="/home/71/25021871/data/chamodya/Singeo_data/run_logs_cvact"
+case "$(hostname)" in
+hpc-cvgl01)   # server A, A40
+    REPO="/home/71/25021871/temp/SinGeo"
+    PY="/home/71/25021871/Workspace/SinGeo-1/singeo/bin/python"
+    OUT="/home/71/25021871/data/data/singeo/cvact"
+    LOGS="/home/71/25021871/data/data/singeo/run_logs_cvact"
+    ;;
+*)            # server B, H100
+    REPO="/home/71/25021871/SinGeo"
+    PY="/home/71/25021871/data/chamodya/venv/bin/python"
+    OUT="/home/71/25021871/data/chamodya/Singeo_data/CVACT"
+    LOGS="/home/71/25021871/data/chamodya/Singeo_data/run_logs_cvact"
+    ;;
+esac
 
 cd "$REPO"
 mkdir -p "$LOGS"
@@ -67,6 +100,28 @@ COMMON=(
     SINGEO_AERIAL_CIRCULAR_MASK=false
     SINGEO_CROP_DROPOUT_STRENGTH=0.5
     SINGEO_RNC_TAU=0.5
+    SINGEO_NUM_WORKERS=4
+)
+
+# roundP22 on the padded protocol, so not built on COMMON: its border and
+# per-batch log-uniform draw do not apply. Every P22 override is copied
+# verbatim from run.sh; crop_dropout_strength is added because P22 took 0.5
+# from the CVUSA default and the CVACT default is 1.0.
+P22=(
+    SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0
+    SINGEO_FOV_SAMPLING=gaussian
+    SINGEO_FOV_GAUSSIAN_STD=30.0
+    SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3
+    SINGEO_FOV_CURRICULUM_END=90.0
+    SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0
+    SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5
+    SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true
+    SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false
+    SINGEO_OVERLAP_GATE_MEASURE=circle
+    SINGEO_INFONCE_GATE_SCALES_TERMS=true
+    "SINGEO_INFONCE_TERM_WEIGHTS=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)"
+    SINGEO_DSS_FOV_FROM_MEASURED=true
+    SINGEO_CROP_DROPOUT_STRENGTH=0.5
     SINGEO_NUM_WORKERS=4
 )
 
@@ -202,6 +257,286 @@ C5 lands below C3 by roughly the same 2.65 the ramp effect is additive and the
 question is closed; if the gap shrinks or reverses, the two settings interact and
 the ramp conclusion from C1 against C2 does not generalise.'
     ;;
+roundC6)
+    echo "Round C6 - roundP22 on CVACT: padded, band N(90, 30) clipped [70, 360] [80 ep]"
+    echo "  CVUSA reference: P22 (see EXPERIMENTS.md); padded protocol, NOT comparable to C0-C5"
+    echo "  NOTE: C6 itself ran with the unrecorded +-90 tile rotation; relaunching"
+    echo "  this now runs the fixed trainer, which is roundC6b"
+    launch roundC6-cvact-p22 "${P22[@]}" \
+        SINGEO_RUN_NOTE='C6. roundP22 transplanted from CVUSA to CVACT with every P22 override
+copied verbatim: padded protocol with no border, per sample Gaussian FoV
+N(mean, 30) with the mean walking 360 to 90 over the first 30 pct of the run
+and the draw clipped to [70, 360], the overlap gate on the circle measure
+scaling all six InfoNCE terms from uniform hand set weights, mass
+renormalisation off, RnC over positives plus the hardest negative at weight
+0.25 and tau 0.5, continuous tile rotation with the disc mask off, and DSS
+ranked at the measured FoV. crop_dropout_strength is pinned to 0.5, the CVUSA
+default P22 ran with, because the CVACT default is 1.0.
+
+READ IT AGAINST roundP22 on CVUSA for the transfer, and NOT against C0 to C5:
+those use the 64 px border protocol, this one is padded, and the two
+protocols feed the encoder different tensors.'
+    ;;
+roundC6b)
+    echo "Round C6b - roundC6 with the unrecorded +-90 tile rotation removed [80 ep]"
+    echo "  control roundC6 (stopped at e74): FoV 360/180/90/70 at e72 = 73.29/68.00/42.41/34.31"
+    launch roundC6b-cvact-p22-rotfix "${P22[@]}" \
+        SINGEO_RUN_NOTE='C6b. roundC6 rerun on the fixed CVACT trainer, every override identical.
+
+THE BUG. With the wedge on, train_singeo_cvact.py kept the albumentations
+satellite rotation on its 1.0 to 0.25 keep schedule, where the CVUSA trainer
+sets it to 1.0. That rotation is applied to the tile BEFORE the wedge is cut
+and is never recorded, so a wedge lands 90 deg away from the bearing its meta
+claims in 1 minus keep_prob of samples: 22 pct at epoch 24, 45 pct at 48,
+67.5 pct at 72, 75 pct at 80. It corrupts the overlap gate on loss6 (q2 vs r2)
+and the RnC distances of the crop vs wedge pairs inside g2a and a2g. It does
+not change which tile is the positive, g2g, or evaluation. C1 to C6 all ran
+with it; C0 has no wedge, so for C0 it is the intended SinGeo augmentation.
+
+WHY IT MATTERS. The mislabelled share grows over exactly the stretch where
+every CVACT run stalls on val while train R@1 keeps climbing, and a2g and g2a
+are the RnC groups C6 ends furthest above roundP22. This run says how much of
+the CVACT gap that noise explains.
+
+READ IT AGAINST roundC6 (the only difference is the fix) and roundP22 on CVUSA.
+Padded protocol, so NOT comparable to C0 to C5.'
+    ;;
+roundC7)
+    echo "Round C7 - roundC6b with q2 forced to a seamless rolled 360 for epochs 1-4, narrowing after [80 ep]"
+    echo "  control roundC6b (same recipe, no warm-up); CVUSA counterpart roundP27"
+    launch roundC7-cvact-fullpano-warmup "${P22[@]}" \
+        SINGEO_FOV_FULL_PANO_PROB=1.0 \
+        SINGEO_FOV_FULL_PANO_EPOCHS=4 \
+        SINGEO_FOV_FULL_PANO_DELAY_SCHEDULE=true \
+        SINGEO_RUN_NOTE='C7. roundC6b with a four epoch warm up in which every q2 is a SEAMLESS
+panorama rolled to a random azimuth, fov forced to exactly 360. The FoV narrowing
+starts AFTER the warm up (fov_full_pano_delay_schedule): epoch 5 runs the schedule
+epoch 1, so the mean walks 349 to 90 over epochs 5 to 28, the same 24 epoch
+descent C6b had, and is held at 90 from epoch 28. The aerial wedge schedule is
+unchanged, linear over all 80 epochs as in C6b.
+
+WHY ON CVACT. The FoV 360 eval query is a seamless panorama rolled to an arbitrary
+azimuth, and training only supplies one through the Gaussian clip at 360 while the
+mean is high, never once the band settles; q1 stays aligned with r1. Measured on
+roundC6: val FoV 360 R@1 is 82.91 with the panorama aligned against 72.40 under the
+random roll at epoch 72, a 10.5 point orientation gap that CVUSA does not have
+(round8a: 96.70 aligned, 96.63 rolled). The gap is widest at 135 to 180 deg.
+
+WHAT TO WATCH. FoV 360 against roundC6b, and whether the warm up is RETAINED: C6
+lost robustness to large rolls after the band settled (180 deg roll 82.02 at e20,
+70.81 at e72), so a four epoch warm up may fade the same way. A steady injection
+(prob 0.1, epochs 0) is the follow up if it does.
+
+Otherwise identical to roundC6b, so C6b is the control; note the band settles
+four epochs later, at epoch 28 instead of 24. The CVUSA
+counterpart roundP27 is built on roundP23 (std 40, no seed), not on this recipe.'
+    ;;
+roundC8)
+    echo "Round C8 - roundC7 with black (RGB 0) blank fill for the ground pad and the aerial wedge [80 ep]"
+    echo "  control roundC7_20261025-125240 (mean-colour fill); FoV 360/180/90/70 at e80 = 76.38/67.84/41.64/33.69"
+    launch roundC8-cvact-blackfill "${P22[@]}" \
+        SINGEO_FOV_FULL_PANO_PROB=1.0 \
+        SINGEO_FOV_FULL_PANO_EPOCHS=4 \
+        SINGEO_FOV_FULL_PANO_DELAY_SCHEDULE=true \
+        SINGEO_BLANK_FILL=black \
+        SINGEO_RUN_NOTE='C8. roundC7 with one setting changed, blank_fill mean to black. Every blank
+pixel is RGB (0, 0, 0) instead of the dataset mean colour (zero after Normalize):
+the q2 pad, the r2 wedge mask and the corners the continuous tile rotation exposes.
+The same fill is used in the DSS train crops and in evaluation, so the FoV 180, 90
+and 70 queries are padded with black. FoV 360 has no pad and compares directly.
+
+WHY. On CVUSA the crop edge, not the amount of fill, decided the padding results, and
+the fill has always been the mean colour, which can pass for road or sky. Black
+cannot be mistaken for content. This asks whether the fill colour matters at all.
+
+READ IT AGAINST roundC7 (20261025-125240). One more difference: this is the first run
+with independent per worker FoV draws. Up to C7 the Gaussian FoV generator was built
+in the main process by the epoch 1 collage, so all four workers drew the same FoV
+sequence, repeated every epoch until the next collage. Fixed 2026-10-26.'
+    ;;
+roundC9)
+    echo "Round C9 - roundC8 with g2g and a2a weighted 0 and the RnC tie-break at 0.01 [80 ep]"
+    echo "  control roundC8_20261027-104753; FoV 360/180/90/70 at e80 = 76.94/68.39/43.30/34.53 (Avg 55.79)"
+    echo "  (roundC9-cvact-no-same-domain-rnc_20261029-085913 was the same run WITHOUT the"
+    echo "   tie-break, stopped early on 2026-10-29 to relaunch with it)"
+    launch roundC9-cvact-crossdomain-tiebreak "${P22[@]}" \
+        SINGEO_FOV_FULL_PANO_PROB=1.0 \
+        SINGEO_FOV_FULL_PANO_EPOCHS=4 \
+        SINGEO_FOV_FULL_PANO_DELAY_SCHEDULE=true \
+        SINGEO_BLANK_FILL=black \
+        "SINGEO_RNC_GROUP_WEIGHTS=(1.0, 0.0, 1.0, 0.0)" \
+        SINGEO_RNC_TIE_BREAK=0.01 \
+        SINGEO_RUN_NOTE='C9. roundC8 with two settings changed. First, rnc_group_weights (g2a, g2g,
+a2g, a2a) from (1, 1, 1, 1) to (1, 0, 1, 0). Second, rnc_tie_break 0 to 0.01.
+
+GROUP WEIGHTS. RnC keeps only the cross-domain groups, ground
+anchors ranked against aerial views and the reverse. g2g and a2a are still computed
+and logged, at zero weight, so their values show what they do without gradient.
+
+WHY. Under positives plus the hardest negative, a same-domain row has two counterparts,
+its partner view and one hard negative, and only one non-zero term: the partner must
+beat that negative in a two-way softmax. That is what InfoNCE loss2 (q1-q2) and loss3
+(r1-r2) already ask, against every negative in the batch. The cross-domain groups are
+the only ones that rank full view, partial view and negative in three levels. This run
+asks whether the same-domain groups add anything beyond InfoNCE.
+
+TIE-BREAK. Every same-location distance gets 0.01 times (1 minus extent over 360), so a
+narrower view ranks strictly behind a wider one it would otherwise tie with. Under the
+circle measure a ground crop shares exactly its own arc with the full tile and with any
+wedge that contains it, about 30 pct of draws; the rank set then pulled the two to EQUAL
+similarity, and float rounding turned 4.5 pct of those ties into a random strict order.
+Now the full tile always ranks ahead of the wedge for a crop anchor, and the panorama
+ahead of the crop for an aerial anchor. It cannot reorder anything else, two full
+views still tie, and positives stay at or below 0.51, under the negatives at 1.0. It
+only acts on rows with two positives, i.e. the cross-domain groups.
+
+READ IT AGAINST roundC8 (20261027-104753). Two changes, so a difference cannot be split
+between them. Removing two groups also cuts the RnC loss by about a third (g2g plus a2a
+were 0.47 of 1.43 at C8 e80). Same black fill eval protocol as C8.'
+    ;;
+roundC10)
+    echo "Round C10 - roundC9 with the original SinGeo FoV schedule (360 -> 70 per epoch, padded), no warm-up [80 ep]"
+    echo "  control roundC9_20261029-093717; FoV 360/180/90/70 at e80 = 70.73/70.19/44.97/36.04 (Avg 55.48)"
+    echo "  (roundC10-cvact-singeo-fov-tiebreak_20261031-165619 was launched on the C8 recipe"
+    echo "   by mistake and stopped in epoch 1 on 2026-10-31)"
+    # P22 without its Gaussian band fields, which are inert under the
+    # deterministic schedule and would only clutter the overrides block.
+    launch roundC10-cvact-c9-singeo-fov \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=deterministic \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        "SINGEO_INFONCE_TERM_WEIGHTS=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)" \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_BLANK_FILL=black \
+        "SINGEO_RNC_GROUP_WEIGHTS=(1.0, 0.0, 1.0, 0.0)" \
+        SINGEO_RNC_TIE_BREAK=0.01 \
+        "SINGEO_EVAL_FOV_EXTRA=(360.0, 0.0, 180.0, 70.0)" \
+        SINGEO_RUN_NOTE='C10. roundC9 with the ground FoV schedule replaced by the original SinGeo
+one and the full panorama warm up removed.
+
+FOV SCHEDULE. One FoV per epoch, shared by every sample, walked linearly from 360
+to 70 across all 80 epochs: the get_dynamic_fov(epoch, 80, 360, 70) call of the
+original SinGeo trainer. Each crop is padded to the full panorama width with black.
+This replaces the Gaussian band N(mean, 30) clipped to [70, 360], whose mean settled
+at 90 by epoch 28.
+
+NO WARM UP. C9 forced every q2 to an exact 360 for epochs 1 to 4 and started the
+band after it. Here epoch 1 is the schedule epoch 1 (356.4 deg), so q2 is never an
+exact 360 and the run never sees the rolled panorama the FoV 360 eval uses.
+
+UNCHANGED FROM C9. rnc_group_weights (1, 0, 1, 0), so RnC ranks only across domains,
+and rnc_tie_break 0.01. Black blank fill, train and eval.
+
+EVAL. FoV 0 (the panorama as stored, aligned with the tile) is added to the extra
+evals, so the roll gap is logged at every eval. Probe on C9 at e80: aligned 84.20,
+random roll 70.31, a 13.9 point gap (C8: 6.8).
+
+EXPECT. On CVUSA the deterministic schedule lost 1.54 Avg to log uniform (8a to B1)
+because the narrow views arrive only once the LR is spent: FoV at or below 90 only
+from epoch 75. Expect FoV 90 and 70 below C9.
+
+READ IT AGAINST roundC9 (20261029-093717). Two changes, the schedule and the warm up,
+so a difference cannot be split between them.'
+    ;;
+roundC11)
+    echo "Round C11 - roundC10 with an exponential fast-to-slow FoV schedule, lam = 5 (360 -> 70, padded) [80 ep]"
+    echo "  control roundC10_20261031-165912 (linear); FoV 360/180/90/70 at e80 = 78.49/69.02/40.86/30.44 (Avg 54.70)"
+    echo "  schedule: FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)); <=180 from e16, <=90 from e42"
+    launch roundC11-cvact-c9-expfov-lam5 \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=deterministic \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        "SINGEO_INFONCE_TERM_WEIGHTS=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)" \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_BLANK_FILL=black \
+        "SINGEO_RNC_GROUP_WEIGHTS=(1.0, 0.0, 1.0, 0.0)" \
+        SINGEO_RNC_TIE_BREAK=0.01 \
+        "SINGEO_EVAL_FOV_EXTRA=(360.0, 0.0, 180.0, 70.0)" \
+        SINGEO_FOV_SCHEDULE_LAMBDA=5.0 \
+        SINGEO_RUN_NOTE='C11. roundC10 with one field changed: fov_schedule_lambda 0 to 5, so the
+per epoch ground FoV falls fast first and slowly converges to 70 instead of walking
+linearly.
+
+SCHEDULE. FoV(e) = 360 - 290 f(e/80) with f(x) = (1 - exp(-lam x)) / (1 - exp(-lam)),
+lam = 5, the exponential fast-to-slow curriculum. One FoV per epoch shared by every
+sample, padded to the full panorama width with black. Milestones: epoch 5 at 282,
+10 at 224, 20 at 152, 30 at 113, 40 at 92, 60 at 75, 80 at 70. FoV at or below 180
+from epoch 16 (linear: 50) and at or below 90 from epoch 42 (linear: 75).
+
+WHY. In C10 the linear walk reaches 90 only at epoch 75, when the cosine LR is
+nearly spent: 0.1 pct of the LR weighted budget is spent at or below 90 (lam 5:
+16.7 pct), and C10 lost 4.1 at FoV 90 and 5.6 at FoV 70 to C9. C10 also kept FoV
+360 climbing to the last epoch (78.49, roll gap 7.0). This run asks whether the
+narrow views recover without giving that back.
+
+UNCHANGED FROM C10. C9 settings (rnc_group_weights (1, 0, 1, 0), tie-break 0.01,
+black fill), no full panorama warm up, the aerial wedge schedule linear 360 to 180,
+and the aligned FoV 360 eval (FoV 0) logged at every eval.
+
+READ IT AGAINST roundC10 (20261031-165912). One change.'
+    ;;
+roundC12)
+    echo "Round C12 - roundC11 with no ground padding: q2 returned as a narrower tensor, train and eval [80 ep]"
+    echo "  control roundC11_20261102-134507 (padded); FoV 360/180/90/70 at e80 = 70.25/70.13/46.71/37.78 (Avg 56.22)"
+    echo "  UNPADDED protocol: FoV 180/90/70 compare with C11 only protocol against protocol; FoV 360 and 0 directly"
+    launch roundC12-cvact-c11-nopad \
+        SINGEO_FOV_PAD=false SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=deterministic \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        "SINGEO_INFONCE_TERM_WEIGHTS=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)" \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_BLANK_FILL=black \
+        "SINGEO_RNC_GROUP_WEIGHTS=(1.0, 0.0, 1.0, 0.0)" \
+        SINGEO_RNC_TIE_BREAK=0.01 \
+        "SINGEO_EVAL_FOV_EXTRA=(360.0, 0.0, 180.0, 70.0)" \
+        SINGEO_FOV_SCHEDULE_LAMBDA=5.0 \
+        SINGEO_RUN_NOTE='C12. roundC11 with one setting changed: fov_pad true to false. The ground crop
+q2 is returned as a narrower tensor, width proportional to the FoV, with no blank
+columns, as stock SinGeo trains and evaluates. The same holds in training, DSS and
+evaluation. The schedule is still one FoV per epoch, so unpadded crops collate.
+
+WHY. In every padded CVACT run most of the q2 tensor is blank once the FoV is narrow:
+at FoV 70 about 80 pct of the columns are black fill. Unpadded, every column is scene.
+This asks whether the padded canvas helps or hurts on CVACT under the C11 recipe.
+
+FILL. blank_fill stays black. With no ground padding the only blank pixels left are
+the r2 wedge mask and the rotation corners, which the dataset fills black as in C11,
+so the aerial input is unchanged. The trainer guard that tied black fill to the padded
+protocol was relaxed on 2026-11-04 to allow a flush unpadded crop; border and batch
+max padding are still refused.
+
+EVAL. Unpadded protocol: the FoV 180, 90 and 70 queries are narrower tensors, so those
+columns compare with C11 only as one protocol against another, never as the same
+input. FoV 360 and the aligned FoV 0 are full panoramas in both runs and compare
+directly.
+
+ON CVUSA. Unpadded flush training (round4aB1, 79.23) sat 0.85 under padded (roundP1,
+80.08) and 1.38 under the 64 px border (roundP3, 80.61). A crop flush with the tensor
+edge is the known cost; the border is the follow up if this run lands below C11.
+
+READ IT AGAINST roundC11 (20261102-134507). One change.'
+    ;;
 roundC0)
     echo "Round C0 - CVACT baseline: border only, no wedge, no RnC [80 ep]"
     launch roundC0-cvact-base "${COMMON[@]}" \
@@ -224,7 +559,7 @@ tail)
     ;;
 stop) screen -S "${2:?usage: ./run_cvact.sh stop <name>}" -X quit && echo "stopped ${2}" ;;
 *)
-    sed -n '3,22p' "$0"
+    sed -n '3,30p' "$0"
     exit 1
     ;;
 esac

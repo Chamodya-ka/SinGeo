@@ -39,8 +39,24 @@ def get_dynamic_fov_exp(epoch, max_epoch, fov_start=360.0, fov_end=90.0, k=5):
 def get_dynamic_rotate_prob(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
     return min_prob - (min_prob - max_prob) * (epoch / max_epoch)
 
-def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0):
-    return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
+def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0, lam=0.0):
+    """One FoV per epoch, walked from `fov_start` to `fov_end` over the run.
+
+    `lam` = 0 is the original SinGeo linear walk (this exact expression).
+    `lam` > 0 is the exponential fast-to-slow shape
+
+        f(x) = (1 - exp(-lam * x)) / (1 - exp(-lam)),   x = epoch / max_epoch
+
+    which moves quickly at first and slows towards `fov_end`; f(0) = 0,
+    f(1) = 1, and f -> x as lam -> 0. With 360 -> 70 over 80 epochs, lam = 5
+    reaches 180 at epoch 16 and 90 at epoch 42 (linear: 50 and 75).
+    """
+    if lam < 0:
+        raise ValueError("lam must be >= 0 (0 = linear), got {!r}".format(lam))
+    if lam == 0:
+        return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
+    progress = (1.0 - math.exp(-lam * epoch / max_epoch)) / (1.0 - math.exp(-lam))
+    return fov_start - (fov_start - fov_end) * progress
 
 
 def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_frac=0.2):
@@ -131,10 +147,13 @@ def get_gaussian_fov_mean(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_
 def draw_gaussian_fov(mean, std=20.0, lo=70.0, hi=360.0, rng=None):
     """One FoV drawn from `N(mean, std)` and clipped to `[lo, hi]`.
 
-    `rng` is a `numpy.random.Generator`; one is created from OS entropy when it
-    is None. Create it lazily per worker process rather than once in the parent:
-    a Generator built before `fork` is copied into every worker, and all of them
-    would then draw the identical sequence.
+    `rng` is a `numpy.random.Generator`; the module-global numpy stream is used
+    when it is None. That stream is the right default inside a dataset: the
+    DataLoader reseeds it in every worker each epoch, and `setup_system` seeds
+    it in the parent. Do not keep a Generator on the dataset instead -- if the
+    parent ever builds it (an input collage calls `dataset[i]` before the
+    workers fork), every worker inherits the same copy and draws the same
+    sequence.
 
     Clipping, not rejection: a draw outside the range is pinned to the boundary,
     so mass piles up at 70 and 360 once the mean approaches either end. That is
@@ -143,9 +162,8 @@ def draw_gaussian_fov(mean, std=20.0, lo=70.0, hi=360.0, rng=None):
     Returns:
         A float in `[lo, hi]`.
     """
-    if rng is None:
-        rng = np.random.default_rng()
-    draw = float(rng.normal(loc=mean, scale=std, size=1)[0])
+    source = rng if rng is not None else np.random
+    draw = float(source.normal(loc=mean, scale=std, size=1)[0])
     return float(min(hi, max(lo, draw)))
 
 
@@ -460,7 +478,35 @@ class Zoomin(ImageOnlyTransform):
         
         return resized_tensor   
 
-def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px=0):
+BLANK_FILL_MODES = ("mean", "black")
+
+
+def blank_fill_value(mode, mean, std):
+    """Per-channel value blank pixels take in the *normalised* tensor.
+
+    "mean" returns None: blanks stay at zero, which `A.Normalize` decodes back to
+    the dataset mean colour. Every run before roundC8 used it, and None keeps
+    every fill site on its original code path, bit-identical.
+
+    "black" returns `(0 - mean) / std` per channel, i.e. RGB (0, 0, 0) once
+    normalised -- about (-2.12, -2.04, -1.80) for the ImageNet statistics.
+    """
+    if mode == "mean":
+        return None
+    if mode == "black":
+        return tuple(float(-m / s) for m, s in zip(mean, std))
+    raise ValueError("blank fill must be one of {}, got {!r}".format(BLANK_FILL_MODES, mode))
+
+
+def _blank_like(x, fill):
+    """A tensor shaped like `x` holding only blank pixels: zeros, or `fill` per channel."""
+    if fill is None:
+        return torch.zeros_like(x)
+    value = torch.tensor(fill, dtype=x.dtype, device=x.device).view(-1, 1, 1)
+    return value.expand_as(x).clone()
+
+
+def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px=0, fill=None):
     """Ground FoV crop that also reports the azimuth arc it kept.
 
     Same operation as :class:`LimitedFoV` -- roll the panorama by `angle` and
@@ -506,6 +552,9 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
 
             Set it the same way for training and evaluation. Padding one side
             only trades the shortcut for a plain geometry mismatch.
+        fill: per-channel value of the padded columns in the normalised tensor,
+            from :func:`blank_fill_value`. None keeps zeros (the mean colour).
+            Implemented for `pad` only; the border protocol rejects it.
 
     Returns:
         `(cropped, center_deg, extent_deg)` where the arc is expressed in the
@@ -515,6 +564,8 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
     if pad and border_px > 0:
         raise ValueError("border_px and pad are alternatives: pad fills out to the panorama's "
                          "full width, border_px adds a fixed margin to the narrow crop")
+    if fill is not None and border_px > 0:
+        raise ValueError("a non-default blank fill is implemented for pad only, not border_px")
 
     if fov <= 0:
         return x, 0.0, 360.0
@@ -537,8 +588,9 @@ def apply_limited_fov(x, fov, angle, pad=False, pad_random_start=True, border_px
         # dataset mean colour -- RGB (123.7, 116.3, 103.5) for the ImageNet
         # statistics this repo trains with -- not to black. Every pipeline that
         # reaches here crops after Normalize/ToTensorV2, so that holds
-        # everywhere; move the crop before Normalize and it would not.
-        filled = torch.zeros_like(x)
+        # everywhere; move the crop before Normalize and it would not. A `fill`
+        # from blank_fill_value overrides it (black: RGB 0 after Normalize).
+        filled = _blank_like(x, fill)
 
         # Random start, but bounded so the block never wraps the tensor edge:
         # the kept azimuths stay one contiguous run of columns. See `pad` above
@@ -632,7 +684,8 @@ def draw_quarter_rotation(rng=None):
     return 90.0 * source.randint(0, 3)
 
 
-def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False):
+def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False,
+                        fill=None):
     """Aerial analogue of the ground FoV crop: rotate the tile, keep a wedge.
 
     The aerial branch's counterpart to a limited ground FoV is a limited
@@ -656,6 +709,10 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
             `CircularMask` in the existing continuous-rotation pipeline.
         return_mask: also return the `[1, H, W]` hard keep-mask (sector and
             disc, in the rotated frame), for mask-aware encoding of this view.
+        fill: per-channel value of every blank pixel in the normalised tensor
+            -- outside the sector or disc, and the corners a non-90 rotation
+            exposes -- from :func:`blank_fill_value`. None keeps zeros (the
+            mean colour) and the original code path.
 
     Returns:
         `[C, H, W]` tensor, same shape as the input; with `return_mask`, the
@@ -672,8 +729,10 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
             # exact here too on the current torchvision; rot90 makes that a
             # property of this code rather than of the library version.
             x = torch.rot90(x, k=int(float(rot_deg) // 90.0), dims=(1, 2))
-        else:
+        elif fill is None:
             x = TF.rotate(x.unsqueeze(0), float(rot_deg)).squeeze(0)
+        else:
+            x = TF.rotate(x.unsqueeze(0), float(rot_deg), fill=list(fill)).squeeze(0)
 
     if arc_extent >= 360.0 and not circular_mask:
         return (x, torch.ones_like(x[:1])) if return_mask else x
@@ -700,9 +759,10 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
         mask &= dist <= radius
 
     keep = mask.unsqueeze(0).to(x.dtype)
+    out = x * keep if fill is None else torch.where(keep.bool(), x, _blank_like(x, fill))
     if return_mask:
-        return x * keep, keep
-    return x * keep
+        return out, keep
+    return out
 
 
 def add_blank_border(x, border_px):
@@ -854,10 +914,11 @@ class LimitedFoVPad(ImageOnlyTransform):
     `fov=361.0` is a sentinel for "draw a fresh FoV in [180, 360] per sample".
     """
 
-    def __init__(self, fov=360., pad_random_start=True):
+    def __init__(self, fov=360., pad_random_start=True, fill=None):
         super(LimitedFoVPad, self).__init__(fov)
         self.fov = fov
         self.pad_random_start = pad_random_start
+        self.fill = fill
 
     def apply(self, x, **params):
         if self.fov <= 0:
@@ -865,7 +926,8 @@ class LimitedFoVPad(ImageOnlyTransform):
 
         fov = random.randint(180, 360) if self.fov == 361.0 else self.fov
         padded, _, _ = apply_limited_fov(x, fov, random.randint(0, 359), pad=True,
-                                         pad_random_start=self.pad_random_start)
+                                         pad_random_start=self.pad_random_start,
+                                         fill=self.fill)
         return padded
 
 
@@ -962,9 +1024,12 @@ def get_transforms_val(image_size_sat,
                        fov_pad_random_start=True,
                        fov_border_px=0,
                        fov_scatter_pad=False,
-                       fov_gap_segments=4):
+                       fov_gap_segments=4,
+                       fov_fill=None):
 
-
+    # The padded columns must be filled as they were in training.
+    if fov_fill is not None and (not fov_pad or fov_scatter_pad):
+        raise ValueError("fov_fill is implemented for fov_pad only (not border or scatter padding)")
 
     satellite_transforms = A.Compose([A.Resize(image_size_sat[0], image_size_sat[1], interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                                       A.Normalize(mean, std),
@@ -983,11 +1048,12 @@ def get_transforms_val(image_size_sat,
                                    # `pad_random_start` included.
                                    LimitedFoVScatterPad(fov=fov, gap_segments=fov_gap_segments)
                                    if fov_scatter_pad else
-                                   LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start)
+                                   LimitedFoVPad(fov=fov, pad_random_start=fov_pad_random_start,
+                                                 fill=fov_fill)
                                    if fov_pad else LimitedFoV(fov=fov, border_px=fov_border_px),
                                   ])
-            
-               
+
+
     return satellite_transforms, ground_transforms
 
 

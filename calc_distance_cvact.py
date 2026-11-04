@@ -7,9 +7,9 @@ import torch
 
 TOP_K = 128
 
-dataset = CVACTDatasetTrain(data_folder =  "/home/71/25021871/data/chamodya/CVACT")
+dataset = CVACTDatasetTrain(data_folder =  "/home/71/25021871/data/data/CVACT")
 
-anuData = sio.loadmat('/home/71/25021871/data/chamodya/CVACT/ACT_data.mat')
+anuData = sio.loadmat('/home/71/25021871/data/data/CVACT/ACT_data.mat')
 
 utm = anuData["utm"]
 ids = anuData['panoIds']
@@ -64,5 +64,5 @@ for i, idnum in enumerate(train_idsnum_list):
     near_neighbors[idnum] = train_idsnum_lookup[ids_near_numpy[i]].tolist()
 
 print("Saving...") 
-with open("./data/CVACT/gps_dict.pkl", "wb") as f:
+with open("/home/71/25021871/data/data/CVACT/ANU_data_small/GPS/gps_dict.pkl", "wb") as f:
     pickle.dump(near_neighbors, f)

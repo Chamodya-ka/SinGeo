@@ -450,15 +450,14 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # rather than a widening support, so an epoch trains on a tight range of
         # widths. Takes precedence over the log-uniform path when set.
         #
-        # The Generator is built lazily in __getitem__, never here: this object
-        # is created in the parent process and forked into every dataloader
-        # worker, so a Generator made now would be copied and all workers would
-        # draw the same sequence.
+        # Per-sample draws use the global numpy stream, which the DataLoader
+        # reseeds in every worker each epoch. Keep no Generator on this object:
+        # it is forked into every worker, so one built in the parent (an input
+        # collage calls __getitem__ there) would give all workers the same draws.
         self.ground_fov_mean = None
         self.ground_fov_std = 20.0
         self.fov_lo = 70.0
         self.fov_hi = 360.0
-        self._fov_rng = None
         # Probability that a sample's FoV is overridden to exactly 360, giving a
         # seamless rolled panorama. The trainer sets this per epoch, so a window
         # (warm-up) and a constant rate (injection) are both expressible.
@@ -596,10 +595,8 @@ class CVUSADatasetTrainSinGeo(Dataset):
                                             lo=self.fov_lo, hi=self.fov_hi,
                                             rng=np.random.default_rng(seed))
                 else:
-                    if self._fov_rng is None:
-                        self._fov_rng = np.random.default_rng()
                     fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
-                                            lo=self.fov_lo, hi=self.fov_hi, rng=self._fov_rng)
+                                            lo=self.fov_lo, hi=self.fov_hi)
             elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:

@@ -913,6 +913,63 @@ or 3-FoV eval protocol and predate the fixes; their numbers are not comparable.
 
 ---
 
+## CVACT — padded protocol, black fill (server A)
+
+Updated 2026-11-04. Launched with `./run_cvact.sh <round>` on server A (A40);
+checkpoints in `/home/71/25021871/data/data/singeo/cvact/convnext_base.fb_in22k_ft_in1k_384/`.
+Every run in this section trains and evaluates padded with black (RGB 0) fill, so
+the rows compare with each other but **not with any CVUSA row**, nor with the 64 px
+border CVACT rounds C0–C5. Rounds C0–C8 are not logged here yet; their recipes
+and run notes are in `run_cvact.sh`.
+
+FoV 360 queries are rolled to a random azimuth. **360 aligned** is the same
+panorama north-aligned (`FoV 0` in `EVAL_FOV_EXTRA`, logged from C10 on), and the
+**roll gap** is aligned minus rolled.
+
+Shared recipe: the roundP22 settings (circle gate scaling uniform InfoNCE terms,
+RnC positives + hardest negative at 0.25 with τ 0.5, continuous tile rotation with
+the disc off, DSS at the measured FoV, `CROP_DROPOUT_STRENGTH=0.5`), plus
+`BLANK_FILL=black`, `RNC_GROUP_WEIGHTS=(1.0, 0.0, 1.0, 0.0)` and `RNC_TIE_BREAK=0.01`.
+
+| run | stamp | ground FoV schedule | 360 | 360 aligned | 180 | 90 | 70 | **Avg** | status |
+|---|---|---|---|---|---|---|---|---|---|
+| roundC9 | `20261029-093717` | per-sample Gaussian N(μ, 30) clipped to [70, 360], μ 360 → 90 by e28, after a 4-epoch rolled-panorama warm-up | 70.73 | — | 70.19 | 44.97 | 36.04 | **55.48** | final |
+| roundC10 | `20261031-165912` | SinGeo's deterministic schedule: one FoV per epoch, 360 → 70 linear, no warm-up | 78.49 | 85.48 | 69.02 | 40.86 | 30.44 | **54.70** | final |
+| **roundC11** | `20261102-134507` | C10 + `FOV_SCHEDULE_LAMBDA=5.0`: exponential, fast then slow, 360 → 70 (≤ 180 from e16, ≤ 90 from e42) | 71.60 | 85.76 | 70.16 | **47.97** | **37.40** | **56.78** | running, e68 of 80 |
+
+### roundC11 progress to e68, against roundC10 at the same epoch
+
+| ep | train FoV | 360 | 360 aligned | roll gap | 180 | 90 | 70 | **Avg** | C10 Avg | Δ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4 | 295 | 41.23 | 72.68 | 31.45 | 28.88 | 8.25 | 4.48 | 20.71 | 17.82 | +2.90 |
+| 8 | 245 | 52.34 | 86.49 | 34.15 | 55.47 | 20.48 | 12.53 | 35.20 | 28.22 | +6.98 |
+| 16 | 175 | 65.47 | 88.03 | 22.57 | 64.10 | 28.48 | 19.29 | 44.34 | 34.23 | +10.10 |
+| 24 | 133 | 73.14 | 88.33 | 15.18 | 69.39 | 36.37 | 25.61 | 51.13 | 38.72 | +12.41 |
+| 32 | 108 | **76.69** | 88.76 | 12.07 | 71.34 | 40.68 | 31.52 | 55.06 | 43.13 | +11.93 |
+| 40 | 92 | 75.88 | 87.93 | 12.06 | 70.87 | 43.17 | 34.39 | 56.08 | 46.41 | +9.66 |
+| 48 | 83 | 74.89 | 87.55 | 12.66 | 70.73 | 46.15 | 35.13 | 56.73 | 49.10 | +7.63 |
+| 56 | 77 | 74.13 | 86.76 | 12.63 | 71.21 | 46.59 | 36.54 | 57.12 | 51.67 | +5.44 |
+| 60 | 75 | 74.77 | 86.89 | 12.11 | 70.97 | 46.87 | 37.80 | **57.60** | 52.42 | +5.19 |
+| 64 | 73 | 73.02 | 86.30 | 13.28 | 70.76 | 46.83 | 37.29 | 56.97 | 53.42 | +3.56 |
+| 68 | 72 | 71.60 | 85.76 | 14.16 | 70.16 | **47.97** | 37.40 | 56.78 | 53.86 | +2.93 |
+
+- **Ahead of both controls at e68.** +2.93 Avg over C10 at the same epoch, and
+  already above C10's final (+2.08) and C9's final (+1.30). The best Avg so far is
+  57.60 at e60. The lead over C10 is shrinking (+12.41 at e24) because C10 only
+  reaches narrow FoVs in its last epochs, so the verdict waits for e80. +1.30 over
+  C9 is under the ~3-point noise floor measured on CVUSA.
+- **The narrow views recovered.** FoV 90 at 47.97 is the best of any padded CVACT
+  run (C6–C10 peaked at 40.86–45.48): +3.00 over C9's final and +8.00 over C10 at
+  e68. FoV 70 is 37.40, +1.36 over C9.
+- **FoV 360 is being given back.** Rolled FoV 360 peaked at 76.69 at e32 (training
+  FoV 108) and has fallen to 71.60, while C10's was still at 76.70 at e68. The
+  aligned score has moved less (88.80 at e20 → 85.76), so most of the loss is roll
+  robustness: the roll gap bottomed at 11.18 at e36 and has widened to 14.16. On
+  the run note's question, whether the narrow views recover without giving FoV 360
+  back: so far they recovered, and about 5 points of FoV 360 went back.
+
+---
+
 ## Method notes and gotchas
 
 - **Effective config** = the run's `train.py` snapshot defaults + its overrides

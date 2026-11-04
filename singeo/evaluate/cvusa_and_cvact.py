@@ -235,54 +235,43 @@ def calculate_scores(query_features, reference_features, query_labels, reference
     ref2index = dict()
     for i, idx in enumerate(reference_labels_np):
         ref2index[idx] = i
-    
-    
-    similarity = []
-    
+    gt_index = torch.as_tensor([ref2index[idx] for idx in query_labels_np],
+                               dtype=torch.long, device=query_features.device)
+
+    # Rank each chunk where it was computed instead of gathering the full Q x R
+    # matrix on the host first. On the 35,531-image train split that matrix is
+    # 5 GB of fp32, and the chunk list plus its torch.cat peaked at ~10 GB,
+    # which got roundC6 OOM-killed on the 31 GB A40 host. The comparisons are
+    # exact on the same fp32 values, so the recalls are unchanged.
+    ranking = []
+
     for i in range(steps):
-        
+
         start = step_size * i
-        
+
         end = start + step_size
-          
+
         sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
-    
+
+        # similiarity value of gt reference
+        gt_sim = sim_tmp.gather(1, gt_index[start:end].unsqueeze(1))
+
+        # number of references with higher similiarity as gt
+        ranking.append((sim_tmp > gt_sim).sum(dim=1).cpu())
+
+    ranking = torch.cat(ranking, dim=0).numpy()
+
 
     topk.append(R//100)
-    
+
     results = np.zeros([len(topk)])
-    
-    
-    bar = tqdm(range(Q))
-    
-    for i in bar:
-        
-        # similiarity value of gt reference
-        gt_sim = similarity[i, ref2index[query_labels_np[i]]]
-        
-        # number of references with higher similiarity as gt
-        higher_sim = similarity[i,:] > gt_sim
-        
-        
-        ranking = higher_sim.sum()
-        for j, k in enumerate(topk):
-            if ranking < k:
-                results[j] += 1.
-                        
-        
+
+    for j, k in enumerate(topk):
+        results[j] = (ranking < k).sum()
+
+
     results = results/ Q * 100.
- 
-    
-    bar.close()
-    
-    # wait to close pbar
-    time.sleep(0.1)
-    
+
     string = []
     for i in range(len(topk)-1):
         
@@ -301,23 +290,22 @@ def calculate_nearest(query_features, reference_features, query_labels, referenc
     Q = len(query_features)
     
     steps = Q // step_size + 1
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
 
-    topk_scores, topk_ids = torch.topk(similarity, k=neighbour_range+1, dim=1)
+    # topk is row-wise, so taking it per chunk (still on the host, as before)
+    # gives the same ids as on the full matrix without ever holding all of it.
+    topk_ids = []
+
+    for i in range(steps):
+
+        start = step_size * i
+
+        end = start + step_size
+
+        sim_tmp = query_features[start:end] @ reference_features.T
+
+        topk_ids.append(torch.topk(sim_tmp.cpu(), k=neighbour_range+1, dim=1)[1])
+
+    topk_ids = torch.cat(topk_ids, dim=0)
 
     topk_references = []
     

@@ -12,6 +12,7 @@ from glob import glob
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
+                               draw_gaussian_fov,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
                                scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
@@ -302,6 +303,25 @@ class CVACTDatasetTrainSinGeo(Dataset):
         self.fov_batch_size = None
         self.fov_epoch = 0
 
+        # Gaussian curriculum, as in CVUSADatasetTrainSinGeo. When
+        # `ground_fov_mean` is set the FoV is drawn from N(mean, std) clipped to
+        # [fov_lo, fov_hi] and takes precedence over the log-uniform path.
+        # Per-sample draws use the global numpy stream, which the DataLoader
+        # reseeds in every worker each epoch; no Generator is kept here, since
+        # one built in the parent (by an input collage) would be shared by all.
+        self.ground_fov_mean = None
+        self.ground_fov_std = 20.0
+        self.fov_lo = 70.0
+        self.fov_hi = 360.0
+        # Value of every blank pixel this dataset writes -- the q2 pad, and the
+        # wedge mask and rotation corners of r2 -- in the normalised tensor, from
+        # transforms.blank_fill_value. None keeps zeros, the dataset mean colour.
+        self.blank_fill = None
+        # Probability that a sample's FoV is overridden to exactly 360, giving a
+        # seamless rolled panorama. The trainer sets this per epoch, so a window
+        # (warm-up) and a constant rate (injection) are both expressible.
+        self.fov_full_pano_prob = 0.0
+
         # Written BY the trainer, read by the training script -- the one piece
         # of curriculum state that flows outward rather than in. After each
         # epoch `train_contrast_singeo_rnc` stores the mean realised crop extent
@@ -326,6 +346,10 @@ class CVACTDatasetTrainSinGeo(Dataset):
         # column. Only read when fov_pad=True, so it does not affect border runs.
         self.pad_random_start = True
         self.roll_q1 = False
+        # Bounded q1 roll, set per epoch by the trainer: q1 is rolled by an angle
+        # drawn uniformly from [-roll_q1_max, +roll_q1_max] degrees. 0 keeps q1 at
+        # relative orientation 0 to r1. `roll_q1` is the full uniform roll.
+        self.roll_q1_max = 0.0
         self.return_aerial_mask = False
 
         
@@ -408,7 +432,19 @@ class CVACTDatasetTrainSinGeo(Dataset):
 
             # Ground FoV crop. `transforms_query2` must be built with fov=0 in
             # this mode so the crop is not applied twice.
-            if self.ground_fov_floor is None:
+            if self.ground_fov_mean is not None:
+                if self.fov_batch_size:
+                    # One draw per batch, seeded from (epoch, batch) so every
+                    # worker agrees on it and unpadded crops still collate.
+                    batch = index // self.fov_batch_size
+                    seed = (self.fov_epoch * 1_000_003 + batch * 2_654_435_761) % (2 ** 63)
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi,
+                                            rng=np.random.default_rng(seed))
+                else:
+                    fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
+                                            lo=self.fov_lo, hi=self.fov_hi)
+            elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
                 batch = index // self.fov_batch_size
@@ -417,11 +453,26 @@ class CVACTDatasetTrainSinGeo(Dataset):
             else:
                 fov = draw_log_uniform_fov(self.ground_fov_floor)
 
+            # Full-panorama injection, overriding whatever the sampler drew. Same
+            # as CVUSADatasetTrainSinGeo: exactly 360 is the only draw that fills
+            # every column, i.e. the seamless rolled panorama the FoV-360 eval
+            # query is. Drawn per BATCH in batch modes so crops still collate.
+            if self.fov_full_pano_prob > 0.0:
+                if self.fov_batch_size:
+                    batch = index // self.fov_batch_size
+                    seed = (self.fov_epoch * 7_654_321 + batch * 2_654_435_761) % (2 ** 63)
+                    hit = random.Random(seed).random() < self.fov_full_pano_prob
+                else:
+                    hit = random.random() < self.fov_full_pano_prob
+                if hit:
+                    fov = 360.0
+
             angle = random.randint(0, 359)
             query_img2, g_center, g_extent = apply_limited_fov(query_img2, fov, angle,
                                                                 pad=self.fov_pad,
                                                                 pad_random_start=self.pad_random_start,
-                                                                border_px=self.fov_border_px)
+                                                                border_px=self.fov_border_px,
+                                                                fill=self.blank_fill)
             # Panorama frame -> compass bearing, the frame the wedge is placed in
             # and every arc comparison assumes. See CVUSA_PANO_COL0_BEARING.
             g_center = (g_center + CVACT_PANO_COL0_BEARING) % 360.0
@@ -459,10 +510,12 @@ class CVACTDatasetTrainSinGeo(Dataset):
                 if self.return_aerial_mask:
                     reference_img2, aerial_mask = apply_aerial_sector(
                         reference_img2, rot, s_center, self.sat_arc,
-                        circular_mask=self.aerial_circular_mask, return_mask=True)
+                        circular_mask=self.aerial_circular_mask, return_mask=True,
+                        fill=self.blank_fill)
                 else:
                     reference_img2 = apply_aerial_sector(reference_img2, rot, s_center, self.sat_arc,
-                                                            circular_mask=self.aerial_circular_mask)
+                                                            circular_mask=self.aerial_circular_mask,
+                                                            fill=self.blank_fill)
                 meta[M_SAT_CENTER] = s_center
                 meta[M_SAT_EXTENT] = self.sat_arc
             else:
@@ -511,6 +564,12 @@ class CVACTDatasetTrainSinGeo(Dataset):
         if self.roll_q1:
             width = query_img1.shape[2]
             query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
+        elif self.roll_q1_max > 0:
+            # q1 covers the whole circle, so its arc stays 360 deg and no gate or
+            # RnC label depends on its heading; only its alignment to r1 changes.
+            width = query_img1.shape[2]
+            degrees = random.uniform(-self.roll_q1_max, self.roll_q1_max)
+            query_img1 = torch.roll(query_img1, shifts=int(round(degrees / 360.0 * width)), dims=2)
         if self.fov_border_q1 and self.fov_border_px:
             query_img1 = add_blank_border(query_img1, self.fov_border_px)
 
