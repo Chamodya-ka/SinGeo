@@ -18,6 +18,7 @@ from singeo.transforms import get_transforms_train_singeo, get_transforms_train_
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
 from singeo.transforms import MASK_FILL_MODES, mask_fill_values
 from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor, get_gaussian_fov_mean
+from singeo.transforms import get_q1_roll_max
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
@@ -408,6 +409,12 @@ class Configuration:
     fov_gaussian_ramp_frac: float = 1.0
     fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
     fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
+    # Shape of the "deterministic" schedule. 0 = the original SinGeo linear walk;
+    # > 0 = exponential fast-to-slow, (1 - exp(-lam x)) / (1 - exp(-lam)) with
+    # x = epoch / epochs: lam = 5 over 360 -> 70 is at or below 180 from epoch 16
+    # and at or below 90 from epoch 42 (linear: 50 and 75). See get_dynamic_fov.
+    # The other sampling modes refuse it at startup rather than ignore it.
+    fov_schedule_lambda: float = 0.0
 
     # Lower clip bound for the Gaussian band, decoupled from the mean endpoint.
     # `None` keeps the original behaviour, clipping at `fov_curriculum_end`,
@@ -617,6 +624,12 @@ class Configuration:
 
     infonce_gate_normalise_mass: bool = False
     infonce_gate_mass_target: Optional[float] = None
+    # Hold loss1's (q1-r1) share of the gated InfoNCE mass fixed: loss1 is scaled
+    # by the mean gate of loss2..loss6 each batch, so its share stays at 1/6 with
+    # flat term weights instead of drifting ~17% -> ~36% as the crop and wedge
+    # narrow. Needs the circle gate with infonce_gate_scales_terms; excludes
+    # infonce_gate_normalise_mass. See singeo.trainer._loss1_share_scale.
+    infonce_hold_loss1_share: bool = False
 
     conv_padding_mode: str = "zeros"
 
@@ -677,6 +690,17 @@ class Configuration:
     # Only q1 is rolled; it is cyclic over 360 degrees so the rotation is exact.
     # The RNC arc for q1 stays (0, 360), so distance labels are untouched.
     ground_roll_q1: bool = False
+
+    # Ramp the q1 roll in instead of switching it on at epoch 1. Each sample's q1
+    # is rolled by a uniform draw from [-A, +A] degrees, with A rising linearly
+    # from 0 at epoch 1 to 180 once this fraction of the run has passed, then
+    # holding. A = 180 covers the whole circle, i.e. the full `ground_roll_q1`
+    # roll. 0 disables it; 1.0 reaches 180 at the final epoch. The full roll from
+    # epoch 1 is measured harmful (caps FoV 180 at ~80, see EXPERIMENTS.md); this
+    # keeps q1 aligned with the tile early and introduces the arbitrary relative
+    # orientation that every FoV-360 eval query has gradually. Excludes
+    # `ground_roll_q1`.
+    ground_roll_q1_ramp_frac: float = 0.0
 
     # Mask-aware encoding of the wedged aerial view (r2), see singeo.masked_encoder.
     #
@@ -894,6 +918,11 @@ def write_run_info(path, cfg, run_name, note, overrides):
             lines.append("  DROPPED as hard positives: {}".format(", ".join(dropped)))
     lines.append("")
 
+    if getattr(cfg, "infonce_hold_loss1_share", False):
+        lines.append("loss1 (q1-r1) share HELD: loss1 is scaled by the mean gate of loss2..loss6")
+        lines.append("  every batch, so it keeps its epoch-1 share of the InfoNCE mass (1/6 with")
+        lines.append("  flat weights) instead of drifting ~17% -> ~36% as the crop and wedge narrow.")
+        lines.append("")
     lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))
     if cfg.fov_sampling.startswith("gaussian"):
         lines.append("  fresh FoV per {} from N(mean, {}) clipped to [{}, 360],".format(
@@ -927,6 +956,15 @@ def write_run_info(path, cfg, run_name, note, overrides):
             cfg.fov_ramp_frac))
         if cfg.fov_sampling == "loguniform_batch":
             lines.append("  one draw per batch, so unpadded crops of equal width still collate.")
+    elif cfg.fov_schedule_lambda > 0:
+        lines.append("  one FoV per epoch, exponential fast-to-slow 360 -> {} deg across the run,".format(
+            cfg.fov_curriculum_end))
+        lines.append("  (1 - exp(-lam x)) / (1 - exp(-lam)) with lam = {}.".format(cfg.fov_schedule_lambda))
+        reached = lambda limit: next((e for e in range(1, cfg.epochs + 1)
+                                      if get_dynamic_fov(e, cfg.epochs, 360.0, cfg.fov_curriculum_end,
+                                                         lam=cfg.fov_schedule_lambda) <= limit), None)
+        lines.append("  at or below 180 deg from epoch {}, at or below 90 deg from epoch {}.".format(
+            reached(180.0), reached(90.0)))
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
@@ -937,6 +975,13 @@ def write_run_info(path, cfg, run_name, note, overrides):
         lines.append("  otherwise stops producing once the band settles.")
         lines.append("  window: {}".format("every epoch" if cfg.fov_full_pano_epochs == 0
                                            else "epochs 1-{} only".format(cfg.fov_full_pano_epochs)))
+    if getattr(cfg, "ground_roll_q1", False):
+        lines.append("q1 roll: full uniform roll of the panorama against the tile, every epoch.")
+    elif getattr(cfg, "ground_roll_q1_ramp_frac", 0.0) > 0.0:
+        lines.append("q1 roll: RAMPED, U(-A, +A) deg per sample, A linear 0 (epoch 1) -> 180 "
+                     "(epoch {:.0f}), then held.".format(cfg.epochs * cfg.ground_roll_q1_ramp_frac))
+    else:
+        lines.append("q1 roll: off, q1 stays aligned with the tile.")
     lines.append("Mask fill: {}".format({
         "mean": "mean colour (tensor zero after Normalize), the historical fill",
         "black": "BLACK (pixel zero) for every mask: ground pad/border, wedge, rotation corners",
@@ -1399,6 +1444,16 @@ if __name__ == '__main__':
         raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
                          "every negative is already in the rank sets")
 
+    if config.infonce_hold_loss1_share:
+        if not (config.overlap_gated_infonce and config.infonce_gate_scales_terms
+                and config.overlap_gate_measure == "circle"):
+            raise ValueError(
+                "infonce_hold_loss1_share needs overlap_gated_infonce=True, "
+                "infonce_gate_scales_terms=True and overlap_gate_measure='circle': only then "
+                "does each term count at its mean gate, which is the share being held.")
+        if config.infonce_gate_normalise_mass:
+            raise ValueError("infonce_hold_loss1_share and infonce_gate_normalise_mass cannot be "
+                             "combined: the mass renormalisation assumes loss1 counts at 1.")
     if config.infonce_gate_normalise_mass and not config.infonce_gate_scales_terms:
         raise ValueError(
             "infonce_gate_normalise_mass needs infonce_gate_scales_terms=True: without it the "
@@ -1420,6 +1475,13 @@ if __name__ == '__main__':
 
     if config.fov_border_q1 and not config.fov_border_px:
         raise ValueError("fov_border_q1 needs fov_border_px > 0: there is no border to add")
+
+    if not 0.0 <= config.ground_roll_q1_ramp_frac <= 1.0:
+        raise ValueError("ground_roll_q1_ramp_frac must be in [0, 1] (a fraction of the run), "
+                         "got {}".format(config.ground_roll_q1_ramp_frac))
+    if config.ground_roll_q1_ramp_frac > 0 and config.ground_roll_q1:
+        raise ValueError("ground_roll_q1_ramp_frac excludes ground_roll_q1: the ramp IS the "
+                         "q1 roll, reaching the full uniform roll at its end")
 
     if config.overlap_gate_measure not in ("containment", "circle", "iou"):
         raise ValueError("overlap_gate_measure must be 'containment', 'circle' or 'iou', got "
@@ -1494,6 +1556,12 @@ if __name__ == '__main__':
             "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
             "on the dataset path, which return_meta enables).")
 
+    if config.fov_schedule_lambda < 0:
+        raise ValueError("fov_schedule_lambda must be >= 0 (0 = linear), got {}".format(
+            config.fov_schedule_lambda))
+    if config.fov_schedule_lambda and config.fov_sampling != "deterministic":
+        raise ValueError("fov_schedule_lambda shapes the 'deterministic' schedule only; it would be "
+                         "inert under fov_sampling={!r}".format(config.fov_sampling))
     if config.fov_sampling not in ("loguniform", "loguniform_batch", "gaussian",
                                    "gaussian_batch", "deterministic"):
         raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch', 'gaussian', "
@@ -1735,7 +1803,8 @@ if __name__ == '__main__':
             fov_floor = None
             fov_dynamic = get_dynamic_fov(epoch, config.epochs,
                                           fov_start=360,
-                                          fov_end=config.fov_curriculum_end)
+                                          fov_end=config.fov_curriculum_end,
+                                          lam=config.fov_schedule_lambda)
         # With RNC the crop moves into the dataset (which records its window),
         # so the transform pipeline is built without one.
         fov_for_transform = 0.0 if config.use_rnc else fov_dynamic
@@ -1762,6 +1831,12 @@ if __name__ == '__main__':
                                                         )
         query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
+
+        if config.ground_roll_q1_ramp_frac > 0:
+            q1_roll_max = get_q1_roll_max(epoch, config.epochs,
+                                          ramp_frac=config.ground_roll_q1_ramp_frac)
+            train_dataloader.dataset.roll_q1_max_deg = q1_roll_max
+            print(f"For Epoch {epoch}: q1 roll ~ U(-{q1_roll_max:.2f}, +{q1_roll_max:.2f}) deg")
         
         if fov_mean is not None:
             settled = "" if config.fov_gaussian_ramp_frac >= 1.0 else (

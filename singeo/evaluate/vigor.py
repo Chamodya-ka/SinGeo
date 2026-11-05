@@ -1,274 +1,208 @@
 import time
 import torch
 import numpy as np
-from tqdm import tqdm
 import gc
 import copy
 from ..trainer import predict
 
 
+# Scoring is done on the GPU one block of queries at a time. Upstream built the
+# whole query x reference matrix on the CPU first: 53,694 x 46,563 floats is
+# 10 GB for the cross-area test (19 GB same-area), held twice during the concat,
+# and then walked one query at a time in Python. The comparisons below are the
+# same ones on the same fp32 values, so R@k and the hit rate are unchanged.
+
+
 def evaluate(config,
              model,
              reference_dataloader,
-             query_dataloader, 
+             query_dataloader,
              ranks=[1, 5, 10],
              step_size=1000,
              cleanup=True):
-    
-    
+
     print("\nExtract Features:")
-    reference_features, reference_labels = predict(config, model, reference_dataloader) 
+    reference_features, reference_labels = predict(config, model, reference_dataloader)
     query_features, query_labels = predict(config, model, query_dataloader)
-    
+
     print("Compute Scores:")
-    r1 =  calculate_scores(query_features, reference_features, query_labels, reference_labels, step_size=step_size, ranks=ranks) 
-        
+    r1 = calculate_scores(query_features, reference_features, query_labels, reference_labels,
+                          step_size=step_size, ranks=ranks)
+
     # cleanup and free memory on GPU
     if cleanup:
         del reference_features, reference_labels, query_features, query_labels
         gc.collect()
-        
+
     return r1
 
 
+def evaluate_fovs(config,
+                  model,
+                  reference_dataloader,
+                  query_dataloaders,
+                  ranks=[1, 5, 10],
+                  step_size=1000):
+    """`evaluate` for several query loaders against one gallery.
+
+    The reference transform is deterministic, so encoding the 46k-tile gallery
+    once and scoring every FoV against it gives the numbers separate `evaluate`
+    calls would, without re-encoding the gallery per FoV.
+
+    `query_dataloaders` is an ordered `{fov: loader}`; returns `{fov: R@1}`. The
+    key "main" marks the checkpoint FoV; every other key also gets the
+    "Extra eval with FoV" line the CVUSA logs carry.
+    """
+    print("\nExtract Features (reference, shared by {} FoVs):".format(len(query_dataloaders)))
+    reference_features, reference_labels = predict(config, model, reference_dataloader)
+
+    results = {}
+    for fov, loader in query_dataloaders.items():
+        print("\nExtract Features (query, FoV {}):".format(fov))
+        query_features, query_labels = predict(config, model, loader)
+        print("Compute Scores:")
+        results[fov] = calculate_scores(query_features, reference_features, query_labels,
+                                        reference_labels, step_size=step_size, ranks=ranks)
+        if fov != "main":
+            # Same line, same place, as the CVUSA trainer's extra-FoV evals.
+            print(f"Extra eval with FoV {fov}: R@1 = {results[fov]:.4f}")
+        del query_features, query_labels
+
+    del reference_features, reference_labels
+    gc.collect()
+    return results
+
+
 def calc_sim(config,
-                        model,
-                        reference_dataloader,
-                        query_dataloader, 
-                        ranks=[1, 5, 10],
-                        step_size=1000,
-                        cleanup=True):
-    
-    
+             model,
+             reference_dataloader,
+             query_dataloader,
+             ranks=[1, 5, 10],
+             step_size=1000,
+             cleanup=True):
+
     print("\nExtract Features:")
-    reference_features, reference_labels = predict(config, model, reference_dataloader) 
+    reference_features, reference_labels = predict(config, model, reference_dataloader)
     query_features, query_labels = predict(config, model, query_dataloader)
-    
+
     print("Compute Scores Train:")
-    r1 =  calculate_scores_train(query_features, reference_features, query_labels, reference_labels, step_size=step_size, ranks=ranks) 
-    
+    r1 = calculate_scores_train(query_features, reference_features, query_labels, reference_labels,
+                                step_size=step_size, ranks=ranks)
+
     near_dict = calculate_nearest(query_features=query_features,
                                   reference_features=reference_features,
                                   query_labels=query_labels,
                                   reference_labels=reference_labels,
                                   neighbour_range=config.neighbour_range,
                                   step_size=step_size)
-            
+
     # cleanup and free memory on GPU
     if cleanup:
         del reference_features, reference_labels, query_features, query_labels
         gc.collect()
-        
+
     return r1, near_dict
 
 
+def _reference_index(reference_labels, labels):
+    """Column of each label in the reference matrix (labels: any shape)."""
+    lookup = torch.full((int(reference_labels.max()) + 1,), -1, dtype=torch.long,
+                        device=reference_labels.device)
+    lookup[reference_labels] = torch.arange(len(reference_labels), device=reference_labels.device)
+    index = lookup[labels]
+    if (index < 0).any():
+        raise ValueError("{} query labels have no reference in the gallery".format(
+            int((index < 0).sum())))
+    return index
 
-def calculate_scores(query_features, reference_features, query_labels, reference_labels, step_size=1000, ranks=[1,5,10]):
+
+def _ranks_and_hits(query_features, reference_features, gt_index, semi_index, step_size):
+    """Per query: how many references score strictly above the positive, and
+    whether any reference other than a semi-positive does (the hit rate)."""
+    rankings, hits = [], []
+    R = reference_features.shape[0]
+    for start in range(0, query_features.shape[0], step_size):
+        sim = query_features[start:start + step_size] @ reference_features.T
+        gt = sim.gather(1, gt_index[start:start + step_size, None])
+        higher = sim > gt
+        rankings.append(higher.sum(1))
+        if semi_index is not None:
+            keep = torch.ones_like(higher)
+            keep.scatter_(1, semi_index[start:start + step_size], False)
+            hits.append((higher & keep).sum(1) < 1)
+        del sim, higher
+    ranking = torch.cat(rankings).cpu().numpy()
+    hit = torch.cat(hits).cpu().numpy() if semi_index is not None else None
+    return ranking, hit, R
+
+
+def calculate_scores(query_features, reference_features, query_labels, reference_labels,
+                     step_size=1000, ranks=[1, 5, 10]):
 
     topk = copy.deepcopy(ranks)
     Q = len(query_features)
-    R = len(reference_features)
-    
-    steps = Q // step_size + 1
-    
-    
-    query_labels_np = query_labels.cpu().numpy()
-    reference_labels_np = reference_labels.cpu().numpy()
-    
-    ref2index = dict()
-    for i, idx in enumerate(reference_labels_np):
-        ref2index[idx] = i
-    
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
-    
 
-    topk.append(R//100)
-    
-    results = np.zeros([len(topk)])
-    
-    hit_rate = 0.0
-    
-    bar = tqdm(range(Q))
-    
-    for i in bar:
-        
-        # similiarity value of gt reference
-        gt_sim = similarity[i, ref2index[query_labels_np[i][0]]]
-        
-        # number of references with higher similiarity as gt
-        higher_sim = similarity[i,:] > gt_sim
-        
-         
-        ranking = higher_sim.sum()
-        for j, k in enumerate(topk):
-            if ranking < k:
-                results[j] += 1.
-                        
-        # mask for semi pos
-        mask = torch.ones(R)
-        for near_pos in query_labels_np[i][1:]:
-            mask[ref2index[near_pos]] = 0
-        
-        # calculate hit rate
-        hit = (higher_sim * mask).sum()
-        if hit < 1:
-            hit_rate += 1.0
-                
-    
-    results = results/ Q * 100.
-    hit_rate = hit_rate / Q * 100
-    
-    bar.close()
-    
-    # wait to close pbar
-    time.sleep(0.1)
-    
+    gt_index = _reference_index(reference_labels, query_labels[:, 0])
+    semi_index = _reference_index(reference_labels, query_labels[:, 1:])
+    ranking, hit, R = _ranks_and_hits(query_features, reference_features, gt_index, semi_index,
+                                      step_size)
+
+    topk.append(R // 100)
+    results = np.array([(ranking < k).sum() for k in topk], dtype=np.float64) / Q * 100.
+    hit_rate = hit.sum() / Q * 100
+
     string = []
-    for i in range(len(topk)-1):
-        
+    for i in range(len(topk) - 1):
         string.append('Recall@{}: {:.4f}'.format(topk[i], results[i]))
-        
     string.append('Recall@top1: {:.4f}'.format(results[-1]))
-    string.append('Hit_Rate: {:.4f}'.format(hit_rate))             
-        
-    print(' - '.join(string)) 
+    string.append('Hit_Rate: {:.4f}'.format(hit_rate))
+    print(' - '.join(string))
 
     return results[0]
 
-def calculate_scores_train(query_features, reference_features, query_labels, reference_labels, step_size=1000, ranks=[1,5,10]):
+
+def calculate_scores_train(query_features, reference_features, query_labels, reference_labels,
+                           step_size=1000, ranks=[1, 5, 10]):
 
     topk = copy.deepcopy(ranks)
     Q = len(query_features)
-    R = len(reference_features)
-    
-    steps = Q // step_size + 1
-    
-    query_labels_np = query_labels[:,0].cpu().numpy()
-    reference_labels_np = reference_labels.cpu().numpy()
-    
-    ref2index = dict()
-    for i, idx in enumerate(reference_labels_np):
-        ref2index[idx] = i
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
 
-    topk.append(R//100)
-    
-    results = np.zeros([len(topk)])
-    
-    bar = tqdm(range(Q))
-    
-    for i in bar:
-        
-        # similiarity value of gt reference
-        gt_sim = similarity[i, ref2index[query_labels_np[i]]]
-        
-        # number of references with higher similiarity as gt
-        higher_sim = similarity[i,:] > gt_sim
-         
-        ranking = higher_sim.sum()
-        for j, k in enumerate(topk):
-            if ranking < k:
-                results[j] += 1.
-        
-    results = results/ Q * 100.
+    gt_index = _reference_index(reference_labels, query_labels[:, 0])
+    ranking, _, R = _ranks_and_hits(query_features, reference_features, gt_index, None, step_size)
 
-    bar.close()
-    
-    # wait to close pbar
-    time.sleep(0.1)
-    
+    topk.append(R // 100)
+    results = np.array([(ranking < k).sum() for k in topk], dtype=np.float64) / Q * 100.
+
     string = []
-    for i in range(len(topk)-1):
-        
+    for i in range(len(topk) - 1):
         string.append('Recall@{}: {:.4f}'.format(topk[i], results[i]))
-        
-    string.append('Recall@top1: {:.4f}'.format(results[-1]))           
-        
-    print(' - '.join(string)) 
+    string.append('Recall@top1: {:.4f}'.format(results[-1]))
+    print(' - '.join(string))
 
     return results[0]
-   
-
-def calculate_nearest(query_features, reference_features, query_labels, reference_labels, neighbour_range=64, step_size=1000):
-
-    query_labels = query_labels[:,0]
-    
-    Q = len(query_features)
-    
-    steps = Q // step_size + 1
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
 
 
-    # there might be more ground views for same sat view
-    topk_scores, topk_ids = torch.topk(similarity, k=neighbour_range+2, dim=1)
+def calculate_nearest(query_features, reference_features, query_labels, reference_labels,
+                      neighbour_range=64, step_size=1000):
 
+    query_labels = query_labels[:, 0]
 
-    topk_references = []
-    
-    for i in range(len(topk_ids)):
-        topk_references.append(reference_labels[topk_ids[i,:]])
-    
-    topk_references = torch.stack(topk_references, dim=0)
-
-     
-    # mask for ids without gt hits
-    mask = topk_references != query_labels.unsqueeze(1)
-    
-    
-    topk_references = topk_references.cpu().numpy()
-    mask = mask.cpu().numpy()
-    
-
-    # dict that only stores ids where similiarity higher than the lowes gt hit score
     nearest_dict = dict()
-    
-    for i in range(len(topk_references)):
-        
-        nearest = topk_references[i][mask[i]][:neighbour_range]
-    
-        nearest_dict[query_labels[i].item()] = list(nearest)
-    
+    for start in range(0, len(query_features), step_size):
+        sim = query_features[start:start + step_size] @ reference_features.T
+        # there might be more ground views for same sat view
+        _, topk_ids = torch.topk(sim, k=neighbour_range + 2, dim=1)
+        topk_references = reference_labels[topk_ids]
+        labels = query_labels[start:start + step_size]
+        # drop the query's own tile
+        mask = topk_references != labels.unsqueeze(1)
+
+        topk_references = topk_references.cpu().numpy()
+        mask = mask.cpu().numpy()
+        labels = labels.cpu().numpy()
+        for i in range(len(topk_references)):
+            # A tile with two panoramas keeps the later one's list, as upstream.
+            nearest_dict[labels[i].item()] = list(topk_references[i][mask[i]][:neighbour_range])
+        del sim
 
     return nearest_dict

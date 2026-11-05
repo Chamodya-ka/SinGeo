@@ -986,9 +986,35 @@ def _pair_overlap_gate(arc_a, arc_b, measure="containment"):
     return overlap.diagonal()
 
 
+def _loss1_share_scale(term_weights, gates_rest):
+    """Weight on loss1 that holds its share of the gated InfoNCE mass constant.
+
+    Under the circle gate with `infonce_gate_scales_terms`, each term counts at
+    its mean gate. loss1 (q1-r1, two full views) always scores 1, while the
+    other five fall as the crop and the wedge narrow. On the P32 curriculum
+    their mean gate is 0.96 at epoch 1, 0.50 at epoch 24 and 0.36 at epoch 80,
+    so loss1's share of the mass drifts 17% -> 28% -> 36%.
+
+    Returns the term-weighted mean gate of loss2..loss6. Multiplying loss1 by it
+    pins loss1's share at t1 / (t1 + t2 + ... + t6), the share it has when every
+    gate is 1 (1/6 for flat weights), at every step. No gradient: the gates come
+    from recorded arcs, not from the model.
+
+    Args:
+        term_weights: the six `infonce_term_weights`.
+        gates_rest: per-sample gate tensors for loss2..loss6.
+    """
+    rest = term_weights[1:]
+    denominator = float(sum(rest))
+    if denominator <= 0:
+        raise ValueError("infonce_hold_loss1_share needs some weight on loss2..loss6, got {}"
+                         .format(tuple(term_weights)))
+    return sum(t * g.mean() for t, g in zip(rest, gates_rest)) / denominator
+
+
 def _singeo_infonce_terms(train_config, model, loss_function,
                           features_q1, features_q2, features_r1, features_r2,
-                          meta=None):
+                          meta=None, info=None):
     """The six InfoNCE terms of `train_contrast_singeo`, and their combination.
 
     With `meta` and `train_config.overlap_gated_infonce`, each term is weighted
@@ -1062,7 +1088,24 @@ def _singeo_infonce_terms(train_config, model, loss_function,
         raise ValueError("infonce_term_weights needs 6 entries (loss1..loss6), got {}"
                          .format(len(weights)))
 
-    total = sum(w * t for w, t in zip(weights, terms))
+    # `infonce_hold_loss1_share` scales loss1 by the mean gate of the other five
+    # terms, so its share of the mass stays where it starts instead of drifting
+    # up as the crop and the wedge narrow. See `_loss1_share_scale`. Off, the
+    # sum below is the original left-to-right expression, bit for bit.
+    loss1_scale = None
+    if gate and getattr(train_config, 'infonce_hold_loss1_share', False):
+        if getattr(train_config, 'infonce_gate_normalise_mass', False):
+            raise ValueError("infonce_hold_loss1_share and infonce_gate_normalise_mass cannot "
+                             "be combined: the mass renormalisation assumes loss1 counts at 1")
+        loss1_scale = _loss1_share_scale(weights, (w2, w3, w4, w5, w6))
+
+    if loss1_scale is None:
+        total = sum(w * t for w, t in zip(weights, terms))
+    else:
+        total = weights[0] * loss1_scale * loss1 + sum(
+            w * t for w, t in zip(weights[1:], terms[1:]))
+    if info is not None:
+        info['loss1_scale'] = loss1_scale
 
     # Renormalise the gate's total mass.
     #
@@ -1135,6 +1178,10 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
 
     losses = AverageMeter()
     rnc_meters = {key: AverageMeter() for key in ('g2a', 'g2g', 'a2g', 'a2a')}
+    # Epoch averages of the six (gated, unweighted) InfoNCE terms, printed into
+    # log.txt: the console's tqdm postfix is cut at the terminal width.
+    term_meters = [AverageMeter() for _ in range(6)]
+    loss1_scale_meter = AverageMeter()
     # Realised ground FoV, averaged over every sample the epoch actually trained
     # on. `meta[M_GROUND_EXTENT]` is the extent AFTER column quantisation, so
     # this is the width the encoder saw, not the width that was drawn.
@@ -1197,6 +1244,8 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
             raise ValueError("batch carries an aerial mask but aerial_mask_mode is {!r}"
                              .format(aerial_mask_mode))
 
+        step_info = {}
+
         def forward_and_loss():
             q1 = query1.to(train_config.device)
             q2 = query2.to(train_config.device)
@@ -1214,7 +1263,7 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
 
             total, terms = _singeo_infonce_terms(train_config, model, loss_function,
                                                  features_q1, features_q2, features_r1, features_r2,
-                                                 meta=meta_dev)
+                                                 meta=meta_dev, info=step_info)
 
             groups = None
             if use_rnc:
@@ -1287,6 +1336,10 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
         if groups is not None:
             for key, value in groups.items():
                 rnc_meters[key].update(value.item())
+        for meter, term in zip(term_meters, terms):
+            meter.update(term.item())
+        if step_info.get('loss1_scale') is not None:
+            loss1_scale_meter.update(float(step_info['loss1_scale']))
 
         if train_config.verbose:
             loss1, loss2, loss3, loss4, loss5, loss6 = terms
@@ -1315,6 +1368,12 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     if use_rnc:
         print("RNC epoch averages - " + " ".join(
             "{}: {:.4f}".format(key, rnc_meters[key].avg) for key in ('g2a', 'g2g', 'a2g', 'a2a')))
+    if term_meters[0].count:
+        line = "InfoNCE epoch averages - " + " ".join(
+            "loss{}: {:.4f}".format(i + 1, m.avg) for i, m in enumerate(term_meters))
+        if loss1_scale_meter.count:
+            line += " | loss1 weight (share held): {:.4f}".format(loss1_scale_meter.avg)
+        print(line)
 
     # Published on the dataset rather than returned, so the signature stays
     # compatible with every existing caller (train_singeo_cvact.py included).

@@ -115,6 +115,8 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP31 `_20261027-103328` | B | unpadded, **flush** | P23 + `FOV_PAD=false FOV_SAMPLING=gaussian_batch` (border stays 0) | 92.22 | 84.67 | 62.66 | 52.88 | **73.11** | final |
 | roundP29 `_20261028-093900` | B | padded, per-sample | P23 + `MASK_FILL=black` — every blank region pixel-black instead of mean colour | — | — | — | — | — | running |
 | roundP32 `_20261028-234233` | B | padded, per-sample | P23 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)'` — RnC on the cross-domain groups only; g2g/a2a are a hardest-negative triplet with no overlap ranking | 95.05 | 92.17 | **76.16** | **66.94** | **82.58** | final — best overall; CVACT twin roundC9 running |
+| roundP33 `_20261031-152053` | B | padded, per-sample | P32 + `RNC_WEIGHT=0.4` — first P32-family run after the per-worker FoV RNG fix, so the dose and the fix are confounded | 94.69 | 90.61 | 72.79 | 63.77 | **80.47** | final |
+| roundP34 `_20261101-233600` | B | padded, per-sample | P32 + `GROUND_ROLL_Q1_RAMP_FRAC=1.0`: q1 rolled by U(−A, +A), A linear 0° (e1) → 180° (e80). Only q1 changes; q2/r1/r2, meta and overlap labels verified bit-identical. Post RNG fix | | | | | | running |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -503,6 +505,17 @@ the two masks overlap, and RnC ranks that overlap.
 | **the hierarchy, when the gate is given the between-term axis** | **−0.98** | P12(cont) → P14 |
 | continuous vs quarter tile rotation, CVUSA | +0.67 | P12 → P12(cont) |
 | continuous vs quarter tile rotation, CVACT | −0.06 | C1 → C3 |
+
+> **CVACT r2 rotation bug (found 2026-10-31).** Until the roundC9 rerun
+> `_20261031-005205`, `train_singeo_cvact.py` kept upstream SinGeo's per-epoch ±90°
+> rotation of r2 switched on while the wedge was active. The wedge arcs never
+> recorded it. Its keep_prob fell from 1.0 to 0.25, so by the end up to 75% of
+> wedge tiles were mislabelled. The logs show it in every wedge-on CVACT run: C1,
+> C2, C3 and C5 (minimum keep_prob 0.25) and the first C9 (0.67 at e35). C1 → C3
+> above compares two runs that share the bug, so the difference stands, but the
+> absolute CVACT numbers (C1 52.50, C3 52.44) are not clean references. The
+> CVUSA trainer always had the guard: every CVUSA run on server B logged
+> keep_prob 1.0000 in every epoch.
 
 **Three claims the evidence supports:**
 
@@ -949,6 +962,121 @@ augmenting the input type will not address it. The levers there are regularisati
 `crop_dropout_strength` (the CVACT runs override the script's own default of 1.0
 down to 0.5) and a wider band.
 
+> **Update 2026-10-31 (roundC9 `_20261031-005205`, eval-only).** Only about half of
+> it is a real decline. The rest is the flush-rotated FoV-360 query: a flush
+> panorama misaligned with its tile, which training never produces because the
+> paired rotate keeps q1 aligned with r1 (see "FoV 360: the logged column mixes an
+> input artefact with embedding quality"). On CVACT that artefact is large and
+> growing, and the e60 roll sweep there (86.56 aligned, 71 at 90°, 62 at 135°)
+> shows the flush path is orientation-specific:
+>
+> | C9 | rotated flush (logged) | rotated + 16 px | north flush |
+> |---|---|---|---|
+> | e24 (peak) | 76.72 | 84.08 | 87.84 |
+> | e40 | 73.93 | 83.10 | 87.56 |
+> | e60 | 72.28 | 82.06 | 86.56 |
+> | e24 → e60 | −4.44 | −2.02 | −1.28 |
+>
+> - **The artefact** is 7.4 points at e24 and 9.8 at e60. On CVUSA P23 it is 0.2.
+>   It grows once the Gaussian band settles at 90° (e24), because no wide
+>   misaligned crops are trained after that. It is also why C9 scores lower at FoV 360 than
+>   at 270 (69.86 vs 79.20 at e68): the 270 query carries fill, which is a trained
+>   input type.
+> - **The real decline** is about 2 points on the bordered query, the same size as
+>   the bordered roundC3's own FoV-360 decline (82.41 at e24 → 79.87 at e80).
+>   That component is the overfitting reading above. FoV 90 and 70 keep rising, so
+>   it is a trade-off within the shared encoder, not a collapse.
+> - On the bordered query C9 at e24 (84.08) is above SinGeo's published CVACT
+>   FoV 360 (83.4).
+>
+> **4 px border (2026-11-01, eval-only, same checkpoints plus `weights_end`).** One
+> ConvNeXt patch of blank on each side of the rotated panorama recovers about three
+> quarters of the 16 px gain, at every epoch. CVACT eval rolls are unseeded, so rows
+> carry ±0.3 roll noise; the flush column matches the logged one within that.
+>
+> | C9 | logged | rotated flush | rotated + 4 px | rotated + 16 px | north flush |
+> |---|---|---|---|---|---|
+> | e24 | 76.40 | 76.61 | 82.18 | 84.02 | 87.84 |
+> | e40 | 73.42 | 73.21 | 80.90 | 82.95 | 87.56 |
+> | e60 | 72.30 | 72.04 | 79.59 | 82.25 | 86.56 |
+> | e80 | 69.03 | 69.36 | 78.75 | 81.72 | 84.67 |
+>
+> At e80 the logged 69.03 splits into +9.4 from the tensor edge (4 px), +3.0 more
+> with 16 px, and +3.0 more for north alignment. The real decline from e24 is about
+> 2.3 on the 16 px query and 3.2 north-aligned, and it continues to e80.
+>
+> **Early epochs (2026-11-05, eval-only, `weights_e4`–`e24`).** Tests the hypothesis
+> that FoV 360 falls because q1–q2 coupling weakens as q2 narrows: under the circle
+> gate with `infonce_gate_scales_terms`, loss2 counts at q2's FoV/360, and g2g is off
+> in C9 (computed, untrained). The roll gap is north flush minus rotated flush; e24
+> re-probed matches the row above within roll noise.
+>
+> | C9 | loss2 weight | g2g (untrained) | logged | rotated flush | + 4 px | + 16 px | north flush | **roll gap** |
+> |---|---|---|---|---|---|---|---|---|
+> | e4 | 0.87 | 0.245 | 54.91 | 53.93 | 62.72 | 62.25 | 70.25 | 16.3 |
+> | e8 | 0.75 | 0.243 | 62.31 | 62.87 | 78.73 | 81.62 | 85.78 | 22.9 |
+> | e12 | 0.63 | 0.270 | 60.16 | 60.76 | 77.39 | 82.20 | 87.28 | **26.5** |
+> | e16 | 0.50 | 0.280 | 65.97 | 66.02 | 80.14 | 83.63 | 87.88 | 21.9 |
+> | e20 | 0.38 | 0.297 | 71.21 | 71.15 | 81.24 | 83.75 | 87.83 | 16.7 |
+> | e24 | 0.27 | 0.314 | 76.40 | 76.44 | 82.20 | 83.91 | 87.84 | **11.4** |
+> | e40 | 0.27 | 0.342 | 73.42 | 73.21 | 80.90 | 82.95 | 87.56 | 14.4 |
+> | e60 | 0.27 | 0.342 | 72.30 | 72.04 | 79.59 | 82.25 | 86.56 | 14.5 |
+> | e80 | 0.27 | 0.334 | 69.03 | 69.36 | 78.75 | 81.72 | 84.67 | 15.3 |
+>
+> - **The gap closes while the coupling weakens.** From e12 to e24 loss2's weight
+>   falls 0.63 → 0.27 and the untrained g2g rises 0.270 → 0.314, yet the roll gap
+>   shrinks 26.5 → 11.4. North flush is flat (87.3–87.8), so the logged rise
+>   60.2 → 76.4 over those epochs is almost all the gap closing. The hypothesis
+>   predicts the opposite direction.
+> - **It is the tensor-edge part that moves.** Rotated + 16 px vs north stays ~4
+>   from e8 on (4.2, 5.1, 4.3, 4.1, 3.9, then 4.6/4.3/3.0). The flush-only part
+>   (+16 px minus flush) rises to 21.4 at e12, falls to 7.5 at e24 and regrows to
+>   12.4 by e80.
+> - **After e24 the gap regrows 3.9, not in step with g2g.** g2g rises to e48 and
+>   then eases (0.346 → 0.334), while the gap keeps widening e60 → e80 (+0.8).
+>   Weak coupling may let it regrow, but does not explain its shape.
+> - **Reading.** The roll gap was smallest when the band had just reached its
+>   narrow end. Narrow-crop training appears to make the flush panorama
+>   roll-tolerant; once the band stops moving, the aligned q1-r1 term and
+>   overfitting take some of it back. A g2g run can still test whether q1-q2
+>   coupling holds the post-e24 regrowth, but at most ~4 points of gap are at stake.
+> - **Follow-up: roundC15 `_20261105-115724`, running.** C9 with
+>   `INFONCE_HOLD_LOSS1_SHARE=true` (loss1 scaled by the mean gate of the other five,
+>   so its share stays 1/6 instead of 17% → 28% at e24 → 36% at e80) and FoV 0 added
+>   to the evals, so the roll gap is logged directly. Tests whether loss1's growing
+>   share drives the post-e24 regrowth and the north-aligned decline.
+>
+> **roundC13 `_20261104-113221` (C9 with `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.25, 0.0)'`),
+> stopped by hand during e69.** Best FoV-90 checkpoint `weights_e68_47.0171.pth`, no
+> `weights_end`. Not probed, so no roll-gap split.
+>
+> | e68 | 360 | 270 | 180 | 90 | 70 | Avg (360/180/90/70) |
+> |---|---|---|---|---|---|---|
+> | roundC13 | 70.95 | 79.32 | 69.54 | 47.02 | 38.07 | **56.39** |
+> | roundC9, same epoch | 69.86 | 79.20 | 70.66 | 46.04 | 35.85 | 55.60 |
+>
+> - **FoV 360: no clear effect.** Across the twelve matched evals e24–e68 C13 minus
+>   C9 averages +0.13 (range −1.89 to +2.80), inside run-to-run spread. C13 still
+>   peaks and falls: 75.55 at e40 to 70.95 at e68 (C9: 76.40 at e24 to 69.86). Only
+>   the last two evals lean its way (+0.11, +1.09).
+> - **The late lead is at the narrow end**: +0.98 at FoV 90 and +2.22 at FoV 70 at e68.
+> - **Weaker a2g did not tighten q1-q2.** The untrained g2g ended higher than C9's
+>   (0.373 vs 0.342 at e60), the opposite of the run note's mechanism.
+>
+> **roundC14 `_20261104-233951` (C13 with the exponential per-epoch FoV, lam 5), final.**
+> 360/180/90/70 = 68.05/69.77/47.72/37.19, **Avg 55.68** (C9 55.20); peak Avg 57.06 at
+> e56. FoV 90 and 70 finish ~1.9 above C9, but FoV 360 still peaks (75.44 at e44)
+> and falls 7.4 by e80. No FoV 0 eval.
+>
+> **roundC15 at e64 (running).** 360/0/180/90/70 = 77.16/85.29/70.04/46.75/37.02, Avg
+> 57.74 against C9's 55.79 at e64. The roll gap (FoV 0 minus FoV 360) is 8.1, against
+> 14.5 for C9 at e60, and has stayed at 8–10 since e20. FoV 0 still eases (87.3 at
+> e24 → 85.3), as C9's aligned score did.
+>
+> **roundC16 `_20261106-084248`, running: the combined recipe.** C15 + C14's
+> exponential schedule + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'`. Three changes on
+> C9, so a gain over C15 credits the pair, not either one.
+
 ---
 
 ## RnC off in P23's recipe costs FoV 360 alone (roundP28)
@@ -1095,6 +1223,7 @@ as training-time evaluation; only the query input changes:
 | P22r | pad · band std 30 | 94.83 | 95.10 | 95.70 | — | 95.87 |
 | P30 | pad · P23 with cross terms at 0.5 | 94.43 | 94.80 | 95.61 | — | 95.81 |
 | **P23** | pad · **the base** | 95.14 | 95.14 | 95.34 | 95.26 | 95.69 |
+| P32 | pad · P23, RnC cross-domain groups only | 95.05 | 95.17 | 96.29 (4 px 96.38, 8 px 96.41) | — | 96.94 |
 | P26 | pad · P23 with RnC 0.4 | 94.95 | 95.01 | 95.23 | — | 95.19 |
 | P24 | pad · P23 without the wedge | 94.51 | 94.50 | 95.01 | — | 95.27 |
 | P19 | pad · band std 20 | 94.33 | 94.46 | 94.61 | — | 94.98 |
@@ -1108,35 +1237,46 @@ as training-time evaluation; only the query input changes:
 
 ### 1. The padded FoV-360 query is an input type training never produces
 
-Every model handles a rotated panorama well only in the form training gave it:
-**rotated with blank columns beside it**. A rotated panorama that touches both
-tensor edges never occurs in training, under either protocol:
+Every model handles a panorama *misaligned with its tile* well only in the form
+training gave it: **with blank columns beside it**. A flush panorama misaligned
+with its tile never occurs in training, under either protocol:
 
-- **q1 is flush but always aligned.** The paired rotate turns the tile by 90°·k and
-  rolls q1 by the same amount, so a flush panorama always has its seam at a quarter
-  position, matching its tile.
-- **q2 is rotated but never flush.** It always has fill beside it, from padding or
-  the border.
+- **q1 is flush but always aligned.** The paired rotate (`prob_rotate` 0.75)
+  turns r1 by 90°·k and rolls q1 by the same k quarters. Verified on the CVACT
+  dataset, 80 draws: k = 0/1/2/3 in 22/15/24/19, q1 and r1 always together. That
+  varies the absolute heading but never the relative one: q1-r1 is always 0°.
+  Collages cannot show it, because both views turn together and a full view's arc
+  is recorded as 360° @ 0° whatever its roll.
+- **q2 is misaligned but never flush.** Its random roll is against an unrotated
+  r1, and it always has fill beside it, from padding or the border.
 
 The bordered protocol's FoV-360 query (rotated + 64 px) matches its rotated q2
 crops. The padded protocol's query (rotated, flush) is exactly the missing
 combination. Bordered models fail on it too, and P9 falls to 84.80, but their
 logged column never asks for it.
 
-A fixed-roll sweep on P1 (flush) shows that the seam position is what matters,
-not the relative orientation to the tile:
+Fixed-roll sweeps (flush unless marked):
 
 ```
 roll       0      5     45     90    135    180    225    270    315
 P1      97.65  97.19  95.37  96.76  95.20  97.11  95.20  96.86  95.59   flush
 P3      96.53  96.71  96.58  96.60  96.62  96.56  96.57  96.58     —    + 64 px
 P23     95.69  95.54  95.16  94.99  95.14  95.42  95.16  94.93  95.06   flush
+C9 e60  86.56      —  79.27  71.39  62.35  68.80  62.03  70.46  79.16   flush, CVACT
 ```
 
-P1 handles a 90° misalignment with the tile almost perfectly (96.76) but loses
-about 2 when the seam sits off a quarter position. With a 16–64 px border it
-scores 96.5–96.7 whether rotated at random or north-aligned (4 px: 96.27
-rotated). P3, bordered, is flat across angles.
+- **C9 on CVACT** falls with misalignment itself: 86.56 aligned, ~79 at ±45°, ~71
+  at 90°/270°, ~62 at ±135°. Quarter rolls are no better than their neighbours, so
+  the q1 quarter roll alone buys nothing.
+- **P1 on CVUSA** keeps its score at quarter misalignments (96.8–97.1) and loses
+  ~2 off-quarter. That pattern is confounded: P1 rotates its wedge tile r2 by exact
+  quarters (`aerial_rotation=quarter`), so r1-r2 and r2-q1 train the tile embedding
+  to be quarter-invariant. A quarter roll is then both a trained seam position and
+  a misalignment the tile embedding ignores. The sweep cannot separate the two.
+  C9 suggests the second, since its continuous r2 rotation gives no quarter steps.
+  (An earlier version of this note credited the seam position alone.)
+- With a 16–64 px border P1 scores 96.5–96.7 whether rotated at random or
+  north-aligned (4 px: 96.27 rotated). P3, bordered, is flat across angles.
 
 ### 2. Padding vs border makes no difference to the panorama embedding
 
@@ -1159,11 +1299,22 @@ aligned bonus. Clean pairs:
 |---|---|---|---|
 | P28 → P23 (RnC 0 → 0.25) | 96.51 → 95.69 | 95.91 → 95.34 | 92.58 → 95.14 |
 | P23 → P26 (0.25 → 0.4) | 95.69 → 95.19 | 95.34 → 95.23 | 95.14 → 95.01 |
+| P23 → P32 (g2g, a2a off) | 95.69 → 96.94 | 95.34 → 96.29 | 95.14 → 95.17 |
 | P2 → P12b (all-pairs → pos+hardneg) | 97.42 → 95.79 | 96.27 → 95.95 | 95.28 → 95.59 |
 | P12 quarter → continuous | 96.39 → 96.41 | — | — |
 
 So RnC raises the logged column only by removing the artefact. Underneath, it
 lowers the panorama embedding by ~0.5. Tile rotation type plays no part.
+
+**The invariance comes from the same-domain groups (g2g, a2a), not the
+cross-domain ones.** P32 drops g2g and a2a: its aligned embedding recovers
+(96.94, +1.25 over P23), and its misalignment gap widens from 0.55 to 1.8. The
+logged column barely moves, because the two changes cancel. RnC cannot see the
+misalignment directly: q1 and r1 are labelled 360° @ 0° whatever their roll, and
+within a sample they are always aligned, so no group ever ranks a misaligned flush
+panorama against a full tile. On CVACT the cross-only recipe leaves a 14-point
+gap (C9 e60: 86.56 aligned vs 72.28 rotated flush). roundC7 (all four groups, never
+run) is the direct test of whether g2g and a2a close it there.
 
 ### 4. With the artefact removed, recipe choices made for FoV 70 cost FoV 360
 
@@ -1220,6 +1371,79 @@ both papers north-aligned (98.04 vs 97.3 / 97.9).**
   predictor. Our aligned path is already at 97.4–98.0, so the target is to carry
   that quality into the rotated views, not to add invariance on top.
 
+
+## VIGOR port (2026-11-03): the P32 recipe on a dataset whose camera is not at the tile centre
+
+`train_singeo_vigor.py` is now a copy of `train_singeo_cvusa.py` with the dataset
+swapped, so every `SINGEO_*` override means the same thing on both. Launch with
+`./run_vigor.sh roundV1` (cross-area) or `roundV2` (same-area); checkpoints go
+to `Singeo_data/VIGOR/`. The upstream VIGOR trainer had none of this branch's
+work (padding, Gaussian band, wedge, gate, RnC, DSS at the measured FoV, env
+overrides, `info.txt`, collages, extra eval FoVs).
+
+What is VIGOR-specific, and how each was settled:
+
+- **The wedge radiates from the camera, not the tile centre.** A VIGOR positive
+  holds its panorama anywhere in the central quarter, up to 160 of 640 px off
+  centre. The split files carry the offset (columns 2-3, tile centre minus
+  panorama, along latitude then longitude, in 640 px pixels), which upstream
+  dropped. `apply_aerial_sector(apex=...)` places the wedge about that point and
+  carries it through the tile rotation; with no apex it is bit-identical to
+  before, so CVUSA and CVACT are untouched. Validated with colour profiles over
+  800 pairs (panorama columns against the tile's per-bearing colour around the
+  camera, at the 180 deg offset): **0.376 ± 0.038 with the offsets as parsed**,
+  0.051 with the row sign flipped, 0.124 with the column sign flipped, **0.003
+  at the tile centre**. A centre-apex wedge would not show what the ground crop
+  sees. `aerial_wedge_apex=centre` keeps the CVUSA geometry for an ablation.
+- **`VIGOR_PANO_COL0_BEARING = 180`, measured, as on CVUSA and CVACT.** Colour
+  profiles over 600 pairs peak at exactly 180 (0.317, against −0.080 at 0);
+  CVUSA roundP32's encoder picks the 180 deg wedge for 227 of 600 crops against 35
+  at 0, and the mirrored handedness gives flat votes. 180 also keeps the paired
+  flip consistent.
+- **The q2 wrap bug was live in upstream VIGOR.** Its dataset rolled the cropped
+  ground view with the paired quarter rotation, wrapping the crop's ends around
+  the tensor; CVUSA's arc-based guard is ported (`tests/test_vigor.py` checks it).
+- **Ground tensor 384 × 768** (upstream VIGOR ratio from 1024 × 2048), 2.7× the
+  ground pixels of CVUSA's 140 × 768.
+- **Evaluation** scores against every tile of the test cities (cross-area
+  53,694 queries vs 46,563 tiles; same-area 52,605 vs 90,618) and also reports
+  VIGOR's `Hit_Rate`, which counts the three semi-positive tiles as hits. Scoring
+  is now chunked on the GPU (upstream held the 10-19 GB similarity matrix on the
+  CPU, twice during the concat) and the gallery is encoded once for all five eval
+  FoVs; both are checked equal to the upstream scoring on random data.
+- **GPS neighbour dicts** (`data/VIGOR/gps_dict_{cross,same}.pkl`, 27,101 / 40,007
+  training tiles) are rebuilt with radians; upstream fed degrees to sklearn's
+  haversine. They only seed epoch 1's batches.
+- No satellite-embedding table exists; positives-only RnC never reads one.
+
+Left as upstream: semi-positive tiles count as negatives in training, and GPS /
+similarity sampling puts them in the same batch deliberately, so a semi-positive
+can be the RnC hardest negative. That matches how SinGeo trains on VIGOR.
+
+| run | split | FoV 360 | 270 | 180 | 90 | 70 | Avg (360/180/90/70) | Hit_Rate @90 | ep |
+|---|---|---|---|---|---|---|---|---|---|
+| SinGeo, published | cross | 24.7 | – | – | 4.9 | – | – | – | 80 |
+| SinGeo, published | same | 62.9 | – | – | 24.0 | – | – | – | 80 |
+| **roundV1 P32** `_20261103-162551`, best FoV 90 (e56) | cross | **31.02** | 24.80 | 15.90 | **7.20** | 5.44 | 14.89 | 7.93 | stopped e71 |
+| roundV1, last eval (e68) | cross | 28.24 | 23.76 | 15.18 | 6.92 | 5.29 | 13.91 | 7.64 | |
+| roundV1, peak FoV 360 (e20) | cross | 32.79 | 27.14 | 16.35 | 6.57 | 4.61 | 15.08 | 7.34 | |
+
+**roundV1 result.** Stopped by hand during epoch 72 (LR already 3e-6), so there is
+no `weights_end.pth`; the checkpoint is `weights_e56_7.1963.pth`. Against SinGeo's
+published cross-area numbers it is **+6.3 at FoV 360 (31.02 vs 24.7) and +2.3 at
+FoV 90 (7.20 vs 4.9)**. FoV 90 and 70 were flat from epoch 36 on (7.0-7.2 and
+5.1-5.5), so the narrow FoVs had converged. FoV 360 and 270 had not settled; they
+were falling: 360 peaked at 32.79 at e20 and lost 4.5 by e68, 270 lost 4.6 from
+its e16 peak. Over the same span train-city R@1 (the DSS pass, at the measured
+FoV) climbed from 71 to 98.7. That is the cross-area gap widening, the model
+fitting New York and Seattle at the cost of the wide views in unseen cities.
+It is the same late FoV 360 decline seen on CVACT C9, but larger.
+
+SinGeo's rows carry only the two columns transcribed from its Table 3. Speed on
+the H100: 3.0-3.15 it/s at 100% GPU (GPU-bound with 8 workers), 38.7 GB; an epoch
+is ~17 min and a five-FoV eval plus the train-set similarity rebuild ~23 min, so
+an 80-epoch run takes ~31 h. Zero-shot (ImageNet weights) is chance level:
+R@1 0.03-0.06 at every FoV, R@1% 5.6-8.9.
 
 ## All runs
 

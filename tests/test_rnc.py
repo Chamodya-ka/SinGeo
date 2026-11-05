@@ -1428,17 +1428,98 @@ def test_gaussian_draw_is_narrower_than_the_loguniform_support():
     assert float(np.std(g)) < float(np.std(lu)) / 2, (np.std(g), np.std(lu))
 
 
-def test_dataset_builds_its_rng_lazily_so_forked_workers_differ():
-    """A Generator created in the parent is copied into every dataloader worker
-    and they would all draw the same FoV sequence. It must be None until first
-    use inside the worker."""
+class _RngDataset(torch.utils.data.Dataset):
+    """Each item is one normal draw from `holder`, like the per-sample FoV."""
+
+    def __init__(self, holder_factory):
+        self.holder = holder_factory()
+
+    def __len__(self):
+        return 16
+
+    def __getitem__(self, index):
+        return float(self.holder().normal())
+
+
+def _worker_batches(ds, seed=None):
+    """Batches 0 and 1 of a 2-worker loader; worker 0 serves 0, worker 1 serves 1."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    loader = torch.utils.data.DataLoader(ds, batch_size=4, num_workers=2, shuffle=False)
+    batches = [b.tolist() for b in loader]
+    return batches[0], batches[1]
+
+
+def test_lazy_generator_is_shared_by_workers_once_the_parent_draws():
+    """The bug, reproduced: a lazily built Generator that the parent already
+    used (the input collage calls dataset[i] before the epoch) is copied into
+    every worker, so both workers hand out the identical sequence."""
+    import numpy as np
+
+    class Lazy:
+        rng = None
+
+        def __call__(self):
+            if self.rng is None:
+                self.rng = np.random.default_rng()
+            return self.rng
+
+    ds = _RngDataset(Lazy)
+    ds[0]                                   # what the collage does in the parent
+    w0, w1 = _worker_batches(ds)
+    assert w0 == w1, "expected the old lazy Generator to repeat across workers"
+
+
+def test_process_local_rng_differs_per_worker_even_after_parent_use():
+    from singeo.transforms import ProcessLocalRNG
+
+    ds = _RngDataset(lambda: ProcessLocalRNG().get)
+    ds[0]                                   # the collage path
+    w0, w1 = _worker_batches(ds)
+    assert w0 != w1, (w0, w1)
+
+    # Seeded from torch's per-worker seed, so a seeded run is reproducible.
+    assert _worker_batches(ds, seed=0) == _worker_batches(ds, seed=0)
+    assert _worker_batches(ds, seed=0) != _worker_batches(ds, seed=1)
+
+
+def test_both_datasets_draw_per_sample_fov_from_a_process_local_rng():
     import inspect
-    from singeo.dataset import cvusa as m
-    src = inspect.getsource(m.CVUSADatasetTrainSinGeo.__init__)
-    assert "self._fov_rng = None" in src, "rng must start as None in __init__"
-    assert "default_rng()" not in src, "rng must NOT be constructed in __init__ (fork-unsafe)"
-    getitem = inspect.getsource(m.CVUSADatasetTrainSinGeo.__getitem__)
-    assert "default_rng()" in getitem, "rng must be built lazily in __getitem__"
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    from singeo.dataset.cvact import CVACTDatasetTrainSinGeo
+    for cls in (CVUSADatasetTrainSinGeo, CVACTDatasetTrainSinGeo):
+        assert "self._fov_rng = ProcessLocalRNG()" in inspect.getsource(cls.__init__), cls
+        assert "self._fov_rng.get()" in inspect.getsource(cls.__getitem__), cls
+
+
+def test_cvusa_per_sample_gaussian_fov_differs_across_workers():
+    """End to end on the real dataset: after a parent-side draw, two workers
+    must not produce the same per-sample FoV sequence."""
+    if not os.path.isdir(CVUSA_FOLDER):
+        print("   (skipped: CVUSA data folder not present)")
+        return
+
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    from singeo.transforms import get_transforms_train_singeo
+
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    s1, s2, g1, g2 = get_transforms_train_singeo((96, 96), (35, 192), mean, std, fov=0.0)
+    ds = CVUSADatasetTrainSinGeo(data_folder=CVUSA_FOLDER,
+                                 transforms_query1=g1, transforms_query2=g2,
+                                 transforms_reference1=s1, transforms_reference2=s2,
+                                 prob_flip=0.0, prob_rotate=0.0,
+                                 shuffle_batch_size=4,
+                                 return_meta=True, enable_aerial_crop=True)
+    ds.ground_fov_mean, ds.ground_fov_std = 180.0, 40.0
+    ds.sat_arc = 180.0
+    ds[0]                                   # the collage path
+
+    sub = torch.utils.data.Subset(ds, list(range(8)))
+    loader = torch.utils.data.DataLoader(
+        sub, batch_size=4, num_workers=2, shuffle=False,
+        collate_fn=lambda items: [float(it[5][M_GROUND_EXTENT]) for it in items])
+    w0, w1 = list(loader)
+    assert w0 != w1, (w0, w1)
 
 
 def test_gaussian_ramp_frac_paces_the_mean_and_defaults_to_the_whole_run():
@@ -2379,3 +2460,104 @@ def test_hardest_negative_adds_exactly_one_reference_per_row():
         counts = seen[0].sum(dim=1)                      # g2a: refs allowed per anchor row
         expected = 2 + (1 if flag else 0)                # own r1 and r2, plus one negative
         assert (counts == expected).all(), (flag, counts)
+
+
+def test_q1_roll_ramp_starts_at_zero_and_reaches_180():
+    from singeo.transforms import get_q1_roll_max
+    assert get_q1_roll_max(1, 80, ramp_frac=1.0) == 0.0
+    assert get_q1_roll_max(80, 80, ramp_frac=1.0) == pytest.approx(180.0)
+    steps = [get_q1_roll_max(e, 80, ramp_frac=1.0) for e in range(1, 81)]
+    assert all(b > a for a, b in zip(steps, steps[1:]))          # strictly rising
+    assert get_q1_roll_max(40, 80, ramp_frac=0.5) == pytest.approx(180.0)
+    assert get_q1_roll_max(70, 80, ramp_frac=0.5) == pytest.approx(180.0)  # held
+    assert get_q1_roll_max(50, 80, ramp_frac=0.0) == 0.0
+
+
+def test_roll_panorama_is_an_exact_rotation_bounded_by_max_deg():
+    from singeo.transforms import roll_panorama
+    width = 720                                                   # 2 columns per degree
+    img = torch.arange(width, dtype=torch.float32).repeat(3, 4, 1)
+    assert torch.equal(roll_panorama(img, 0.0), img)
+    rng = random.Random(0)
+    shifts = []
+    for _ in range(500):
+        out = roll_panorama(img, 10.0, rng=rng)
+        shift = int((out[0, 0, 0] - img[0, 0, 0]).item()) * -1 % width
+        assert torch.equal(out, torch.roll(img, shifts=shift, dims=-1))
+        shifts.append(shift if shift <= width // 2 else shift - width)
+    assert max(abs(s) for s in shifts) <= 20                      # 10 deg = 20 columns
+    assert min(shifts) < 0 < max(shifts)                          # both directions
+
+
+def test_cvusa_dataset_applies_the_ramped_q1_roll():
+    import inspect
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    src = inspect.getsource(CVUSADatasetTrainSinGeo.__getitem__)
+    assert "roll_panorama(query_img1, self.roll_q1_max_deg)" in src
+
+
+def test_q1_roll_leaves_q2_r1_r2_meta_and_overlap_labels_untouched():
+    """The ramped q1 roll is the last random draw in __getitem__ and touches only
+    query_img1. With every generator seeded identically, a sample drawn at roll 0
+    and at roll 180 must give bit-identical q2, r1, r2 and meta (q2 arc and wedge
+    arc), hence identical overlap labels, while q1 is an exact roll of itself.
+    Covers flip/paired-rotate as in training and a band at 360, where q2 is a full
+    panorama that the paired rotate also rolls."""
+    if not os.path.isdir(CVUSA_FOLDER):
+        print("   (skipped: CVUSA data folder not present)")
+        return
+
+    from singeo.dataset.cvusa import CVUSADatasetTrainSinGeo
+    from singeo.transforms import get_transforms_train_singeo
+    from singeo.distances import angular_overlap
+
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    s1, s2, g1, g2 = get_transforms_train_singeo((96, 96), (35, 192), mean, std, fov=0.0)
+    ds = CVUSADatasetTrainSinGeo(data_folder=CVUSA_FOLDER,
+                                 transforms_query1=g1, transforms_query2=g2,
+                                 transforms_reference1=s1, transforms_reference2=s2,
+                                 prob_flip=0.5, prob_rotate=0.75,
+                                 shuffle_batch_size=4,
+                                 return_meta=True, enable_aerial_crop=True)
+    ds.ground_fov_std, ds.fov_lo, ds.fov_hi = 40.0, 70.0, 360.0
+    ds.sat_arc, ds.sat_rot_max = 180.0, 90.0
+
+    def draw(index, roll_max, seed):
+        ds.roll_q1_max_deg = roll_max
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        ds._fov_rng._rng = np.random.default_rng(seed)
+        ds._fov_rng._pid = os.getpid()
+        return ds[index]
+
+    rolled = 0
+    for fov_mean in (180.0, 360.0):
+        ds.ground_fov_mean = fov_mean
+        for index in range(12):
+            base = draw(index, 0.0, 1000 + index)
+            for roll_max in (30.0, 180.0):
+                out = draw(index, roll_max, 1000 + index)
+                for k, name in zip(range(1, 6), ("q2", "r1", "r2", "label", "meta")):
+                    assert torch.equal(base[k], out[k]), (name, fov_mean, index, roll_max)
+                width = base[0].shape[-1]
+                shifts = [s for s in range(width)
+                          if torch.equal(torch.roll(base[0], s, dims=-1), out[0])]
+                assert shifts, (fov_mean, index, roll_max)      # q1 is an exact roll
+                s = shifts[0] if shifts[0] <= width // 2 else shifts[0] - width
+                assert abs(s) <= round(roll_max * width / 360.0) + 1
+                rolled += s != 0
+
+                # Overlap labels read only meta (q2 and r2) and q1's constant full arc.
+                def circle(ca, ea, cb, eb):
+                    one = lambda v: torch.as_tensor(v, dtype=torch.float32).reshape(1)
+                    return float(angular_overlap(one(ca), one(ea), one(cb), one(eb),
+                                                 measure="circle"))
+                labels = []
+                for m in (base[5], out[5]):
+                    q2_r2 = circle(m[M_GROUND_CENTER], m[M_GROUND_EXTENT],
+                                   m[M_SAT_CENTER], m[M_SAT_EXTENT])
+                    q1_r2 = circle(0.0, 360.0, m[M_SAT_CENTER], m[M_SAT_EXTENT])
+                    q1_q2 = circle(0.0, 360.0, m[M_GROUND_CENTER], m[M_GROUND_EXTENT])
+                    assert q1_r2 == pytest.approx(float(m[M_SAT_EXTENT]) / 360.0)
+                    labels.append((q2_r2, q1_r2, q1_q2))
+                assert labels[0] == labels[1], (fov_mean, index, roll_max, labels)
+    assert rolled > 30                                           # the roll did fire

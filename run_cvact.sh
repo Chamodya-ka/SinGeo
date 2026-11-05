@@ -15,6 +15,14 @@
 #   roundC7   the roundP23 recipe on CVACT, mean-colour fill (control for C8)
 #   roundC8   C7 with mask_fill black (CVUSA twin: roundP29)
 #   roundC9   C7 with RnC on the cross-domain groups only (CVUSA twin: roundP32)
+#   roundC10  C9 with mask_fill black
+#   roundC11  C9 with rnc_weight 0.4 (cross-domain RnC dose)
+#   roundC12  C9 with the q2 FoV a random whole degree in 70..360 per sample, no curriculum
+#   roundC13  C9 with the a2g RnC group at 0.25 (group weights 1, 0, 0.25, 0)
+#   roundC14  C13 with the exponential per-epoch FoV schedule (lam 5, 360 -> 70) from
+#             branch investigating-padding-issue-a40, where it ran as that server's C11
+#   roundC15  C9 with loss1 (q1-r1) held at a fixed 1/6 share of the gated InfoNCE mass
+#   roundC16  C15 + the exponential per-epoch FoV schedule of C14 (lam 5) + a2g RnC at 0.5
 #
 # NOTE ON ROTATION. COMMON carries aerial_rotation=continuous, which is what
 # roundP12 actually ran. roundC1 and roundC2 were launched with quarter by
@@ -306,7 +314,250 @@ cross-domain groups. This asks whether that transfers to CVACT.
 READING. The one-variable control is roundC7, which has not run yet. Until it
 has, the nearest CVACT references are the bordered runs roundC1 52.50 and
 roundC3 52.44 Avg, a different protocol. Read all four columns, and watch FoV 360:
-CVACT FoV 360 fell after epoch 20 under the padded recipe in roundC6.'
+CVACT FoV 360 fell after epoch 20 under the padded recipe in roundC6.
+
+RERUN. Replaces roundC9 _20261030-174050, stopped at epoch 33, which had two bugs:
+the r2 tile took an extra +-90 rotation the wedge arcs never recorded (keep_prob
+fell to 0.70 by epoch 32), and all dataloader workers shared one per-sample FoV
+generator. Both are fixed here.'
+    ;;
+roundC10)
+    echo "Round C10 - roundC9 with mask_fill black [80 ep]"
+    echo "  control roundC9 _20261031-005205 (same recipe, mean fill)"
+    launch roundC10-cvact-p32-black "${P23[@]}" \
+        SINGEO_MASK_FILL=black \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RUN_NOTE='C10. roundC9 (the roundP32 recipe on CVACT) with mask_fill black and nothing
+else changed. Every pad, wedge mask and rotation corner is a pixel zero instead of
+the mean colour RGB 124 116 104. Same code as the C9 rerun _20261031-005205, so
+both C9 bug fixes are in.
+
+WHY. The roundC8 hypothesis, tested on the stronger recipe. CVACT panoramas carry
+a wide flat grey road band close to the mean colour (about six times more flat
+mean-coloured patches than CVUSA), so a mean fill may teach the encoder that real
+road reads as missing view. That would hurt FoV 360 most, the only query with no
+real fill. A black fill shares its colour with almost nothing real in CVACT.
+
+READING. Control roundC9 _20261031-005205. FoV 360 rising clearly with 90 and 70
+held means the fill colour is part of the CVACT 360 problem. Nothing moving means
+the cost is the share of fill in the descriptor, not its colour. CVUSA analogue:
+roundP29 (roundP23 with black fill).
+
+CAVEATS. CVACT tiles hold a few isolated pure black pixels, and Coarse and
+GridDropout holes are already black, so the masks now share their colour with
+that augmentation.'
+    ;;
+roundC11)
+    echo "Round C11 - roundC9 with rnc_weight 0.4 [80 ep]"
+    echo "  control roundC9 _20261031-005205 (same recipe, rnc_weight 0.25)"
+    # SINGEO_RNC_WEIGHT comes after the P23 array on purpose: env applies its
+    # assignments in order, so this 0.4 replaces the array's 0.25.
+    launch roundC11-cvact-p32-rncw04 "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_WEIGHT=0.4 \
+        SINGEO_RUN_NOTE='C11. roundC9 (the roundP32 recipe on CVACT, mean fill, RnC on the
+cross-domain groups g2a and a2g only) with rnc_weight 0.4 instead of 0.25 and
+nothing else changed. Same code as the C9 rerun _20261031-005205.
+
+WHY. More RnC was tested before only with all four groups (roundP26, weight 0.4 on
+CVUSA: Avg 80.50 against P23 80.80), where the same-domain groups g2g and a2a were
+also scaled up. With those groups off, the remaining RnC is the overlap ranking
+that took P23 to P32 (+1.78 Avg on CVUSA). Cross-only at 0.25 carries about 30 pct
+less RnC than P23 did (g2g and a2a were 0.36 of a 1.20 group sum), so 0.4 restores
+that mass and goes somewhat beyond. This is the first dose step for cross-domain
+RnC alone.
+
+READING. Control roundC9. Read all four columns. FoV 360 as logged mixes the
+panorama embedding with a 14 point rotation gap on CVACT (C9 e60: 86.56 aligned,
+72.28 rotated flush), so also probe the checkpoints for rotated plus 16 px and
+north flush. RnC never ranks a misaligned full panorama against a full tile, so
+the gap itself is not expected to close. A gain at 90 and 70 with 360 held is the
+outcome that would favour 0.4.'
+    ;;
+roundC12)
+    echo "Round C12 - C9 with the q2 FoV a random whole degree in 70..360 per sample, no curriculum [80 ep]"
+    echo "  control roundC9 _20261031-005205: 69.03 / 70.70 / 45.80 / 35.27, Avg 55.20"
+    launch roundC12-cvact-uniformfov "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_FOV_SAMPLING=uniform \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_RUN_NOTE='C12. roundC9 with the ground crop FoV a random pick from the whole degrees
+70, 71, ... 360, each equally likely (1/291), drawn per sample at every epoch: no
+curriculum. Everything else is C9: padded, wedge, circle gate, RnC on the
+cross-domain groups only at 0.25. The Gaussian band fields are inert in this mode.
+
+WHY. C9 trains a Gaussian band whose mean reaches 90 deg at epoch 24, after which
+almost no q2 crop is wider than 210 deg. Uniform keeps wide and narrow crops in
+every epoch: about 31 percent of draws at 270 deg or more and 7 percent at 90 or
+less, against roughly 0 and 50 percent for C9 after e24. A pick of exactly 360
+(1/291, about 0.34 percent of crops) is a rotated panorama with no blank at all,
+which is the FoV-360 eval query itself.
+
+READING. Control roundC9 _20261031-005205: 360/180/90/70 = 69.03/70.70/45.80/35.27,
+Avg 55.20, 270 = 79.77. Expect 360 and 270 up and the rotated-flush gap smaller;
+90 and 70 likely down, since uniform spends far less of the run at narrow FoVs.
+Read all four columns.
+
+RERUN. Replaces _20261101-172959, stopped in epoch 1, which drew a continuous
+FoV in [70, 360) and so never produced exactly 360.'
+    ;;
+roundC13)
+    echo "Round C13 - roundC9 with the a2g RnC group at 0.25 [80 ep]"
+    echo "  control roundC9 _20261031-005205: 69.03 / 70.70 / 45.80 / 35.27, Avg 55.20"
+    launch roundC13-cvact-p32-a2g025 "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.25, 0.0)' \
+        SINGEO_RUN_NOTE='C13. roundC9 _20261031-005205 (the roundP32 recipe on CVACT, mean fill) with
+rnc_group_weights (1, 0, 0.25, 0) instead of (1, 0, 1, 0) and nothing else
+changed. g2a keeps full weight; a2g, the group with aerial anchors and ground
+references, drops to a quarter. rnc_weight stays 0.25.
+
+WHY. Under positives only plus hardest negative, an a2g row anchored on the full
+tile r1 orders its ground references as q1 above q2 above the hardest negative,
+so it is the group that holds the crop q2 apart from the panorama q1. Some of
+that separation is wanted, but pulling q1 and q2 together is what makes the
+panorama embedding orientation invariant: on CVUSA, dropping g2g and a2a (P23 to
+P32) widened the aligned vs rotated flush gap from 0.55 to 1.8. C9 on CVACT has
+a 14 point gap (e60: 86.56 north flush, 72.28 rotated flush). Weakening a2g
+lets the q1 to q2 coupling from InfoNCE dominate, without bringing g2g back.
+
+READING. Control roundC9 _20261031-005205: 360/180/90/70 = 69.03/70.70/45.80/35.27,
+Avg 55.20, 270 = 79.77, FoV 360 peak 76.40 at e24. Watch whether FoV 360 still
+declines after e24, and probe checkpoints with eval_fov360_probe.py for rotated
+flush, rotated plus 16 px and north flush. The risk is at 90 and 70: a2g is also
+the group that pulls q2 toward its own tile above the hardest negative.
+
+CONFOUND. a2g was about 0.49 of a roughly 1.0 group sum late in C9, so the total
+RnC mass falls by about 37 pct. A drop at 90 and 70 may be dose, not the group.'
+    ;;
+roundC14)
+    echo "Round C14 - roundC13 with the exponential per-epoch FoV schedule, lam = 5, 360 -> 70 [80 ep]"
+    echo "  control roundC13 _20261104-113221 (Gaussian band, a2g 0.25), running"
+    echo "  schedule: FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)); <=180 from e16, <=90 from e42"
+    # The P23 array without its four Gaussian-band fields, which are inert under
+    # the deterministic schedule and would only clutter the logged overrides.
+    launch roundC14-cvact-c13-expfov-lam5 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=deterministic \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_FOV_SCHEDULE_LAMBDA=5.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.25, 0.0)' \
+        SINGEO_RUN_NOTE='C14. roundC13 with the ground FoV schedule swapped and nothing else changed.
+The per-sample Gaussian band (std 40, mean 360 to 90 by epoch 24, clipped at 70) is
+replaced by one FoV per epoch shared by every sample, walked 360 to 70 on the
+exponential fast-to-slow curve with lam 5. Padded to full width with mean fill, RnC
+group weights (1, 0, 0.25, 0) as in C13.
+
+SCHEDULE. FoV(e) = 360 - 290 f(e/80) with f(x) = (1 - exp(-lam x)) / (1 - exp(-lam)).
+Epoch 5 at 282, 10 at 224, 20 at 152, 30 at 113, 40 at 92, 60 at 75, 80 at 70. At or
+below 180 from epoch 16 and at or below 90 from epoch 42 (linear walk: 50 and 75).
+
+WHY. Ported from branch investigating-padding-issue-a40. On that server, on CVACT
+with black fill and all-cross RnC (1, 0, 1, 0), its roundC11 ran this schedule and
+reached 56.78 Avg at e68, against 55.48 final for the Gaussian band (its C9, the P32
+recipe) and 54.70 final for the linear walk (its C10). Its FoV 90 of 47.97 was the
+best of any padded CVACT run there, but its rolled FoV 360 peaked at e32 and gave
+back about 5 points afterwards. Here the schedule is combined with the a2g 0.25 of
+C13, which targets the FoV 360 orientation gap.
+
+READING. One-variable control roundC13 _20261104-113221 (running). Further reference
+roundC9 _20261031-005205: 360/180/90/70 = 69.03/70.70/45.80/35.27, Avg 55.20. Read
+all four columns and the FoV 360 trend after e32, and probe checkpoints with
+eval_fov360_probe.py for rotated flush against north flush.'
+    ;;
+roundC15)
+    echo "Round C15 - roundC9 with loss1 (q1-r1) held at a fixed share of the InfoNCE mass [80 ep]"
+    echo "  control roundC9 _20261031-005205: 69.03 / 70.70 / 45.80 / 35.27, Avg 55.20"
+    echo "  C9 north flush e24/40/60/80 = 87.84 / 87.56 / 86.56 / 84.67, roll gap 11.4 -> 15.3"
+    launch roundC15-cvact-c9-hold-l1share "${P23[@]}" \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)' \
+        SINGEO_RUN_NOTE='C15. roundC9 _20261031-005205 with infonce_hold_loss1_share on and nothing else
+in the training config changed. Each batch, loss1 (q1-r1) is scaled by the mean gate
+of loss2 to loss6, so it keeps a fixed 1/6 share of the gated InfoNCE mass. The
+evaluation adds FoV 0, the north aligned panorama, which does not touch training.
+
+WHY. Under the circle gate with gate scaled terms, loss1 always counts at 1 while
+the q2 terms fall to 0.27 once the band settles (e24) and the wedge terms fall
+from 0.85 to 0.5 over the whole run. loss1 share of the mass so drifts from 17 pct
+at e1 to 28 pct at e24 and 36 pct at e80. loss1 is the only term whose pair is
+always aligned and flush. In C9 the roll gap (north flush minus rotated flush)
+closed from 26.5 at e12 to 11.4 at e24 and then regrew to 15.3 by e80, while the
+north aligned score fell 87.84 to 84.67. The regrowth continues to e80, as the
+loss1 share does. This asks whether the growing loss1 share drives it.
+
+SCALE. loss1 weight is about 0.96 at e1, 0.50 at e24 and 0.36 at e80, logged per
+epoch in log.txt with the six term averages. Mass renormalisation stays off; it
+would rescale all six terms together and leave the shares unchanged.
+
+READING. Control roundC9: 360/180/90/70 = 69.03/70.70/45.80/35.27, Avg 55.20. Roll
+gap = FoV 0 minus FoV 360, against C9 11.4 at e24, 14.4 at e40, 14.5 at e60, 15.3 at
+e80. Supports the hypothesis if the gap stays near 11 after e24 and FoV 0 holds
+near 87.8. If the gap regrows as in C9, the regrowth is general overfitting, not
+the loss1 share. Watch FoV 90 and 70: loss1 is also the main panorama signal.'
+    ;;
+roundC16)
+    echo "Round C16 - C15 + exponential per-epoch FoV (lam 5, 360 -> 70) + a2g RnC at 0.5 [80 ep]"
+    echo "  controls: C15 _20261105-115724 (running; e64 Avg 57.74), C14 _20261104-233951 55.68, C9 55.20"
+    echo "  schedule: FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)); <=180 from e16, <=90 from e42"
+    # C14's explicit field list (P23 without the inert Gaussian-band fields), plus
+    # C15's held loss1 share and FoV 0 eval, with a2g at 0.5.
+    launch roundC16-cvact-c15-expfov-a2g05 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=deterministic \
+        SINGEO_FOV_CURRICULUM_END=70.0 \
+        SINGEO_FOV_SCHEDULE_LAMBDA=5.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' \
+        SINGEO_RUN_NOTE='C16. The combined CVACT recipe: roundC15 (C9 with loss1 held at a fixed 1/6
+share of the gated InfoNCE mass, FoV 0 logged) with two further changes. (1) The
+ground FoV schedule of roundC14: one FoV per epoch for every sample, 360 to 70 on
+the exponential fast-to-slow curve, lam 5, in place of the per-sample Gaussian
+band. (2) rnc_group_weights (1, 0, 0.5, 0): a2g at 0.5, between C9 (1.0) and C13
+(0.25). Everything else is C15.
+
+SCHEDULE. FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)). At or below 180
+from epoch 16 and at or below 90 from epoch 42. With the held share, loss1 weight
+is about 0.56 at e24 and 0.32 at e80.
+
+WHY. Each change was positive on its own against C9 (Avg 55.20 final). C15 held
+the roll gap near 8 against 14.5 for C9 and led by 1.95 Avg at e64 (57.74 vs
+55.79). C14 (exponential schedule with a2g 0.25) finished at 55.68 with FoV 90 and
+70 both about 1.9 above C9, and peaked at 57.06 Avg at e56. C13 (a2g 0.25 alone)
+led C9 by 0.79 Avg at e68, mostly at FoV 70. a2g 0.5 is a midpoint, untested alone.
+
+READING. Controls roundC15 _20261105-115724 (running), roundC14 _20261104-233951
+55.68 final, roundC9 _20261031-005205 55.20 final. Roll gap = FoV 0 minus FoV 360.
+Three changes at once, so a gain over C15 credits the pair, not either one. Watch
+FoV 360 after e44, where C14 began to fall.'
     ;;
 roundC0)
     echo "Round C0 - CVACT baseline: border only, no wedge, no RnC [80 ep]"

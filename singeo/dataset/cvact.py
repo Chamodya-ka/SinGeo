@@ -12,7 +12,7 @@ from glob import glob
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
-                               draw_gaussian_fov,
+                               draw_gaussian_fov, ProcessLocalRNG,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
                                scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
@@ -313,9 +313,14 @@ class CVACTDatasetTrainSinGeo(Dataset):
         self.ground_fov_std = 20.0
         self.fov_lo = 70.0
         self.fov_hi = 360.0
-        # Created lazily in each worker: a Generator built before fork would be
-        # copied into every worker, which would then all draw the same sequence.
-        self._fov_rng = None
+        # Uniform FoV: when True (and no Gaussian mean is set), each crop's FoV is
+        # a random pick from the whole degrees fov_lo..fov_hi, both included and
+        # equally likely (1/291 each for 70..360), the same at every epoch.
+        self.fov_uniform = False
+        # Keyed to the process: a plain Generator made in the parent (here, or
+        # by the input collage calling dataset[i]) would be copied into every
+        # worker, which would then all draw the same sequence.
+        self._fov_rng = ProcessLocalRNG()
 
         # Per-channel tensor value for every blank region this dataset writes
         # (ground pad/border, panorama border, wedge mask, rotation corners).
@@ -438,10 +443,12 @@ class CVACTDatasetTrainSinGeo(Dataset):
                                             lo=self.fov_lo, hi=self.fov_hi,
                                             rng=np.random.default_rng(seed))
                 else:
-                    if self._fov_rng is None:
-                        self._fov_rng = np.random.default_rng()
                     fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
-                                            lo=self.fov_lo, hi=self.fov_hi, rng=self._fov_rng)
+                                            lo=self.fov_lo, hi=self.fov_hi,
+                                            rng=self._fov_rng.get())
+            elif self.fov_uniform:
+                fov = float(self._fov_rng.get().integers(int(self.fov_lo), int(self.fov_hi),
+                                                         endpoint=True))
             elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
@@ -682,21 +689,21 @@ class CVACTDatasetTrainSinGeo(Dataset):
             
        
 class CVACTDatasetEval(Dataset):
-    
+
     def __init__(self,
                  data_folder,
                  split,
                  img_type,
                  transforms=None,
                  ):
-        
+
         super().__init__()
- 
+
         self.data_folder = data_folder
         self.split = split
         self.img_type = img_type
         self.transforms = transforms
-        
+
         anuData = sio.loadmat(f'{data_folder}/ACT_data.mat')
         
         ids = anuData['panoIds']
@@ -749,11 +756,11 @@ class CVACTDatasetEval(Dataset):
 
         img = cv2.imread(path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
+
         # image transforms
         if self.transforms is not None:
             img = self.transforms(image=img)['image']
-            
+
         label = torch.tensor(self.idx2label[idx], dtype=torch.long)
 
         return img, label
@@ -769,13 +776,13 @@ class CVACTDatasetTest(Dataset):
                  img_type,
                  transforms=None,
                  ):
-        
+
         super().__init__()
- 
+
         self.data_folder = data_folder
         self.img_type = img_type
         self.transforms = transforms
-        
+
         files_sat = glob(f'{self.data_folder}/ANU_data_test/satview_polish/*_satView_polish.jpg')
         files_ground = glob(f'{self.data_folder}/ANU_data_test/streetview/*_grdView.jpg')
         
@@ -817,7 +824,7 @@ class CVACTDatasetTest(Dataset):
         # image transforms
         if self.transforms is not None:
             img = self.transforms(image=img)['image']
-            
+
         label = torch.tensor(self.idx2num_idx[idx], dtype=torch.long)
 
         return img, label

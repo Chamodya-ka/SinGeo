@@ -1,45 +1,62 @@
+"""SinGeo training on VIGOR, with this branch's CVUSA pipeline.
+
+A copy of train_singeo_cvusa.py with the dataset swapped: the same
+Configuration fields (so the same SINGEO_* overrides reproduce a CVUSA round
+here), the same curricula, wedge, overlap gate and RnC. What is VIGOR-specific:
+
+  * VigorDatasetTrainSinGeo / VigorDatasetEval, same-area or cross-area split
+  * ground tensor 384 x 768 (2048 x 1024 panoramas at the upstream VIGOR ratio)
+  * the wedge radiates from the panorama's position in the tile, which VIGOR
+    records, instead of the tile centre (`aerial_wedge_apex`)
+  * evaluation reports VIGOR's hit rate beside R@k and encodes the gallery once
+    for all eval FoVs
+  * RnC negative tiering: only "none" (and "geo" from the GPS ranks); there is
+    no satellite-embedding table or coordinate CSV for VIGOR
+"""
+import ast
 import os
+import math
 import time
 import shutil
 import sys
 import torch
 import pickle
 from dataclasses import dataclass
+from typing import Optional
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from singeo.dataset.vigor import VigorDatasetEval, VigorDatasetTrainSinGeo
+from singeo.dataset.cvusa import BatchMaxPadCollate
+from singeo.dataset.vigor import VigorDatasetEval, VigorDatasetTrainSinGeo, VIGOR_PANO_COL0_BEARING
 from singeo.transforms import get_transforms_train_singeo, get_transforms_train_singeo_rot, get_transforms_val
-
-# for dynamic rotation
 from singeo.transforms import get_dynamic_rotate_prob, build_satellite_dynamic_transforms
-from singeo.transforms import get_dynamic_fov
+from singeo.transforms import MASK_FILL_MODES, mask_fill_values
+from singeo.transforms import get_dynamic_fov, get_dynamic_fov_floor, get_gaussian_fov_mean
+from singeo.transforms import get_q1_roll_max
+
 from singeo.utils import setup_system, Logger
-from singeo.trainer import train_contrast_singeo
+from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
+from singeo.loss import InfoNCE, RankNContrast
+from singeo.distances import GeoNeighbourRanks, RnCDistanceBuilder
+from singeo.model import PADDING_MODES, TimmModel_SinGeo, set_conv_padding_mode
+from singeo.visualize import RnCSampleVisualizer
+from singeo.evaluate.vigor import evaluate_fovs, calc_sim
+from singeo.transforms import get_dynamic_rotation_angle
 
-
-from singeo.evaluate.vigor import evaluate, calc_sim
-from singeo.loss import InfoNCE, CARE
-from singeo.model import TimmModel_SinGeo
 
 
 @dataclass
 class Configuration:
-
-    # Model
-    model: str = 'convnext_base.fb_in22k_ft_in1k_384'
+    dataset: str = 'vigor'
+    model: str = 'convnext_base.fb_in22k_ft_in1k_384' 
     
     # Override model image size
     img_size: int = 384
-
-    # loss type
-    loss_info: bool = True # if True, use InfoNCE loss
-    loss_care: bool = False # if True, use CARE loss
-
+    
     # Training 
     mixed_precision: bool = True
-    seed = 1
+    seed = 42
     epochs: int = 80
     batch_size: int = 16        # keep in mind real_batch_size = 2 * batch_size
     verbose: bool = True
@@ -52,44 +69,471 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
+    # Pre-computed GPS neighbours (calc_distance_vigor.py), one per split. None
+    # picks data/VIGOR/gps_dict_{same,cross}.pkl in the repo to match `same_area`.
+    gps_dict_path: Optional[str] = None
+    
     
     # Eval
     batch_size_eval: int = 16
-    eval_every_n_epoch: int = 4      # eval every n Epoch
+    eval_every_n_epoch: int = 4        # eval every n Epoch
     normalize_features: bool = True
 
     # Optimizer 
-    clip_grad = 100.                 # None | float
+    clip_grad = 100.                   # None | float
     decay_exclue_bias: bool = False
-    grad_checkpointing: bool = False # Gradient Checkpointing
+    # Gradient checkpointing. Mathematically identical, so it changes no result
+    # -- it only trades compute for memory. Measured here at batch_size 16,
+    # ConvNeXt-base @384, 6 steps of the RNC path:
+    #
+    #            peak GPU     throughput
+    #   off      20.31 GiB    1.59 steps/s
+    #   on        4.99 GiB    1.26 steps/s   (-21%)
+    #
+    # Off. On the H100 (95 GiB) a run holds every activation in ~23 GiB, so two
+    # concurrent runs sit at ~45 GiB and there is nothing to save; on the old A40
+    # (45 GiB usable) two runs needed 2 x 20.3 GiB and still fit. Either way the
+    # GPU is compute-bound at this batch size, and checkpointing cost 21%
+    # throughput for headroom that went unused. Turn it on only to push the batch
+    # size well past 16, which no experiment here does.
+    #
+    # Note `aerial_mask_mode` != "off" refuses to run with it (see below).
+    grad_checkpointing: bool = False
     
     # Loss
     label_smoothing: float = 0.1
-    
+
+    # Scales the six-term InfoNCE block, the way `rnc_weight` scales the RNC
+    # block. Exists so the two objectives can be switched off independently:
+    #
+    #   infonce_weight=1, rnc_weight=0.25  both (the standard configuration)
+    #   infonce_weight=1, rnc_weight=0     gated InfoNCE alone
+    #   infonce_weight=0, rnc_weight=0.25  RNC alone
+    #
+    # Setting this to 0 leaves `logit_scale` without gradient, which is
+    # harmless: RNC carries its own temperature (`rnc_tau`) and never reads it.
+    #
+    # Note that switching RNC off must be done with `rnc_weight=0`, NOT
+    # `use_rnc=False`: `use_rnc` also controls whether the dataset emits the
+    # crop arcs (`return_meta`) and whether the aerial wedge exists at all, so
+    # turning it off would silently remove the overlap gate and the aerial crop
+    # along with the RNC term.
+    infonce_weight: float = 1.0
+
+    # Per-term weights inside the InfoNCE block, in the order
+    #   (loss1 q1-r1, loss2 q1-q2, loss3 r1-r2, loss4 r1-q2, loss5 r2-q1, loss6 r2-q2)
+    # The default reproduces the original expression exactly, bit for bit.
+    #
+    # The reason this is a knob: loss3, loss5 and loss6 are the three terms that
+    # hold the aerial wedge as a HARD positive, i.e. they instruct the model that
+    # a view which is up to 60% blank pixels must be identical to a clean one.
+    # `(1.0, 0.5, 0.0, 0.25, 0.0, 0.0)` removes exactly those three and leaves the
+    # wedge out of InfoNCE's positives altogether, so the wedge can be carried by
+    # RNC instead, which ranks it as a partial match below the full tile rather
+    # than forcing equality. The remaining terms are blank-free without padding.
+    infonce_term_weights: tuple = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+
+    # Rank-N-Contrast (RNC) auxiliary loss
+    # Added alongside the six InfoNCE terms, never replacing them.
+    use_rnc: bool = True              # master switch for the whole RNC path
+    rnc_weight: float = 0.25            # weight of the summed RNC term
+
+    # RNC temperature. 2.0 is the value from the Rank-N-Contrast paper, which
+    # ranks on *unbounded* L2 distances. This repo ranks on cosine similarity,
+    # bounded in [-1, 1], so dividing by 2 squeezes every logit into [-0.5, 0.5]
+    # and the loss loses almost all of its dynamic range. Measured at B=32 with
+    # dense (embed) targets, the gap between random features and a perfectly
+    # ordered oracle:
+    #
+    #   tau    2.0     1.0     0.5     0.2     0.1    0.07
+    #   range  0.22    0.41    0.72    1.30    1.74    1.98   (nats)
+    #
+    # At 2.0 the whole achievable improvement is 0.22 nats, and the 80-epoch
+    # run 230514 realised 0.00 of it -- its four group losses sat flat at ~2.59
+    # from the first epoch to the last while contributing ~60% of the reported
+    # train loss. 0.1 is roughly the scale the InfoNCE head already uses
+    # (logit_scale = 1/0.07).
+    #
+    # SWEPT, full CVUSA, 80 epochs, everything else fixed. FoV 90 R@1 / Avg:
+    #
+    #   tau    0.05     0.1      0.2      0.5      1.0      2.0
+    #   FoV90  66.32    68.43    71.63    75.38    75.24    61.43*
+    #   Avg    75.02    76.29    79.47    82.01    81.83      -
+    #
+    #   * the tau=2.0 runs also predate the ground FoV curriculum, padding-roll
+    #     and eval-seeding fixes, so that point bounds 2.0 from above rather
+    #     than isolating it.
+    #
+    # 0.5 and 1.0 are effectively tied, so the optimum is a broad plateau rather
+    # than a sharp peak; 0.5 is the default as the lower edge of it. This was
+    # the single most valuable knob found -- worth +9.1 R@1 at FoV 90 from the
+    # 0.05 end, and it is what took the branch past the published SinGeo.
+    rnc_tau: float = 0.5
+
+    # How equidistant references are treated in each other's rank sets.
+    #
+    # False (the original RnC formulation) reads a tie as "make these two
+    # equally similar": every tied reference sits in every other's denominator,
+    # and that sum is minimised only when their similarities are identical. The
+    # group's contribution is then pinned at |T|*log|T| and cannot descend, so
+    # the term keeps producing gradient forever without being satisfiable.
+    # True drops tied references from each other's rank sets; a term carrying
+    # no ordering information then costs exactly 0.
+    #
+    # The reported RNC group losses drop on this switch simply because those
+    # zeros are averaged in, so they are not comparable across the flag.
+    rnc_exclude_ties: bool = False
+    # Restrict RNC to views of the SAME location, so it ranks a location's own
+    # views against each other and never against another location's.
+    #
+    # Ranking one positive against one unrelated negative asks a question the
+    # overlap labels cannot answer. The arcs measure how much two views of one
+    # place share; there is no meaningful sense in which a view of Kansas is
+    # "0.83 far" from a view of Oregon, so any number put there is invented and
+    # RNC then spends most of its budget ordering invented distances. With this
+    # on, RNC is purely a view-overlap ordering term and every
+    # positive-vs-negative decision is left to InfoNCE.
+    #
+    # Two consequences. `negative_tiering` is never read, so no GPS table and no
+    # satellite-embedding CSV are loaded. And with two views per domain the
+    # same-domain groups are exactly zero: anchor q1_i's only same-location
+    # reference in g2g is q2_i (the diagonal is already dropped), its rank set is
+    # itself, and logsumexp({s}) - s = 0. Only g2a and a2g carry signal.
+    rnc_positives_only: bool = True
+
+    # Add the single most confusable negative per row to the positives-only rank
+    # sets. Positives-only leaves a partial view (wedge, crop) with nothing it
+    # must beat, so it is only pushed BEHIND the full view and never pulled
+    # toward its own location -- measured on one step: cos(q1, r2) falls under
+    # positives-only and rises under all-pairs. With the hardest negative in the
+    # rank set the ordering becomes full view < partial view < hardest negative,
+    # which restores the attraction while keeping RnC free of the GEE ranking
+    # over all 15 negatives. Needs rnc_positives_only=True.
+    rnc_hardest_negative: bool = False
+
+    rnc_similarity: str = "cosine"     # "cosine" | "l2"
+    # Per-group weights, ordered (ground->aerial, ground->ground,
+    # aerial->ground, aerial->aerial). The four groups are always computed and
+    # logged separately; these only scale their contribution to the total.
+    rnc_group_weights: tuple = (1.0, 1.0, 1.0, 1.0)
+    # Positive pairs occupy [0, rnc_positive_scale]; negatives are pushed above
+    # it by at least rnc_negative_margin so the two ranges never touch.
+    rnc_positive_scale: float = 0.5
+    rnc_negative_margin: float = 1e-2
+
+    # How the overlap of two views of the same location is measured. RNC reads
+    # only the ordering within a row, so this decides what the loss actually
+    # asks for -- rnc_positive_scale does not, it only rescales.
+    #
+    # Required orderings, for two views of the same location:
+    #   ground anchor (panorama or crop):  full aerial tile < aerial sector
+    #   aerial anchor (tile or sector):    ground panorama  < ground crop
+    # i.e. the uncropped counterpart always wins, on both sides. Anything else
+    # trains the model toward references and queries the eval never produces.
+    #
+    #   "circle"      - inter / 360. Constant denominator, so distance falls
+    #                   strictly with the intersection and all four orderings
+    #                   hold by construction. Default.
+    #   "iou"         - inter / union. Violates one of the four on 66% of
+    #                   curriculum pairs: the union shrinks for a narrow
+    #                   reference, so a 324 deg aerial sector outranks the full
+    #                   tile as a match for a 302 deg ground crop.
+    #   "containment" - inter / min(extent_a, extent_b). Never inverts, but
+    #                   ties 99.5% of pairs, leaving the positive block with
+    #                   almost no ordering at all.
+    #
+    # inter / max(extent_a, extent_b) is not offered: it equals "iou" exactly
+    # whenever one arc contains the other, and widens the sector inversion
+    # elsewhere (84% of pairs violate).
+    rnc_positive_overlap: str = "circle"
+
+    # Where negative-pair distances come from:
+    #   "geo"  - geographic proximity from the pre-computed neighbour ranking
+    #            (gps_dict_path). Stable, independent of model state. Default.
+    #   "none" - flat 1.0 for every negative; the original untiered RnC
+    #            behaviour, and the fallback when no geographic data exists.
+    #   "dss"  - EXPERIMENTAL. Derived from the model's current embedding
+    #            similarity. This makes the ranking target chase the model's
+    #            own confusion, which can pull against the discriminative
+    #            objective. Emits a runtime warning when selected.
+    #   "embed" - scene dissimilarity between the two aerial tiles, from the
+    #            Google Satellite Embedding sampled at each location
+    #            (fetch_satellite_embeddings_cvusa.py). Unlike "geo" this is a
+    #            target the encoder can actually represent: a photograph cannot
+    #            reveal whether a negative is 500 km or 1500 km away, but it can
+    #            reveal that two scenes look alike. Dense, so it barely ties.
+    #
+    # VIGOR has no embedding table or coordinate CSV, so only "none" and "geo"
+    # with rnc_geo_source="ranks" are available. Positives-only RnC (the P-series
+    # recipe) never reads a tiering at all.
+    negative_tiering: str = "none"
+
+    # Embeddings CSV for negative_tiering="embed". Restricted to the ids in the
+    # training split at load time.
+    sat_embedding_csv: Optional[str] = None     # unused on VIGOR, kept for field parity
+
+    # Where "geo" tiering gets its separations from:
+    #   "coords" - haversine computed on demand from the raw (lat, lon) table
+    #              below. Exact for every pair, 0.28 MB resident, ~0.1 ms per
+    #              batch. Default.
+    #   "ranks"  - legacy top-K neighbour lookup from gps_dict_path. Stores ids
+    #              and not distances, so every pair outside an anchor's top-128
+    #              ties at 1.0 -- which, under similarity sampling, is ~99.7% of
+    #              the pairs in a batch. Kept only for comparison.
+    rnc_geo_source: str = "ranks"     # VIGOR: "ranks" only
+    gps_coords_csv: Optional[str] = None        # unused on VIGOR, kept for field parity
+
+    # Separation at which negatives reach the maximum distance label; pairs
+    # beyond it tie at 1.0. RNC reads only the *ordering* within a row, so the
+    # value of this constant is irrelevant except where it clamps -- which
+    # makes it purely a control over how many pairs are allowed to tie.
+    #
+    #   None  - normalise by the batch maximum. Nothing clamps, so the row
+    #           keeps the true geographic ordering: 120 distinct labels per
+    #           batch, 0.8% tied. Default.
+    #   2500  - 94 distinct labels, 22.5% tied.
+    #   100   - 100% tied. Every pair in a similarity-sampled batch is farther
+    #           apart than this (median separation 1527 km), so the whole
+    #           matrix collapses onto one value and RNC degenerates.
+    #
+    # A short ceiling is only defensible once tied pairs are excluded from the
+    # rank sets in singeo.loss.RankNContrast; as the loss stands, a tie is an
+    # active instruction to make the two similarities equal.
+    rnc_geo_max_km: Optional[float] = None
+
+    # Aerial crop augmentation (the aerial counterpart of the ground FoV
+    # curriculum). When False the aerial branch only ever yields the full tile
+    # and the RNC groups collapse to using that alone.
+    enable_aerial_crop: bool = True
+    aerial_arc_start: float = 360.0    # sector width at epoch 1
+    aerial_arc_end: float = 180.0      # sector width at the final epoch
+    aerial_rot_max: float = 180.0      # max |continuous tile rotation| reached
+
+    # Fraction of the run over which the two aerial schedules (sector width and
+    # rotation/drift bound) reach their final values. 1.0 = linear across the
+    # whole run, the original behaviour.
+    #
+    # This is the aerial twin of `fov_ramp_frac`. The ground FoV curriculum used
+    # to walk 360 -> 70 across the entire run, which meant the narrow views --
+    # the ones the model is scored on -- arrived once the cosine LR was spent;
+    # fixing that was worth about +6 R@1 at FoV 90. The aerial schedules still
+    # have it: run round1a hit its 180 deg sector and +-180 deg drift only at
+    # epochs 75-80, at LR ~1e-6, and both runs were still climbing steeply when
+    # the schedule ended (+9.9 R@1 at FoV 360 over the final 16 epochs, +3.4 in
+    # the last eval alone) while train recall sat saturated at 99.9.
+    aerial_ramp_frac: float = 1.0
+
+    # How the wedge view's tile is rotated, and whether it is disc-masked.
+    #
+    #   "continuous" - uniform in +-aerial_rot_max, interpolated, with the disc
+    #                  mask hiding the blank corners that creates. Original.
+    #   "discrete"   - 0 or +-90 only, an exact pixel permutation, rotating with
+    #                  the same per-epoch probability schedule the no-wedge path
+    #                  uses (get_dynamic_rotate_prob, keep 1.0 -> 0.25). Pair with
+    #                  aerial_circular_mask=False: 90-degree rotations lose no
+    #                  corners, so the disc would only blank 21.5% of the tile.
+    #
+    # SinGeo's supplementary Tab. 1 compares these for the satellite branch
+    # (FoV 360 / 180 / 90): continuous 89.2 / 77.5 / 63.7, discrete 96.8 / 91.8 /
+    # 70.1. Turning the wedge on had swapped the discrete schedule for the
+    # continuous rotation, so 'the wedge' bundled that change with the crop.
+    # "discrete" keeps the crop and undoes only the rotation.
+    #
+    # Only the tile's rotation changes. The sector's heading drift off the
+    # ground crop still follows aerial_rot_max in both modes.
+    #   "quarter"    - uniform over {0, 90, 180, 270}, every one an exact pixel
+    #                  permutation. Unlike "discrete" it includes 180 and has no
+    #                  probability schedule. Applied to r2 whether or not the
+    #                  wedge is on, so a wedge-on/wedge-off pair differs only in
+    #                  the wedge rather than also in the rotation scheme.
+    aerial_rotation: str = "continuous"
+    aerial_circular_mask: bool = True
+
+    # Weight each InfoNCE positive by how much of the narrower of its two views
+    # the other one actually covers (the containment overlap of their azimuth
+    # arcs).
+    #
+    # Five of the six terms are unaffected by construction -- q1 and r1 are
+    # always full 360 degree views, so anything paired with one of them is
+    # contained outright and weighs exactly 1. The term that changes is loss6,
+    # ground crop against aerial wedge, the only pair with both sides cropped.
+    # Because `aerial_rot_max` lets the wedge's heading drift up to +-180
+    # degrees off the ground crop's, that pair degrades over the curriculum:
+    #
+    #   epoch          1      40      70      80
+    #   mean overlap   0.988   0.537   0.190   0.097
+    #   zero overlap   0.0%    0.0%    2.0%    30.6%
+    #
+    # Ungated, the loss spends the last stretch of training insisting that a
+    # ground view facing north matches an aerial wedge facing south -- which is
+    # the mechanism behind SinGeo's finding that aerial cropping is
+    # destructive, and it directly contradicts the RNC labels, which measure
+    # the same overlap and rank it correctly. Gating removes the pair as a
+    # *positive* only; it stays a valid negative in every other row.
+    #
+    # Set False to reproduce the ungated behaviour for ablation.
+    overlap_gated_infonce: bool = True
+
+    # How the ground FoV curriculum is sampled.
+    #
+    #   "loguniform"    - draw a fresh FoV per sample from [floor(epoch), 360],
+    #                     where the floor ramps 360 -> fov_curriculum_end over
+    #                     the first `fov_ramp_frac` of the run. Default.
+    #   "deterministic" - the original: one FoV per epoch, walked linearly from
+    #                     360 to fov_curriculum_end across the whole run.
+    #
+    # The deterministic schedule is anti-aligned with the cosine LR: it saves
+    # the narrow views for the epochs where there is no learning rate left. On
+    # the 80-epoch run, the share of the *LR-weighted* budget spent at or below
+    # each evaluation FoV:
+    #
+    #                      <= 180    <= 90
+    #   deterministic        8.7%     0.1%
+    #   loguniform          44.1%    10.2%
+    #
+    # 0.1% is why test recall at FoV 90 was still climbing when run 230514
+    # ended, and why going from 40 to 80 epochs bought +5.2 points there.
+    # Sampling a range instead of a point also keeps wide-FoV examples in every
+    # batch, which is what makes one model robust across 360/180/90/70 rather
+    # than specialised at the curriculum's endpoint.
+    #   "loguniform_batch" - the same draw, but ONE FoV per batch instead of per
+    #                        sample. This is the only log-uniform mode that
+    #                        works UNPADDED: per-sample draws give each sample a
+    #                        different crop width and default_collate cannot
+    #                        stack them, which is why every log-uniform run so
+    #                        far has been padded. Across batches the FoV
+    #                        distribution is identical to "loguniform".
+    #
+    #                        It also removes FoV as a within-batch cue: InfoNCE
+    #                        discriminates sample i from sample j inside one
+    #                        batch, and if they share a FoV it cannot be used to
+    #                        tell them apart.
+    fov_sampling: str = "loguniform"   # "loguniform" | "loguniform_batch" | "gaussian" | "deterministic"
+
+    # "gaussian": per-sample FoV from N(mean, fov_gaussian_std) clipped to
+    # [fov_curriculum_end, 360], with the mean walked linearly 360 -> end across
+    # the run. A narrow band that slides, where loguniform is a widening support:
+    # late in a loguniform run an epoch still mixes 70 and 360 deg crops, whereas
+    # this trains a tight range of widths that migrates toward the eval FoV.
+    fov_gaussian_std: float = 20.0
+
+    # Paces the Gaussian mean's descent, as fov_ramp_frac paces the log-uniform
+    # floor. 1.0 (default) spreads it over the whole run, so the mean only
+    # reaches fov_curriculum_end in the final epoch and the narrow views arrive
+    # with the cosine LR nearly spent. Lower it to buy epochs at the narrow end:
+    # 0.75 lands at epoch 60 of 80 and holds for the last 20. `<= 0` starts at
+    # fov_curriculum_end immediately. Inert unless fov_sampling="gaussian".
+    fov_gaussian_ramp_frac: float = 1.0
+    fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
+    fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
+    # Shape of the "deterministic" schedule. 0 = the original SinGeo linear walk;
+    # > 0 = exponential fast-to-slow, (1 - exp(-lam x)) / (1 - exp(-lam)) with
+    # x = epoch / epochs: lam = 5 over 360 -> 70 is at or below 180 from epoch 16
+    # and at or below 90 from epoch 42 (linear: 50 and 75). See get_dynamic_fov.
+    # The other sampling modes refuse it at startup rather than ignore it.
+    fov_schedule_lambda: float = 0.0
+
+    # Lower clip bound for the Gaussian band, decoupled from the mean endpoint.
+    # `None` keeps the original behaviour, clipping at `fov_curriculum_end`,
+    # which centres the settled band exactly on its own clip and so pins ~50% of
+    # every late batch to that one width. Setting it BELOW the mean endpoint
+    # leaves the lower tail intact: a mean of 90 with std 30 clipped at 70 keeps
+    # roughly a quarter of samples at or under 70, so the narrowest evaluated
+    # FoV is still represented in training instead of being unreachable.
+    # Inert unless fov_sampling is a Gaussian mode.
+    fov_gaussian_clip_lo: Optional[float] = None
+
+    # Probability a sample's ground FoV is overridden to EXACTLY 360, which is the
+    # only draw that yields a seamless panorama rolled to an arbitrary azimuth --
+    # the input the FoV-360 evaluation query is. Training otherwise never supplies
+    # one once the band settles: q1 is never rolled, the Gaussian clip at 360 only
+    # fires while the mean is high (39% of draws at epoch 1, 0% from epoch 12), and
+    # log-uniform is continuous so it never lands on 360.
+    #
+    # `fov_full_pano_epochs` bounds the window: 0 means every epoch, N means the
+    # first N only. So prob=1.0 with epochs=4 is a four-epoch warm-up, and
+    # prob=0.1 with epochs=0 is a steady 10% injection across the run.
+    fov_full_pano_prob: float = 0.0
+    fov_full_pano_epochs: int = 0
+
+    # Hold the ground FoV schedule at its 360 deg start for this many epochs
+    # before the narrowing begins. Set it equal to `fov_full_pano_epochs` for a
+    # full-panorama warm-up, so the band does not advance underneath the warm-up
+    # and then hand over with a jump: without it a 4-epoch warm-up at 360 is
+    # followed by a band already centred at 303.75, because the schedule kept
+    # running while it was being overridden. The ramp still LASTS
+    # `ramp_frac * epochs`; it just starts later, so with delay 4 and ramp_frac
+    # 0.3 over 80 epochs the mean walks 360 -> 90 across epochs 5 to 28.
+    fov_ramp_delay_epochs: int = 0
+
+    # GridDropout/CoarseDropout severity on the *cropped* views (q2 and r2).
+    # Those views have already lost most of the image to the FoV crop and the
+    # aerial sector; GridDropout at ratio 0.5 then removes half of what is
+    # left, so the crop and the dropout compound. Scales the grid ratio, hole
+    # count and hole size -- not how often dropout fires.
+    # 1.0 = original SinGeo behaviour, 0.0 = no dropout on those two views.
+    # The uncropped views (q1, r1) keep full-strength augmentation either way.
+    #
+    # Measured fraction of pixels blanked:
+    #   strength   1.00   0.75   0.50   0.40   0.25
+    #   q2 ground  5.43%  2.82%  1.19%  0.73%  0.26%
+    #   r2 aerial  8.28%  4.34%  1.46%  0.90%  0.22%
+    crop_dropout_strength: float = 0.5
+
     # Learning Rate
-    lr: float = 0.0001                  # 1 * 10^-4 for ViT | 1 * 10^-1 for CNN
+    lr: float = 0.0001
     scheduler: str = "cosine"          # "polynomial" | "cosine" | "constant" | None
     warmup_epochs: int = 1
     lr_end: float = 0.0001             #  only for "polynomial"
+    # Exponent of the polynomial decay. HF computes
+    #   lr = (lr - lr_end) * (1 - progress)**power + lr_end
+    # so power > 1 decays fast then flattens, power < 1 decays slowly and keeps a
+    # usable LR late. 1.5 was hardcoded before this field existed, so that stays
+    # the default. NOTE lr_end defaults to lr, which makes the schedule CONSTANT
+    # -- set lr_end below lr for the decay to do anything.
+    poly_power: float = 1.5
     
     # Dataset
-    data_folder = "./data/VIGOR"
-    ground_cutting = 0                 # cut ground upper and lower
-    same_area: bool = False             # True: same | False: cross
-    gps_dict_path: str = "./data/VIGOR/gps_dict_cross.pkl"   # gps_dict_cross.pkl | gps_dict_same.pkl
-    # Savepath for model checkpoints
-    model_path: str = "./singeo_vigor"
+    data_folder = "/home/71/25021871/data/chamodya/VIGOR"
+    # True: same-area (all four cities, train/test split within each).
+    # False: cross-area (train New York + Seattle, test Chicago + San Francisco).
+    same_area: bool = False
+    ground_cutting: int = 0            # rows cut from the panorama top and bottom
 
+    # Where the aerial wedge radiates from. "ground" places its apex at the
+    # panorama's recorded position in the tile, which on a VIGOR positive is
+    # anywhere in the central quarter (up to 160 px of 640 off centre), so a
+    # centre-apex wedge would not show what the ground crop sees. "centre" is the
+    # CVUSA geometry, for ablation.
+    aerial_wedge_apex: str = "ground"
+    
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
-
+    # Savepath for model checkpoints. On /data (2 TB, ~1.6 TB free), not the
+    # 193 GB root filesystem -- `data/data` is a symlink to `/data`.
+    model_path: str = "/home/71/25021871/data/chamodya/Singeo_data/VIGOR"
+    
     # Eval before training
-    zero_shot: bool = False  
+    zero_shot: bool = False
     
     # Checkpoint to start from
-    checkpoint_start = None
+    checkpoint_start = None   
+
+    # Resume an interrupted run: skip to this epoch and fast-forward the LR
+    # schedule to match, so the curricula and the learning rate land where the
+    # original run left off. Only the model weights are in a checkpoint -- the
+    # optimizer moments and scheduler position are not saved -- so a resume is
+    # never bit-exact. Late in a cosine schedule that is immaterial because the
+    # LR is already near zero; resuming mid-run would not be.
+    start_epoch: int = 1
+
+    # On resume, aim the DSS sim-sampling crop at this FoV before rebuilding the
+    # similarity dict. Set it to the measured mean the interrupted run last
+    # logged, which is what dss_fov_from_measured would have applied at that
+    # epoch. None falls back to `fov`, the eval setting.
+    resume_dss_fov: Optional[float] = None
   
     # set num_workers to 0 if on Windows
     num_workers: int = 0 if os.name == 'nt' else 4 
@@ -102,29 +546,580 @@ class Configuration:
     
     # make cudnn deterministic
     cudnn_deterministic: bool = False
-    fov: float=90 # eval fov (with unknown orientation)
+    fov: float=90 # eval fov setting (with unknown orientation)
+
+    # Additional FoVs to report every eval, alongside `fov`. `fov` alone still
+    # drives checkpoint selection; these are for reading robustness across the
+    # range the curriculum now trains on rather than at one point on it.
+    # Set to () to report only `fov`.
+    eval_fov_extra: tuple = (360.0, 270, 180.0, 70.0)
     random_fov: bool=False
+
+    # Keep every ground view at the panorama's full width, filling the azimuths
+    # the FoV crop drops (LimitedFoVPad) instead of handing the encoder a
+    # narrower tensor (LimitedFoV).
+    #
+    # False leaks the FoV through the tensor's own width -- 192 columns at the
+    # eval's 90 degrees against 644 at epoch 16's 302 -- which is a shortcut the
+    # RNC cross-domain groups reward: they rank a location's full panorama above
+    # its own crop as a match for the aerial tile, and one monotone function of
+    # that width satisfies the ordering everywhere. The model then meets an eval
+    # width it never saw in training and every query lands far from every tile.
+    #
+    # Applies to training and evaluation together, by design. Padding one side
+    # only swaps the shortcut for a geometry mismatch. Note this makes test
+    # recall incomparable with logs from before the switch -- the eval input
+    # changes shape -- so re-baseline rather than reading it against them.
+    # A fixed blank border (columns each side) around the ground crop, as an
+    # alternative to fov_pad. Padding fills out to the full panorama width; this
+    # keeps the crop narrow and only lifts it off the tensor edge.
+    #
+    # Why it might matter: a crop flush against the tensor border loses ~12 R@1
+    # per touching edge (measured on round4a at FoV 90: 75.71 centred on a full
+    # width canvas, 63.61 and 63.80 with one edge touching, 48.75 with both).
+    # At the border the convolutions substitute their own zero padding, which is
+    # not the blank-fill pattern the scene's edge columns were trained beside.
+    # 4 px already recovers 10.5 of those 12 points; 64 px recovers all of it.
+    #
+    # Unlike fov_pad it does not force a fixed tensor width, so the per-batch FoV
+    # draw still collates, and it reveals nothing about the FoV that the crop's
+    # own width does not already reveal.
+    fov_border_px: int = 0
+
+    # Pad each ground crop to the WIDEST crop in its batch, with the blank going
+    # in as 1..fov_gap_segments random runs whose positions include the inside of
+    # the scene. Needs per-sample FoV (fov_sampling="loguniform") and no other
+    # padding.
+    #
+    # Two things separate it from fov_pad. The tensor width follows the batch, not
+    # the protocol, so a batch of narrow crops stays narrow and the widest sample
+    # carries no blank at all. And blank can land inside the scene, so "blank only
+    # appears at the two ends" is not learnable -- the edge condition the model
+    # has to handle becomes variable by construction.
+    # Padding mode for every convolution that pads -- the 36 depthwise 7x7 layers
+    # of ConvNeXt-B. "zeros" is stock. See singeo.model.set_conv_padding_mode and
+    # "Mind the Pad" (ICLR 2021): zero padding injects a constant the network never
+    # meets inside an image, and the artefact propagates inward.
+    #
+    # "circular" wraps both axes, which is right for a full panorama horizontally
+    # and wrong vertically (sky onto road) and for narrow crops (two unrelated
+    # edges joined). "replicate" repeats the edge pixel and assumes nothing.
+    # Which overlap measure the InfoNCE gate uses. "containment" (inter/min) is
+    # 1 for any pair with a full 360 side, so it gates loss6 only. "circle"
+    # (inter/360) gates every term by the share of the compass both views see.
+    #
+    # Careful reading it: InfoNCE takes a WEIGHTED MEAN, so a weight that is the
+    # same for every sample in a batch cancels. Under a per-batch FoV draw that
+    # leaves loss6 as the only term the gate can move; r1-r2 and r2-q1 never vary
+    # within a batch under any protocol, since the wedge sector is per-epoch.
+    overlap_gate_measure: str = "circle"
+
+    # Let the overlap gate set the BETWEEN-term balance as well as the
+    # within-term one, replacing the hand-set infonce_term_weights hierarchy.
+    #
+    # Each term is currently a weighted mean, normalised by the gate's own sum,
+    # so a gate shared by the whole batch cancels exactly and the gate can only
+    # reweight samples inside a term. Normalising by the batch size instead lets
+    # the term shrink with the share of the compass the two views see. Measured
+    # over P12's curriculum the resulting scalars land at
+    #   q1-r1 1.00  q1-q2 0.44  r1-r2 0.50  r1-q2 0.44  r2-q1 0.50  r2-q2 0.22
+    # against SinGeo's hand-set 1, .5, .5, .25, .25, .25 -- four of six within
+    # 0.06, with the two cross terms r1-q2 and r2-q1 about twice as heavy.
+    #
+    # Needs overlap_gated_infonce=True and is only informative with
+    # overlap_gate_measure="circle"; pair it with uniform infonce_term_weights
+    # so the geometry is the only thing setting the balance.
+    infonce_gate_scales_terms: bool = False
+
+    # Renormalise the six gate-derived weights onto a fixed total each batch, so
+    # the geometry sets how weight is DISTRIBUTED without also setting how much
+    # there is. Without it the total falls 5.83 -> 3.11 across the run (measured
+    # on P12's curriculum), a 47% loss-scale decay stacked on the cosine LR --
+    # an unintended second change bundled into the mechanism.
+    #
+    # The target defaults to sum(SINGEO_TERM_WEIGHTS) = 2.75, which is nothing
+    # but SinGeo's hierarchy added up. Any constant removes the drift; this one
+    # also leaves InfoNCE on the baseline's scale, so rnc_weight keeps meaning
+    # what it meant in roundP12. Needs infonce_gate_scales_terms.
+    # Rank dynamic similarity sampling at the FoV the epoch ACTUALLY trained on,
+    # measured from the recorded crop extents, instead of an analytic stand-in.
+    # The stand-ins are central values, not means: the log-uniform geometric
+    # mean sits ~19 deg below the arithmetic mean all run, and the Gaussian
+    # pre-clip mean is 8 deg low at epoch 80 once the clip piles mass at 70.
+    # Measured during training and applied before calc_sim in the SAME epoch, so
+    # it costs no lag. Off by default so earlier runs stay reproducible.
+    dss_fov_from_measured: bool = True
+
+    infonce_gate_normalise_mass: bool = False
+    infonce_gate_mass_target: Optional[float] = None
+    # Hold loss1's (q1-r1) share of the gated InfoNCE mass fixed: loss1 is scaled
+    # by the mean gate of loss2..loss6 each batch, so its share stays at 1/6 with
+    # flat term weights instead of drifting ~17% -> ~36% as the crop and wedge
+    # narrow. Needs the circle gate with infonce_gate_scales_terms; excludes
+    # infonce_gate_normalise_mass. See singeo.trainer._loss1_share_scale.
+    infonce_hold_loss1_share: bool = False
+
+    conv_padding_mode: str = "zeros"
+
+    # Apply fov_border_px to the full panorama q1 as well as to the crops. Off by
+    # default. With it on every ground view carries the same blank margin, which
+    # also matches the FoV 360 evaluation query: that one is built by the crop
+    # path and is therefore already bordered, while training q1 is not.
+    fov_border_q1: bool = False
+
+    fov_pad_batch_max: bool = False
+    fov_gap_segments: int = 4
+
+    fov_pad: bool=True
+
+    # Where the padded block sits inside the full-width ground tensor.
+    #
+    # True places it at a uniformly random non-wrapping column offset, so the
+    # azimuth a view shows and the columns it occupies are independent. False
+    # pins it to column 0, fixing both its start and its end from the FoV alone.
+    #
+    # This is an ABLATION, not a tuning knob. Padding and the q1 roll each
+    # independently prevent the mid-run collapse seen in every unpadded run
+    # (old log.txt 14.04 -> 3.08, round7a 15.66 -> 3.61, round8a 18.49 -> 6.99
+    # at FoV 90), while 230514/round1a/round4a with padding and round8b with the
+    # q1 roll are all smooth. The hypothesis is that both work by denying the
+    # model an absolute column-position cue -- padding by randomising where
+    # content sits, the roll by randomising which azimuth the panorama starts
+    # at. Setting this False keeps padding's constant 768-wide tensor but
+    # removes the positional randomisation, so it separates the two.
+    #
+    # Applies to training and evaluation together, like `fov_pad` itself.
+    fov_pad_random_start: bool=True
+
+    # Colour of every blank region the masks write: the ground crop's padding or
+    # border, the panorama border, the aerial wedge mask and its rotation corners.
+    #   "mean"   tensor zero after A.Normalize = the dataset mean colour,
+    #            RGB (124, 116, 104). The historical fill; bit-identical default.
+    #   "black"  pixel zero = (0 - mean) / std per channel, ~(-2.12, -2.04, -1.80).
+    # The mean colour sits close to real flat content (asphalt, dirt, overcast
+    # sky); flat black is rare in daytime CVUSA. If teaching the shared encoder to
+    # discount the fill also discounts real flat regions -- one candidate for the
+    # ~1.2 R@1 the padded protocol costs at FoV 360 -- black should leak less.
+    # Training and evaluation use the same value. Needs the RNC dataset path.
+    # The albumentations Coarse/GridDropout holes are pixel zeros (black)
+    # already and are not affected.
+    mask_fill: str = "mean"
+
+    # Give the uncropped panorama (q1) its own uniform roll in training.
+    #
+    # Without it, q1 and the aerial tile are always in the SAME relative
+    # orientation: the prob_rotate block rotates the tile and rolls the panorama
+    # by the matching amount. Evaluation never does that -- get_transforms_val
+    # rolls the query by random.randint(0, 359) and leaves the north-up tile
+    # alone -- so every test pair carries an arbitrary relative orientation the
+    # model was never trained on. prob_rotate's four discrete offsets do not
+    # cover that, and 25% of samples get no roll at all.
+    #
+    # Only q1 is rolled; it is cyclic over 360 degrees so the rotation is exact.
+    # The RNC arc for q1 stays (0, 360), so distance labels are untouched.
+    ground_roll_q1: bool = False
+
+    # Ramp the q1 roll in instead of switching it on at epoch 1. Each sample's q1
+    # is rolled by a uniform draw from [-A, +A] degrees, with A rising linearly
+    # from 0 at epoch 1 to 180 once this fraction of the run has passed, then
+    # holding. A = 180 covers the whole circle, i.e. the full `ground_roll_q1`
+    # roll. 0 disables it; 1.0 reaches 180 at the final epoch. The full roll from
+    # epoch 1 is measured harmful (caps FoV 180 at ~80, see EXPERIMENTS.md); this
+    # keeps q1 aligned with the tile early and introduces the arbitrary relative
+    # orientation that every FoV-360 eval query has gradually. Excludes
+    # `ground_roll_q1`.
+    ground_roll_q1_ramp_frac: float = 0.0
+
+    # Mask-aware encoding of the wedged aerial view (r2), see singeo.masked_encoder.
+    #
+    # The wedge blanks part of the tile, and timm's global average pool then mixes
+    # the encoder's response to that blank region into the descriptor that InfoNCE
+    # asks to match the ground view.
+    #
+    #   "off"   stock encoder; the batch and every random draw are unchanged.
+    #   "pool"  masked global average pool over the valid stage-4 cells only.
+    #   "gated" also multiply the input of every spatial conv (stem, downsample,
+    #           depthwise) by the mask, so blank content never reaches a valid cell.
+    #           On pretrained convnext_base, pooling alone leaves the descriptor
+    #           29.7% dependent on the blank fill (stock 31.8%); gating makes it 0.
+    #
+    # Needs the wedge (use_rnc and enable_aerial_crop) and no grad checkpointing.
+    aerial_mask_mode: str = "off"
+
+    # Save a collage of the four training views (q1, q2, r1, r2) into the run's
+    # own output directory every N epochs, plus epoch 1 -- the epoch where a
+    # miswired crop or rotation is cheapest to catch. 0 disables it.
+    #
+    # Each panel is labelled with the arc that sample actually received, so the
+    # curriculum can be checked by eye rather than inferred from the loss. Needs
+    # use_rnc=True, since the crop windows only exist on that path.
+    input_collage_every: int = 10
+    input_collage_samples: int = 4
 
 #-----------------------------------------------------------------------------#
 # Train Config                                                                #
 #-----------------------------------------------------------------------------#
 
-config = Configuration() 
+def apply_env_overrides(cfg):
+    """Override any Configuration field from the environment.
+
+    `SINGEO_<FIELD>` sets `<field>`, e.g. `SINGEO_USE_RNC=false
+    SINGEO_EPOCHS=40`. Values are parsed with `ast.literal_eval` and fall back
+    to the raw string, so tuples and None work as written:
+    `SINGEO_EVAL_FOV_EXTRA='(360.0, 180.0)'`, `SINGEO_CHECKPOINT_START=None`.
+
+    This exists so an ablation grid runs from one file. Copying the script per
+    variant is how the runs in `singeo_cvusa/` were made, and it leaves no way
+    to tell which differences between two copies were deliberate. The script
+    already snapshots itself into the checkpoint directory, and the overrides
+    are echoed into the log, so a run stays fully reconstructible.
+
+    Returns the list of `(field, value)` applied, for logging.
+    """
+    applied = []
+
+    for name in sorted(dir(cfg)):
+        if name.startswith('_'):
+            continue
+
+        env_name = "SINGEO_{}".format(name.upper())
+        if env_name not in os.environ:
+            continue
+
+        raw = os.environ[env_name]
+        current = getattr(cfg, name)
+
+        if isinstance(current, bool):
+            # Never let a bool fall through to literal_eval: "false" is not a
+            # Python literal, so it would survive as the *string* "false" --
+            # which is truthy, silently inverting the flag and quietly ruining
+            # whichever ablation depended on it.
+            lowered = raw.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                value = True
+            elif lowered in ("false", "0", "no", "off"):
+                value = False
+            else:
+                raise ValueError("{} is a boolean field; got {!r}".format(env_name, raw))
+        else:
+            try:
+                value = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                value = raw      # plain strings like cosine / embed / coords
+
+            if isinstance(current, float) and isinstance(value, int):
+                value = float(value)
+
+        setattr(cfg, name, value)
+        applied.append((name, value))
+
+    # Not config fields: they label the run rather than change it.
+    meta_vars = ("SINGEO_RUN_NAME", "SINGEO_RUN_NOTE")
+
+    unknown = [k for k in os.environ
+               if k.startswith("SINGEO_")
+               and k not in meta_vars
+               and not hasattr(cfg, k[len("SINGEO_"):].lower())]
+    if unknown:
+        raise ValueError("No such Configuration field(s) for: {}".format(", ".join(sorted(unknown))))
+
+    return applied
+
+
+def write_run_info(path, cfg, run_name, note, overrides):
+    """Write `info.txt` describing what this run is and what it tests.
+
+    Everything here is read off the live `cfg`, never hardcoded, so the file
+    cannot drift out of sync with what actually ran -- a description saying
+    "uses RnC with GEE embeddings" would be false for the stock-SinGeo control
+    runs, which is exactly the confusion this is meant to prevent.
+
+    `SINGEO_RUN_NOTE` supplies the free-text "what we are testing" line.
+    """
+    rnc_on = cfg.use_rnc and cfg.rnc_weight != 0
+    gee_on = rnc_on and cfg.negative_tiering == "embed"
+
+    # The wedge's existence is decided by `use_rnc and enable_aerial_crop` at
+    # dataset construction -- rnc_weight only scales the loss term. Reporting it
+    # off whenever rnc_weight==0 mislabelled every InfoNCE-only run that still
+    # had the wedge active (round5a, round7a, round8b), which is exactly the
+    # kind of run where knowing matters.
+    wedge_on = cfg.use_rnc and cfg.enable_aerial_crop
+
+    lines = []
+    lines.append("Run:      {}".format(run_name or "(unnamed)"))
+    lines.append("Started:  {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+    lines.append("Dataset:  VIGOR {} ({})".format(
+        "same-area" if cfg.same_area else "cross-area", cfg.data_folder))
+    lines.append("Model:    {}".format(cfg.model))
+    lines.append("")
+
+    lines.append("WHAT THIS RUN TESTS")
+    lines.append("-" * 70)
+    lines.append(note or "(no SINGEO_RUN_NOTE given)")
+    lines.append("")
+
+    lines.append("METHOD")
+    lines.append("-" * 70)
+    if rnc_on:
+        lines.append("Rank-N-Contrast (RnC) auxiliary loss: ON")
+        lines.append("  weight {}, temperature {}, similarity {}".format(
+            cfg.rnc_weight, cfg.rnc_tau, cfg.rnc_similarity))
+        lines.append("  positive pairs  : arc overlap, measure '{}', scale {}".format(
+            cfg.rnc_positive_overlap, cfg.rnc_positive_scale))
+        # Report the EFFECTIVE tiering: positives-only forces it to "none" and the
+        # embedding table is never even loaded, so printing the requested value
+        # would claim a dependency the run does not have.
+        effective_tiering = "none" if cfg.rnc_positives_only else cfg.negative_tiering
+        if effective_tiering != cfg.negative_tiering:
+            lines.append("  negative tiering: '{}'  (requested '{}', overridden by "
+                         "rnc_positives_only)".format(effective_tiering, cfg.negative_tiering))
+            lines.append("    -> negatives all sit at distance 1.0; no GEE table is read")
+        else:
+            lines.append("  negative tiering: '{}'".format(effective_tiering))
+        if gee_on and effective_tiering == "embed":
+            lines.append("    -> Google Earth Engine satellite embeddings, i.e. negatives are")
+            lines.append("       ranked by how similar the two SCENES look, not by how far apart")
+            lines.append("       they are. A photograph cannot reveal 500 km vs 1500 km, but it")
+            lines.append("       can reveal that two places look alike, so this target is one the")
+            lines.append("       encoder can actually represent. Dense, so it barely ties.")
+            lines.append("    -> source: {}".format(cfg.sat_embedding_csv))
+        elif effective_tiering == "geo":
+            lines.append("    -> geographic separation, source '{}'".format(cfg.rnc_geo_source))
+        if cfg.rnc_positives_only and getattr(cfg, "rnc_hardest_negative", False):
+            lines.append("  scope: a location's own views + the single hardest negative per row")
+            lines.append("    -> ordering full view < partial view < hardest negative;"
+                         " g2g/a2a are NOT zero")
+        elif cfg.rnc_positives_only:
+            lines.append("  scope: positives only -- a location's own views, no negatives at all")
+            lines.append("    -> g2g/a2a are exactly 0 with two views per domain")
+        else:
+            lines.append("  scope: all pairs -- every negative in the batch joins the rank sets")
+        lines.append("  group weights (g2a, g2g, a2g, a2a): {}".format(cfg.rnc_group_weights))
+        lines.append("  ties: {}".format("excluded from rank sets" if cfg.rnc_exclude_ties
+                                         else "compete (original RnC)"))
+    else:
+        lines.append("Rank-N-Contrast (RnC) auxiliary loss: OFF"
+                     "{}".format("  (rnc_weight = 0)" if cfg.use_rnc else ""))
+        lines.append("  -> plain SinGeo InfoNCE only. No GEE satellite embeddings are used.")
+    lines.append("")
+
+    lines.append("Aerial wedge crop: {}".format(
+        "ON  (sector {} -> {} deg, heading drift up to +-{} deg)".format(
+            cfg.aerial_arc_start, cfg.aerial_arc_end, cfg.aerial_rot_max)
+        if wedge_on else "OFF"))
+    if wedge_on:
+        rotation_text = {
+            "discrete": "discrete 0/+-90 (exact), schedule keep 1.0 -> 0.25",
+            "quarter": "uniform 90*k, k in {0,1,2,3} (exact), no schedule",
+        }.get(cfg.aerial_rotation,
+              "continuous up to +-{} deg (interpolated)".format(cfg.aerial_rot_max))
+        lines.append("  tile rotation: {}{}".format(
+            rotation_text,
+            ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
+        lines.append("InfoNCE overlap gating: {}".format(
+            "ON  - each positive weighted by the {} overlap of the two views' arcs,".format(
+                cfg.overlap_gate_measure)
+            if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
+        lines.append("  {}".format(
+            "so a wedge pointing away from the ground crop cannot assert a false positive."
+            if cfg.overlap_gated_infonce
+            else "including the ~31% that share no azimuth at all late in the curriculum."))
+        if getattr(cfg, "infonce_gate_scales_terms", False):
+            lines.append("  the gate also scales each TERM (divided by batch size, not by the gate")
+            lines.append("  sum), so a batch-shared overlap no longer cancels and the geometry sets")
+            lines.append("  the between-term balance in place of the hand-set hierarchy.")
+            tgt = getattr(cfg, "infonce_gate_mass_target", None)
+            if getattr(cfg, "infonce_gate_normalise_mass", False):
+                tgt = sum((1.0, 0.5, 0.5, 0.25, 0.25, 0.25)) if tgt is None else tgt
+                lines.append("  mass renormalised to a fixed total of {:.2f} every batch, so this run".format(tgt))
+                lines.append("  differs from the hierarchy ONLY in how that mass is distributed.")
+            else:
+                lines.append("  mass NOT renormalised: the six weights sum to ~5.8 early and ~3.1 late,")
+                lines.append("  so the loss scale drifts down ~47% on top of the cosine LR schedule.")
+    default_terms = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
+    if tuple(cfg.infonce_term_weights) != default_terms:
+        names = ("q1-r1", "q1-q2", "r1-r2", "r1-q2", "r2-q1", "r2-q2")
+        lines.append("InfoNCE term weights: {}".format(", ".join(
+            "{} {}".format(n, w) for n, w in zip(names, cfg.infonce_term_weights))))
+        dropped = [n for n, w in zip(names, cfg.infonce_term_weights) if w == 0]
+        if dropped:
+            lines.append("  DROPPED as hard positives: {}".format(", ".join(dropped)))
+    lines.append("")
+
+    if getattr(cfg, "infonce_hold_loss1_share", False):
+        lines.append("loss1 (q1-r1) share HELD: loss1 is scaled by the mean gate of loss2..loss6")
+        lines.append("  every batch, so it keeps its epoch-1 share of the InfoNCE mass (1/6 with")
+        lines.append("  flat weights) instead of drifting ~17% -> ~36% as the crop and wedge narrow.")
+        lines.append("")
+    lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))
+    if cfg.fov_sampling.startswith("gaussian"):
+        lines.append("  fresh FoV per {} from N(mean, {}) clipped to [{}, 360],".format(
+            "BATCH" if cfg.fov_sampling == "gaussian_batch" else "SAMPLE",
+            cfg.fov_gaussian_std,
+            cfg.fov_gaussian_clip_lo if cfg.fov_gaussian_clip_lo is not None
+            else cfg.fov_curriculum_end))
+        if cfg.fov_gaussian_clip_lo is not None and cfg.fov_gaussian_clip_lo < cfg.fov_curriculum_end:
+            lines.append("  clip floor {} sits BELOW the mean endpoint {}, so the lower tail".format(
+                cfg.fov_gaussian_clip_lo, cfg.fov_curriculum_end))
+            lines.append("  survives instead of piling on one width.")
+        if cfg.fov_sampling == "gaussian_batch":
+            lines.append("  one draw per batch, so unpadded crops of equal width still collate.")
+        if cfg.fov_gaussian_ramp_frac >= 1.0:
+            lines.append("  with the mean walked linearly 360 -> {} deg across the whole run,".format(
+                cfg.fov_curriculum_end))
+            lines.append("  so it only reaches {} deg in the final epoch.".format(
+                cfg.fov_curriculum_end))
+        else:
+            lines.append("  with the mean walked linearly 360 -> {} deg over the first {:.0%}".format(
+                cfg.fov_curriculum_end, cfg.fov_gaussian_ramp_frac))
+            lines.append("  of the run (epoch {:.0f}), then held there for the rest.".format(
+                cfg.epochs * cfg.fov_gaussian_ramp_frac))
+        lines.append("  A narrow band that slides, not a widening support: an epoch trains on a")
+        lines.append("  tight range of widths instead of mixing 70 and 360 deg crops throughout.")
+    elif cfg.fov_sampling.startswith("loguniform"):
+        lines.append("  fresh FoV per {} from [floor, 360], floor ramping 360 -> {} deg".format(
+            "batch" if cfg.fov_sampling == "loguniform_batch" else "sample",
+            cfg.fov_curriculum_end))
+        lines.append("  over the first {:.0%} of the run, while the LR is still near its peak.".format(
+            cfg.fov_ramp_frac))
+        if cfg.fov_sampling == "loguniform_batch":
+            lines.append("  one draw per batch, so unpadded crops of equal width still collate.")
+    elif cfg.fov_schedule_lambda > 0:
+        lines.append("  one FoV per epoch, exponential fast-to-slow 360 -> {} deg across the run,".format(
+            cfg.fov_curriculum_end))
+        lines.append("  (1 - exp(-lam x)) / (1 - exp(-lam)) with lam = {}.".format(cfg.fov_schedule_lambda))
+        reached = lambda limit: next((e for e in range(1, cfg.epochs + 1)
+                                      if get_dynamic_fov(e, cfg.epochs, 360.0, cfg.fov_curriculum_end,
+                                                         lam=cfg.fov_schedule_lambda) <= limit), None)
+        lines.append("  at or below 180 deg from epoch {}, at or below 90 deg from epoch {}.".format(
+            reached(180.0), reached(90.0)))
+    else:
+        lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
+            cfg.fov_curriculum_end))
+    if getattr(cfg, "fov_full_pano_prob", 0.0) > 0.0:
+        lines.append("Full-panorama injection: p = {} of samples forced to EXACTLY 360 deg,".format(
+            cfg.fov_full_pano_prob))
+        lines.append("  a seamless roll -- the FoV-360 eval input, which the curriculum")
+        lines.append("  otherwise stops producing once the band settles.")
+        lines.append("  window: {}".format("every epoch" if cfg.fov_full_pano_epochs == 0
+                                           else "epochs 1-{} only".format(cfg.fov_full_pano_epochs)))
+    if getattr(cfg, "ground_roll_q1", False):
+        lines.append("q1 roll: full uniform roll of the panorama against the tile, every epoch.")
+    elif getattr(cfg, "ground_roll_q1_ramp_frac", 0.0) > 0.0:
+        lines.append("q1 roll: RAMPED, U(-A, +A) deg per sample, A linear 0 (epoch 1) -> 180 "
+                     "(epoch {:.0f}), then held.".format(cfg.epochs * cfg.ground_roll_q1_ramp_frac))
+    else:
+        lines.append("q1 roll: off, q1 stays aligned with the tile.")
+    lines.append("Mask fill: {}".format({
+        "mean": "mean colour (tensor zero after Normalize), the historical fill",
+        "black": "BLACK (pixel zero) for every mask: ground pad/border, wedge, rotation corners",
+    }.get(getattr(cfg, "mask_fill", "mean"), getattr(cfg, "mask_fill", "mean"))))
+    lines.append("DSS ranking FoV: {}".format(
+        "measured from the epoch's own crop extents, applied before calc_sim in the same epoch"
+        if getattr(cfg, "dss_fov_from_measured", False)
+        else "analytic representative (log-uniform geometric mean / Gaussian pre-clip mean)"))
+    if cfg.overlap_gated_infonce and cfg.overlap_gate_measure != "containment":
+        lines.append("InfoNCE gate measure: {} (every term weighted, not just loss6)".format(
+            cfg.overlap_gate_measure))
+    if cfg.conv_padding_mode != "zeros":
+        lines.append("Conv padding mode: {} (all 36 padding convs; stock is zeros)".format(
+            cfg.conv_padding_mode))
+    if cfg.fov_pad_batch_max:
+        lines.append("Ground padding: to the WIDEST crop in each batch, blank scattered in "
+                     "1-{} runs (inside the scene as well as at the ends)".format(
+                         cfg.fov_gap_segments))
+    if cfg.fov_border_px:
+        lines.append("Ground crop border: {} px of blank on each side, train and eval".format(
+            cfg.fov_border_px))
+        if cfg.fov_border_q1:
+            lines.append("  the full panorama q1 carries the same border")
+    lines.append("Ground padding (fov_pad): {}".format(
+        "ON  - crops keep the panorama's full width, dropped azimuths filled"
+        if cfg.fov_pad else "OFF - crops return a narrower tensor (stock SinGeo)"))
+    lines.append("Wedge apex: {}".format(
+        "panorama position in the tile (split offsets)" if cfg.aerial_wedge_apex == "ground"
+        else "tile centre (CVUSA geometry)"))
+    lines.append("Panorama column 0 bearing: {} deg".format(VIGOR_PANO_COL0_BEARING))
+    lines.append("")
+
+    lines.append("KEY HYPERPARAMETERS")
+    lines.append("-" * 70)
+    for name in ("epochs", "batch_size", "lr", "scheduler", "warmup_epochs",
+                 "label_smoothing", "prob_rotate", "prob_flip",
+                 "crop_dropout_strength", "grad_checkpointing", "seed"):
+        lines.append("  {:24s} {}".format(name, getattr(cfg, name)))
+    lines.append("  {:24s} {} (checkpoint metric) + extra {}".format(
+        "eval fov", cfg.fov, tuple(cfg.eval_fov_extra) or "none"))
+    lines.append("")
+
+    lines.append("ENVIRONMENT OVERRIDES")
+    lines.append("-" * 70)
+    if overrides:
+        for name, value in overrides:
+            lines.append("  SINGEO_{:24s} {!r}".format(name.upper(), value))
+    else:
+        lines.append("  none - every value is the file default")
+    lines.append("")
+
+    lines.append("BASELINES TO BEAT (VIGOR, R@1, unknown orientation)")
+    lines.append("-" * 70)
+    lines.append("  SinGeo, published, same-area   62.9 @ FoV 360 / 24.0 @ FoV 90")
+    lines.append("  SinGeo, published, cross-area  24.7 @ FoV 360 /  4.9 @ FoV 90")
+    lines.append("")
+    lines.append("Results: log.txt in this directory. Exact code: train.py, snapshotted here.")
+
+    with open(os.path.join(path, "info.txt"), "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+config = Configuration()
+env_overrides = apply_env_overrides(config)
 
 
 if __name__ == '__main__':
 
 
+    # SINGEO_RUN_NAME labels the output directory so an ablation grid is
+    # readable at a glance instead of being a list of timestamps.
+    run_name = os.environ.get("SINGEO_RUN_NAME", "")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     model_path = "{}/{}/{}".format(config.model_path,
-                                       config.model,
-                                       time.strftime("%H%M%S"))
+                                   config.model,
+                                   "{}_{}".format(run_name, stamp) if run_name else stamp)
 
     if not os.path.exists(model_path):
         os.makedirs(model_path)
-    shutil.copyfile(os.path.basename(__file__), "{}/train.py".format(model_path))
-
+    shutil.copyfile(os.path.abspath(__file__), "{}/train.py".format(model_path))
+    write_run_info(model_path, config, run_name,
+                   os.environ.get("SINGEO_RUN_NOTE", ""), env_overrides)
     # Redirect print to both console and log file
     sys.stdout = Logger(os.path.join(model_path, 'log.txt'))
+
+    if run_name:
+        print("Run: {}".format(run_name))
+    print("Output: {}".format(model_path))
+    if env_overrides:
+        print("Config overrides from environment:")
+        for name, value in env_overrides:
+            print("  {} = {!r}".format(name, value))
+    else:
+        print("Config overrides from environment: none")
+
+    collage = None
+    if config.input_collage_every and config.use_rnc:
+        # Epoch 1 as well as every Nth: the first epoch is when a geometry bug
+        # is most visible and least expensive to have found.
+        epochs = sorted({1} | set(range(config.input_collage_every,
+                                        config.epochs + 1, config.input_collage_every)))
+        collage = RnCSampleVisualizer(
+            model_path, mean=None, std=None,
+            num_samples=config.input_collage_samples, epochs=epochs,
+            positive_scale=config.rnc_positive_scale,
+            positive_overlap=config.rnc_positive_overlap)
+        print("Input collages -> {} at epochs {}".format(model_path, epochs))
+    elif config.input_collage_every:
+        print("Input collages: off (needs use_rnc=True for the crop windows)")
 
     setup_system(seed=config.seed,
                  cudnn_benchmark=config.cudnn_benchmark,
@@ -136,11 +1131,11 @@ if __name__ == '__main__':
         
     print("\nModel: {}".format(config.model))
 
-
+    # loading pretrained models.
     model = TimmModel_SinGeo(config.model,
-                          pretrained=True,
-                          img_size=config.img_size,
-                          random_fov=config.random_fov)
+                      pretrained=True,
+                      img_size=config.img_size,
+                      random_fov=config.random_fov)
                           
     data_config = model.get_config()
     print(data_config)
@@ -148,13 +1143,19 @@ if __name__ == '__main__':
     std = data_config["std"]
     img_size = config.img_size
     fov = config.fov # eval FoV
-
+    
     image_size_sat = (img_size, img_size)
-
-    new_width = img_size*2    
+    
+    # Upstream VIGOR ratio: 2048 x 1024 panoramas, so 384 x 768.
+    new_width = config.img_size * 2
     new_hight = int(((1024 - 2 * config.ground_cutting) / 2048) * new_width)
     img_size_ground = (new_hight, new_width)
     
+    if config.conv_padding_mode != "zeros":
+        changed = set_conv_padding_mode(model, config.conv_padding_mode)
+        print("Conv padding mode: {} applied to {} padding convolutions".format(
+            config.conv_padding_mode, changed))
+
     # Activate gradient checkpointing
     if config.grad_checkpointing:
         model.set_grad_checkpointing(True)
@@ -173,6 +1174,9 @@ if __name__ == '__main__':
     # Model to device   
     model = model.to(config.device)
 
+    if collage is not None:
+        collage.mean, collage.std = mean, std
+
     print("\nImage Size Sat:", image_size_sat)
     print("Image Size Ground:", img_size_ground)
     print("Mean: {}".format(mean))
@@ -183,13 +1187,15 @@ if __name__ == '__main__':
     # DataLoader                                                                  #
     #-----------------------------------------------------------------------------#
 
-    # Transforms
-    sat_transforms_train1, sat_transforms_train2, ground_transforms_train1, ground_transforms_train2 = get_transforms_train_singeo(
-        image_size_sat,
-        img_size_ground,
-        mean=mean,
-        std=std
-    )                            
+    # transformations for Training.
+    sat_transforms_train1, sat_transforms_train2, ground_transforms_train1, ground_transforms_train2 = get_transforms_train_singeo(image_size_sat,
+                                                                img_size_ground,
+                                                                mean=mean,
+                                                                std=std,
+                                                                fov_pad=config.fov_pad,
+                                                                ground_cutting=config.ground_cutting,
+                                                                )
+                                                                   
                                                                    
     # Train
     train_dataset = VigorDatasetTrainSinGeo(data_folder=config.data_folder ,
@@ -200,31 +1206,64 @@ if __name__ == '__main__':
                                       transforms_reference2=sat_transforms_train2,
                                       prob_flip=config.prob_flip,
                                       prob_rotate=config.prob_rotate,
-                                      shuffle_batch_size=config.batch_size
+                                      shuffle_batch_size=config.batch_size,
+                                      # With RNC on, the dataset also emits the crop
+                                      # windows it drew, so the distances can be labelled.
+                                      return_meta=config.use_rnc,
+                                      enable_aerial_crop=config.use_rnc and config.enable_aerial_crop,
                                       )
     
     
+    # Under RNC the FoV crop lives in the dataset (it has to record the arc it
+    # drew), so the padding switch is handed over here rather than baked into
+    # the transform pipeline.
+    train_dataset.fov_pad = config.fov_pad
+    train_dataset.fov_border_px = config.fov_border_px
+    train_dataset.fov_border_q1 = config.fov_border_q1
+    train_dataset.aerial_rotation = config.aerial_rotation
+    train_dataset.aerial_circular_mask = config.aerial_circular_mask
+    train_dataset.pad_random_start = config.fov_pad_random_start
+    train_dataset.roll_q1 = config.ground_roll_q1
+    train_dataset.return_aerial_mask = config.aerial_mask_mode != "off"
+    if config.aerial_wedge_apex not in ("ground", "centre"):
+        raise ValueError("aerial_wedge_apex must be 'ground' or 'centre', got {!r}".format(
+            config.aerial_wedge_apex))
+    train_dataset.wedge_apex = config.aerial_wedge_apex
+    # One fill for every mask (ground pad/border, wedge, rotation corners); the
+    # eval transforms below get the same `mask_fill`.
+    mask_fill = mask_fill_values(config.mask_fill, mean, std)
+    train_dataset.mask_fill = mask_fill
+
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=config.batch_size,
                                   num_workers=config.num_workers,
                                   shuffle=not config.custom_sampling,
-                                  pin_memory=True)
-    
-    
-    # Eval
+                                  pin_memory=True,
+                                  collate_fn=BatchMaxPadCollate(config.fov_gap_segments, fill=mask_fill)
+                                  if config.fov_pad_batch_max else None)
+
+
+    # transformations for Eval and Sim sampling.
     sat_transforms_val, ground_transforms_val = get_transforms_val(image_size_sat,
-                                                                   img_size_ground,
-                                                                   mean=mean,
-                                                                   std=std,
-                                                                   fov=fov,
-                                                                   ground_cutting=config.ground_cutting)
+                                                               img_size_ground,
+                                                               mean=mean,
+                                                               std=std,
+                                                               fov=fov,
+                                                               fov_pad=config.fov_pad,
+                                                               fov_pad_random_start=config.fov_pad_random_start,
+                                                               fov_border_px=config.fov_border_px,
+                                                               fov_scatter_pad=config.fov_pad_batch_max,
+                                                               fov_gap_segments=config.fov_gap_segments,
+                                                               mask_fill=config.mask_fill,
+                                                               ground_cutting=config.ground_cutting,
+                                                               )
 
 
-    # Reference Satellite Images Test
+    # Reference Satellite Images
     reference_dataset_test = VigorDatasetEval(data_folder=config.data_folder ,
                                               split="test",
                                               img_type="reference",
-                                              same_area=config.same_area,  
+                                              same_area=config.same_area,
                                               transforms=sat_transforms_val,
                                               )
     
@@ -233,14 +1272,44 @@ if __name__ == '__main__':
                                            num_workers=config.num_workers,
                                            shuffle=False,
                                            pin_memory=True)
-    
-    
+    # One query loader per extra FoV. Each gets its own crop seed so the FoVs
+    # do not all land on the same orientations, but the seed is fixed, so the
+    # same query set is scored at every evaluation.
+    query_dataloaders_extra = {}
+    for extra_idx, extra_fov in enumerate(config.eval_fov_extra):
+        _, ground_transforms_val_extra = get_transforms_val(image_size_sat,
+                                                           img_size_ground,
+                                                           mean=mean,
+                                                           std=std,
+                                                           fov=extra_fov,
+                                                           fov_pad=config.fov_pad,
+                                                           fov_pad_random_start=config.fov_pad_random_start,
+                                                           fov_border_px=config.fov_border_px,
+                                                           fov_scatter_pad=config.fov_pad_batch_max,
+                                                           fov_gap_segments=config.fov_gap_segments,
+                                                           mask_fill=config.mask_fill,
+                                                           ground_cutting=config.ground_cutting,
+                                                           )
+        query_dataset_test_extra = VigorDatasetEval(data_folder=config.data_folder ,
+                                          split="test",
+                                          img_type="query",
+                                          same_area=config.same_area,
+                                          transforms=ground_transforms_val_extra,
+                                          crop_seed=1000 + extra_idx,
+                                          )
+        query_dataloaders_extra[extra_fov] = DataLoader(query_dataset_test_extra,
+                                       batch_size=config.batch_size_eval,
+                                       num_workers=config.num_workers,
+                                       shuffle=False,
+                                       pin_memory=True)
+
+
     
     # Query Ground Images Test
     query_dataset_test = VigorDatasetEval(data_folder=config.data_folder ,
                                           split="test",
                                           img_type="query",
-                                          same_area=config.same_area,      
+                                          same_area=config.same_area,
                                           transforms=ground_transforms_val,
                                           )
     
@@ -251,30 +1320,51 @@ if __name__ == '__main__':
                                        pin_memory=True)
     
     
-    print("Query Images Test:", len(query_dataset_test))
     print("Reference Images Test:", len(reference_dataset_test))
+    print("Query Images Test:", len(query_dataset_test))
     
-
+    
     #-----------------------------------------------------------------------------#
     # GPS Sample                                                                  #
     #-----------------------------------------------------------------------------#
+    if config.gps_dict_path is None:
+        config.gps_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "VIGOR",
+                                            "gps_dict_{}.pkl".format("same" if config.same_area else "cross"))
     if config.gps_sample:
         with open(config.gps_dict_path, "rb") as f:
             sim_dict = pickle.load(f)
+        print("GPS sampling dict: {} ({} tiles)".format(config.gps_dict_path, len(sim_dict)))
     else:
         sim_dict = None
-    
+
+    # RNC negative tiering. VIGOR carries no satellite-embedding table and no
+    # coordinate CSV; the GPS ranks are the only geographic source. Positives-only
+    # scoping (every P round) never reads a tiering, so nothing is loaded then.
+    geo_ranks = None
+    geo_coords = None
+    sat_embeddings = None
+    effective_tiering_check = "none" if config.rnc_positives_only else config.negative_tiering
+    if config.use_rnc and effective_tiering_check == "embed":
+        raise ValueError("negative_tiering='embed' has no satellite-embedding table on VIGOR")
+    if config.use_rnc and effective_tiering_check == "geo":
+        if config.rnc_geo_source != "ranks":
+            raise ValueError("on VIGOR, negative_tiering='geo' needs rnc_geo_source='ranks', got {!r}"
+                             .format(config.rnc_geo_source))
+        with open(config.gps_dict_path, "rb") as f:
+            geo_ranks = GeoNeighbourRanks(pickle.load(f))
+        print("RNC geo tiering: loaded neighbour ranking from", config.gps_dict_path)
+
     #-----------------------------------------------------------------------------#
-    # Sim Sample + Eval on Train                                                  #
+    # Sim Sample                                                                  #
     #-----------------------------------------------------------------------------#
     
     if config.sim_sample:
-
+    
         # Query Ground Images Train for simsampling
         query_dataset_train = VigorDatasetEval(data_folder=config.data_folder ,
                                                split="train",
                                                img_type="query",
-                                               same_area=config.same_area,      
+                                               same_area=config.same_area,
                                                transforms=ground_transforms_val,
                                                )
             
@@ -284,11 +1374,11 @@ if __name__ == '__main__':
                                             shuffle=False,
                                             pin_memory=True)
         
-        # Reference Satellite Images Train for simsampling
+        
         reference_dataset_train = VigorDatasetEval(data_folder=config.data_folder ,
                                                    split="train",
                                                    img_type="reference",
-                                                   same_area=config.same_area,  
+                                                   same_area=config.same_area,
                                                    transforms=sat_transforms_val,
                                                    )
         
@@ -297,28 +1387,239 @@ if __name__ == '__main__':
                                                 num_workers=config.num_workers,
                                                 shuffle=False,
                                                 pin_memory=True)
-            
-      
-        print("\nQuery Images Train:", len(query_dataset_train))
-        print("Reference Images Train (unique):", len(reference_dataset_train))
-        
+
+
+        print("\nReference Images Train:", len(reference_dataset_train))
+        print("Query Images Train:", len(query_dataset_train))        
+
     
     #-----------------------------------------------------------------------------#
     # Loss                                                                        #
     #-----------------------------------------------------------------------------#
 
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
-    if config.loss_info:
-        print("Using InfoNCE Loss")
-        loss_function = InfoNCE(loss_function=loss_fn,
-                            device=config.device,
-                            )
-    if config.loss_care:
-        print("Using CARE Loss")
-        loss_function = CARE(loss_function=loss_fn,
+
+    print("Using InfoNCE Loss")
+    loss_function = InfoNCE(loss_function=loss_fn,
                         device=config.device,
-                        equiv_weight=0.01,
-                        num_equiv_chunks=8)
+                        gate_scales_terms=config.infonce_gate_scales_terms,
+                        )
+    if config.infonce_gate_scales_terms:
+        print("InfoNCE gate scales the terms: each term is normalised by the batch size, "
+              "not by the gate sum, so the overlap sets the between-term balance too")
+
+    rnc_loss = None
+    distance_builder = None
+    if config.use_rnc:
+        rnc_loss = RankNContrast(temperature=config.rnc_tau,
+                                 similarity=config.rnc_similarity,
+                                 exclude_ties=config.rnc_exclude_ties)
+        # With positives-only scoping the negative block is masked out of every
+        # rank set, so whatever tiering would have filled it is never read.
+        # Force the no-op source rather than letting a stale 'embed'/'geo'
+        # setting demand a table that was deliberately not loaded.
+        effective_tiering = "none" if config.rnc_positives_only else config.negative_tiering
+        distance_builder = RnCDistanceBuilder(positive_scale=config.rnc_positive_scale,
+                                              negative_tiering=effective_tiering,
+                                              negative_margin=config.rnc_negative_margin,
+                                              geo_ranks=geo_ranks,
+                                              geo_coords=geo_coords,
+                                              geo_max_km=config.rnc_geo_max_km,
+                                              positive_overlap=config.rnc_positive_overlap,
+                                              sat_embeddings=sat_embeddings)
+        print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
+            config.rnc_weight, config.rnc_tau, effective_tiering))
+        if config.rnc_positives_only:
+            if config.rnc_hardest_negative:
+                print("RNC scope: POSITIVES + HARDEST NEGATIVE - a location's own views plus the "
+                      "single most confusable negative per row, so the partial view must beat "
+                      "that negative while still ranking behind the full view. "
+                      "negative_tiering is unused (requested {!r}); g2g/a2a are NOT zero here, "
+                      "since each row keeps one negative".format(config.negative_tiering))
+            else:
+                print("RNC scope: POSITIVES ONLY - only views of the same location are ranked; "
+                      "negative pairs leave every rank set, negative_tiering is unused "
+                      "(requested {!r}), and the same-domain groups g2g/a2a are exactly 0 "
+                      "with two views per domain".format(config.negative_tiering))
+        else:
+            print("RNC scope: all pairs (positives ranked against negatives)")
+        print("RNC positive overlap:", config.rnc_positive_overlap)
+        print("RNC tie handling:", "ties excluded from rank sets"
+              if config.rnc_exclude_ties else "ties compete (original RnC)")
+        print("RNC group weights (g2a, g2g, a2g, a2a):", config.rnc_group_weights)
+        print("Aerial crop:", "enabled" if config.enable_aerial_crop else "disabled")
+
+    # The gate needs the recorded crop arcs, which only exist on the RNC path.
+    # Say so rather than reporting "on" for a run where it can never fire.
+    if not config.use_rnc:
+        print("InfoNCE overlap gating: n/a (no RNC -> no recorded arcs)")
+    elif config.overlap_gated_infonce:
+        print("InfoNCE overlap gating: on, measure {!r} ({})".format(
+            config.overlap_gate_measure,
+            "every term weighted by the share of the compass both views see"
+            if config.overlap_gate_measure == "circle"
+            else "1.0 for any pair with a full 360 deg side, so only loss6 is gated"))
+    else:
+        print("InfoNCE overlap gating: off")
+    if config.rnc_hardest_negative and not config.rnc_positives_only:
+        raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
+                         "every negative is already in the rank sets")
+
+    if config.infonce_hold_loss1_share:
+        if not (config.overlap_gated_infonce and config.infonce_gate_scales_terms
+                and config.overlap_gate_measure == "circle"):
+            raise ValueError(
+                "infonce_hold_loss1_share needs overlap_gated_infonce=True, "
+                "infonce_gate_scales_terms=True and overlap_gate_measure='circle': only then "
+                "does each term count at its mean gate, which is the share being held.")
+        if config.infonce_gate_normalise_mass:
+            raise ValueError("infonce_hold_loss1_share and infonce_gate_normalise_mass cannot be "
+                             "combined: the mass renormalisation assumes loss1 counts at 1.")
+    if config.infonce_gate_normalise_mass and not config.infonce_gate_scales_terms:
+        raise ValueError(
+            "infonce_gate_normalise_mass needs infonce_gate_scales_terms=True: without it the "
+            "gate is normalised away inside each term, so there is no gate mass to rescale.")
+    if config.infonce_gate_scales_terms:
+        if not config.overlap_gated_infonce:
+            raise ValueError("infonce_gate_scales_terms needs overlap_gated_infonce=True: with no "
+                             "gate there are no per-pair weights for the terms to be scaled by")
+        if config.overlap_gate_measure != "circle":
+            print("!! WARNING: infonce_gate_scales_terms with overlap_gate_measure="
+                  "{!r}. 'containment' is 1.0 for any pair with a full 360 deg side, so five of "
+                  "the six terms would scale by 1.0 and no hierarchy can appear. Use 'circle'."
+                  .format(config.overlap_gate_measure))
+        if tuple(config.infonce_term_weights) != (1.0,) * 6:
+            print("!! WARNING: infonce_gate_scales_terms is on but infonce_term_weights is {}. "
+                  "The geometry and the hand-set hierarchy will both be applied, multiplying "
+                  "together. Set all six to 1.0 to let the gate alone set the balance."
+                  .format(config.infonce_term_weights))
+
+    if config.fov_border_q1 and not config.fov_border_px:
+        raise ValueError("fov_border_q1 needs fov_border_px > 0: there is no border to add")
+
+    if not 0.0 <= config.ground_roll_q1_ramp_frac <= 1.0:
+        raise ValueError("ground_roll_q1_ramp_frac must be in [0, 1] (a fraction of the run), "
+                         "got {}".format(config.ground_roll_q1_ramp_frac))
+    if config.ground_roll_q1_ramp_frac > 0 and config.ground_roll_q1:
+        raise ValueError("ground_roll_q1_ramp_frac excludes ground_roll_q1: the ramp IS the "
+                         "q1 roll, reaching the full uniform roll at its end")
+
+    if config.overlap_gate_measure not in ("containment", "circle", "iou"):
+        raise ValueError("overlap_gate_measure must be 'containment', 'circle' or 'iou', got "
+                         "{!r}".format(config.overlap_gate_measure))
+
+    if config.conv_padding_mode not in PADDING_MODES:
+        raise ValueError("conv_padding_mode must be one of {}, got {!r}".format(
+            PADDING_MODES, config.conv_padding_mode))
+
+    if config.fov_pad_batch_max:
+        if config.fov_pad or config.fov_border_px:
+            raise ValueError("fov_pad_batch_max excludes fov_pad and fov_border_px: all three "
+                             "decide what surrounds the crop")
+        if config.fov_sampling != "loguniform":
+            raise ValueError(
+                "fov_pad_batch_max needs fov_sampling='loguniform' (per sample). With one FoV per "
+                "batch every crop is already the same width, so there is nothing to pad to.")
+        if config.fov_gap_segments < 1:
+            raise ValueError("fov_gap_segments must be >= 1, got {}".format(config.fov_gap_segments))
+
+    if config.fov_border_px < 0:
+        raise ValueError("fov_border_px must be >= 0, got {}".format(config.fov_border_px))
+    if config.fov_border_px and config.fov_pad:
+        raise ValueError(
+            "fov_border_px={} with fov_pad=True: they are alternatives. Padding already fills the "
+            "crop out to the panorama width, so a border adds nothing.".format(config.fov_border_px))
+
+    if config.mask_fill not in MASK_FILL_MODES:
+        raise ValueError("mask_fill must be one of {}, got {!r}".format(MASK_FILL_MODES,
+                                                                          config.mask_fill))
+    if config.mask_fill != "mean" and not config.use_rnc:
+        raise ValueError(
+            "mask_fill={!r} is applied by the RNC dataset path (the training crop and wedge "
+            "live there); without use_rnc the training transforms would still pad with the "
+            "mean colour while evaluation used the new fill.".format(config.mask_fill))
+    print("Mask fill: {}".format(
+        "mean colour (tensor zero, historical)" if config.mask_fill == "mean"
+        else "{} -- tensor value {}".format(config.mask_fill, tuple(
+            round(v, 3) for v in mask_fill_values(config.mask_fill, mean, std)))))
+
+    if config.aerial_rotation not in ("continuous", "discrete", "quarter"):
+        raise ValueError("aerial_rotation must be 'continuous', 'discrete' or 'quarter', "
+                         "got {!r}".format(config.aerial_rotation))
+    if config.aerial_rotation != "continuous" and not config.use_rnc:
+        raise ValueError(
+            "aerial_rotation={!r} is applied in the dataset, which only runs when use_rnc=True "
+            "(return_meta). Use 'continuous' without RNC.".format(config.aerial_rotation))
+    if config.aerial_mask_mode not in ("off", "pool", "gated"):
+        raise ValueError("aerial_mask_mode must be 'off', 'pool' or 'gated', got {!r}".format(
+            config.aerial_mask_mode))
+    if config.aerial_mask_mode != "off":
+        if not (config.use_rnc and config.enable_aerial_crop):
+            raise ValueError("aerial_mask_mode={!r} needs the aerial wedge "
+                             "(use_rnc=True and enable_aerial_crop=True)".format(config.aerial_mask_mode))
+        if config.grad_checkpointing:
+            raise ValueError("aerial_mask_mode={!r} is incompatible with grad_checkpointing".format(
+                config.aerial_mask_mode))
+    print("Aerial mask mode: {}".format({
+        "off": "off (stock encoder)",
+        "pool": "pool (masked global pool on the wedged view)",
+        "gated": "gated (spatial convs gated + masked pool on the wedged view)",
+    }[config.aerial_mask_mode]))
+    print("Ground FoV sampling: {} (curriculum end {:.1f} deg{})".format(
+        config.fov_sampling, config.fov_curriculum_end,
+        ", ramp {:.0%} of run".format(config.fov_ramp_frac)
+        if config.fov_sampling.startswith("loguniform") else ""))
+    if not config.fov_pad_random_start and not config.use_rnc:
+        # get_transforms_train_singeo_rot does the crop on the no-RNC path and
+        # does not take pad_random_start, so training would keep the random
+        # offset while evaluation used the fixed one. Refuse rather than desync.
+        raise ValueError(
+            "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
+            "on the dataset path, which return_meta enables).")
+
+    if config.fov_schedule_lambda < 0:
+        raise ValueError("fov_schedule_lambda must be >= 0 (0 = linear), got {}".format(
+            config.fov_schedule_lambda))
+    if config.fov_schedule_lambda and config.fov_sampling != "deterministic":
+        raise ValueError("fov_schedule_lambda shapes the 'deterministic' schedule only; it would be "
+                         "inert under fov_sampling={!r}".format(config.fov_sampling))
+    if config.fov_sampling not in ("loguniform", "loguniform_batch", "gaussian",
+                                   "gaussian_batch", "deterministic"):
+        raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch', 'gaussian', "
+                         "'gaussian_batch' or 'deterministic', got {!r}".format(config.fov_sampling))
+    if config.fov_sampling.startswith("gaussian"):
+        if config.fov_sampling == "gaussian" and not (config.fov_pad or config.fov_pad_batch_max):
+            raise ValueError(
+                "fov_sampling='gaussian' needs fov_pad=True: the draw is per sample, so crop "
+                "widths differ inside a batch and default_collate cannot stack them. Use "
+                "'gaussian_batch' to run a Gaussian band unpadded, e.g. under a border.")
+        if not config.use_rnc:
+            raise ValueError(
+                "fov_sampling='gaussian' needs use_rnc=True (the per-sample draw lives in "
+                "VigorDatasetTrainSinGeo, which only crops when return_meta is on).")
+        if config.fov_gaussian_std <= 0:
+            raise ValueError("fov_gaussian_std must be > 0, got {}".format(config.fov_gaussian_std))
+        if config.fov_gaussian_ramp_frac > 1.0:
+            raise ValueError(
+                "fov_gaussian_ramp_frac must be <= 1.0 (a fraction of the run), got {}. "
+                "1.0 descends across every epoch; <= 0 starts at fov_curriculum_end."
+                .format(config.fov_gaussian_ramp_frac))
+    if config.fov_sampling == "loguniform" and not (config.fov_pad or config.fov_pad_batch_max):
+        raise ValueError(
+            "fov_sampling='loguniform' needs fov_pad=True: per-sample draws give each sample a "
+            "different crop width and default_collate cannot stack them. Use "
+            "'loguniform_batch' to run log-uniform unpadded.")
+    if config.fov_sampling.startswith("loguniform") and not config.use_rnc:
+        # The per-sample draw lives in the dataset, which only crops when it is
+        # recording arcs for RNC. Without RNC the crop stays in the transform
+        # pipeline, where LimitedFoVPad takes one fixed FoV per epoch. Say so
+        # rather than silently running the deterministic schedule.
+        raise ValueError(
+            "fov_sampling='loguniform' needs use_rnc=True (the per-sample draw lives in "
+            "VigorDatasetTrainSinGeo, which only crops when return_meta is on). "
+            "Set fov_sampling='deterministic' for a no-RNC run.")
+    print("Eval FoV: {} (checkpoint metric) + extra {}".format(
+        config.fov, tuple(config.eval_fov_extra) or "none"))
 
     if config.mixed_precision:
         scaler = GradScaler(init_scale=2.**10)
@@ -355,11 +1656,14 @@ if __name__ == '__main__':
     warmup_steps = len(train_dataloader) * config.warmup_epochs
        
     if config.scheduler == "polynomial":
-        print("\nScheduler: polynomial - max LR: {} - end LR: {}".format(config.lr, config.lr_end))  
+        print("\nScheduler: polynomial - max LR: {} - end LR: {} - power: {}".format(
+            config.lr, config.lr_end, config.poly_power))
+        if config.lr_end >= config.lr:
+            print("  WARNING: lr_end >= lr, so this schedule is CONSTANT at {}".format(config.lr))
         scheduler = get_polynomial_decay_schedule_with_warmup(optimizer,
                                                               num_training_steps=train_steps,
                                                               lr_end = config.lr_end,
-                                                              power=1.5,
+                                                              power=config.poly_power,
                                                               num_warmup_steps=warmup_steps)
         
     elif config.scheduler == "cosine":
@@ -378,6 +1682,15 @@ if __name__ == '__main__':
         
     print("Warmup Epochs: {} - Warmup Steps: {}".format(str(config.warmup_epochs).ljust(2), warmup_steps))
     print("Train Epochs:  {} - Train Steps:  {}".format(config.epochs, train_steps))
+
+    # Resume: advance the scheduler to the step the original run had reached, so
+    # the LR continues the same cosine curve instead of restarting at warmup.
+    if config.start_epoch > 1 and scheduler is not None:
+        skip = (config.start_epoch - 1) * len(train_dataloader)
+        for _ in range(skip):
+            scheduler.step()
+        print("Resuming at epoch {}: fast-forwarded scheduler {} steps, LR now {:.3e}".format(
+            config.start_epoch, skip, optimizer.param_groups[0]["lr"]))
         
         
     #-----------------------------------------------------------------------------#
@@ -386,13 +1699,16 @@ if __name__ == '__main__':
     if config.zero_shot:
         print("\n{}[{}]{}".format(30*"-", "Zero Shot", 30*"-"))  
 
-        r1_test = evaluate(config=config,
-                           model=model,
-                           reference_dataloader=reference_dataloader_test,
-                           query_dataloader=query_dataloader_test, 
-                           ranks=[1, 5, 10],
-                           step_size=1000,
-                           cleanup=True)
+      
+        # Every eval FoV, through the same call the epoch evals use.
+        zero_shot_loaders = {"main": query_dataloader_test}
+        zero_shot_loaders.update(query_dataloaders_extra)
+        r1_test = evaluate_fovs(config=config,
+                                model=model,
+                                reference_dataloader=reference_dataloader_test,
+                                query_dataloaders=zero_shot_loaders,
+                                ranks=[1, 5, 10],
+                                step_size=1000)["main"]
         
         if config.sim_sample:
             r1_train, sim_dict = calc_sim(config=config,
@@ -402,7 +1718,43 @@ if __name__ == '__main__':
                                           ranks=[1, 5, 10],
                                           step_size=1000,
                                           cleanup=True)
-        
+                
+    #-----------------------------------------------------------------------------#
+    # Resume: rebuild the DSS similarity dict before the first shuffle            #
+    #-----------------------------------------------------------------------------#
+    # The only other pre-loop calc_sim sits inside the zero_shot block, so a
+    # resumed run would otherwise start with sim_dict None and get RANDOM batches
+    # for every epoch until the next eval rebuilt it -- four epochs of easier
+    # negatives than the interrupted run had. One similarity pass over the train
+    # set from the loaded checkpoint restores the composition.
+    # Fires whenever we resume, regardless of what sim_dict currently holds: with
+    # gps_sample on it holds the GEOGRAPHIC neighbour dict, which is SinGeo's
+    # cold-start composition, not the model-similarity ranking the interrupted
+    # run had built from its last eval.
+    if config.start_epoch > 1 and config.sim_sample:
+        dss_fov = config.resume_dss_fov if config.resume_dss_fov else config.fov
+        _, ground_transforms_resume = get_transforms_val(
+            image_size_sat, img_size_ground, mean=mean, std=std,
+            fov=dss_fov,
+            fov_pad=config.fov_pad,
+            fov_pad_random_start=config.fov_pad_random_start,
+            fov_border_px=config.fov_border_px,
+            fov_scatter_pad=config.fov_pad_batch_max,
+            fov_gap_segments=config.fov_gap_segments,
+            mask_fill=config.mask_fill,
+            ground_cutting=config.ground_cutting,
+        )
+        query_dataloader_train.dataset.transforms = ground_transforms_resume
+        print("\nResume DSS: sim-sampling crop aimed at {:.2f} deg, building "
+              "sim_dict before epoch {}".format(dss_fov, config.start_epoch))
+        r1_train, sim_dict = calc_sim(config=config,
+                                      model=model,
+                                      reference_dataloader=reference_dataloader_train,
+                                      query_dataloader=query_dataloader_train,
+                                      ranks=[1, 5, 10],
+                                      step_size=1000,
+                                      cleanup=True)
+
     #-----------------------------------------------------------------------------#
     # Shuffle                                                                     #
     #-----------------------------------------------------------------------------#            
@@ -415,44 +1767,203 @@ if __name__ == '__main__':
     # Train                                                                       #
     #-----------------------------------------------------------------------------#
     best_score = 0
-    
 
-    for epoch in range(1, config.epochs+1):
+    for epoch in range(config.start_epoch, config.epochs+1):
         
         # modulate the ratation prob of the satellite branch
-        rotate_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25)
-        sat_transforms_dynamic = build_satellite_dynamic_transforms(image_size_sat, mean, std, rotate_prob)
+        dataset_rotates_r2 = config.use_rnc and config.aerial_rotation != "continuous"
+        if (config.use_rnc and config.enable_aerial_crop) or dataset_rotates_r2:
+            # The aerial sector crop applies its own rotation with a recorded
+            # angle, so the albumentations +-90 rotation is switched off here
+            # (keep_prob=1.0) rather than stacking two unrelated rotations. In
+            # "discrete" mode the same +-90 schedule moves into the dataset,
+            # where the angle is known and the sector is placed consistently.
+            rotate_prob = 1.0
+            wedge_keep_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25)
+            train_dataloader.dataset.aerial_rotate_keep_prob = wedge_keep_prob
+            if config.aerial_rotation == "discrete":
+                print(f"For Epoch {epoch}: Aerial wedge rotation = discrete +-90, "
+                      f"keep_prob = {wedge_keep_prob:.4f}, disc mask = {config.aerial_circular_mask}")
+        else:
+            rotate_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25) # the prob not to rotate
+        sat_transforms_dynamic = build_satellite_dynamic_transforms(
+            image_size_sat, mean, std, rotate_prob,
+            dropout_strength=config.crop_dropout_strength)
         train_dataloader.dataset.transforms_reference2 = sat_transforms_dynamic
         print(f"For Epoch {epoch}: Satellite rotation keep_prob = {rotate_prob:.4f}")
 
         # modulate the fov of the ground branch
-        fov_dynamic = get_dynamic_fov(epoch, config.epochs, fov_start=360, fov_end=70)
+        #
+        # "loguniform" hands the dataset a *floor* and lets it draw a fresh FoV
+        # per sample from [floor, 360]; `fov_dynamic` is then only the
+        # representative value used for the sim-sampling loader (which needs one
+        # fixed FoV to rank with) and for logging. The geometric mean of the
+        # draw is the honest representative, so use that.
+        fov_mean = None
+        # Delay the narrowing so a full-panorama warm-up hands over smoothly: the
+        # schedule is evaluated at `epoch - delay`, held at 0 during the warm-up,
+        # so the ramp starts where the warm-up ends instead of having advanced
+        # underneath it. Duration is unchanged -- still ramp_frac * epochs.
+        ramp_epoch = max(0, epoch - config.fov_ramp_delay_epochs)
+
+        if config.fov_sampling.startswith("gaussian"):
+            # The band centre. `fov_dynamic` is the representative the
+            # sim-sampling loader and the logs need, and for a symmetric draw
+            # the mean is that representative -- clipped, since the loader
+            # cannot be handed a FoV outside the legal range.
+            fov_mean = get_gaussian_fov_mean(ramp_epoch, config.epochs,
+                                             fov_start=360.0,
+                                             fov_end=config.fov_curriculum_end,
+                                             ramp_frac=config.fov_gaussian_ramp_frac)
+            fov_floor = None
+            fov_dynamic = min(360.0, max(config.fov_curriculum_end, fov_mean))
+        elif config.fov_sampling.startswith("loguniform"):
+            fov_floor = get_dynamic_fov_floor(ramp_epoch, config.epochs,
+                                              fov_start=360.0,
+                                              fov_end=config.fov_curriculum_end,
+                                              ramp_frac=config.fov_ramp_frac)
+            fov_dynamic = math.sqrt(fov_floor * 360.0)
+        else:
+            fov_floor = None
+            fov_dynamic = get_dynamic_fov(epoch, config.epochs,
+                                          fov_start=360,
+                                          fov_end=config.fov_curriculum_end,
+                                          lam=config.fov_schedule_lambda)
+        # With RNC the crop moves into the dataset (which records its window),
+        # so the transform pipeline is built without one.
+        fov_for_transform = 0.0 if config.use_rnc else fov_dynamic
         _, _, _, ground_transforms_dynamic = get_transforms_train_singeo_rot(image_size_sat,
                                                                 img_size_ground,
                                                                 mean=mean,
                                                                 std=std,
-                                                                fov=fov_dynamic)
-        
+                                                                fov=fov_for_transform,
+                                                                con_dropout_strength=config.crop_dropout_strength,
+                                                                fov_pad=config.fov_pad,
+                                                                ground_cutting=config.ground_cutting)
+
+        # modulate the Fov of sim-sampling at the same time
         _, ground_transforms_dynamic_for_simsample = get_transforms_val(image_size_sat,
                                                         img_size_ground,
                                                         mean=mean,
                                                         std=std,
                                                         fov=fov_dynamic,
+                                                        fov_pad=config.fov_pad,
+                                                        fov_pad_random_start=config.fov_pad_random_start,
+                                                        fov_border_px=config.fov_border_px,
+                                                        fov_scatter_pad=config.fov_pad_batch_max,
+                                                        fov_gap_segments=config.fov_gap_segments,
+                                                        mask_fill=config.mask_fill,
+                                                        ground_cutting=config.ground_cutting,
                                                         )
-        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample # Important! This line means we change the Fov of sim-sampling at the same time!
+        query_dataloader_train.dataset.transforms = ground_transforms_dynamic_for_simsample
         train_dataloader.dataset.transforms_query2 = ground_transforms_dynamic
-        print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}")
+
+        if config.ground_roll_q1_ramp_frac > 0:
+            q1_roll_max = get_q1_roll_max(epoch, config.epochs,
+                                          ramp_frac=config.ground_roll_q1_ramp_frac)
+            train_dataloader.dataset.roll_q1_max_deg = q1_roll_max
+            print(f"For Epoch {epoch}: q1 roll ~ U(-{q1_roll_max:.2f}, +{q1_roll_max:.2f}) deg")
+        
+        if fov_mean is not None:
+            settled = "" if config.fov_gaussian_ramp_frac >= 1.0 else (
+                ", mean settles at e{:.0f}".format(config.epochs * config.fov_gaussian_ramp_frac))
+            print(f"For Epoch {epoch}: Ground FOV ~ N({fov_mean:.2f}, {config.fov_gaussian_std:.1f}) "
+                  f"clipped to [{(config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None else config.fov_curriculum_end):.0f}, 360]{settled}"
+                  f"{', padded to full width' if config.fov_pad else ''}")
+        elif fov_floor is None:
+            print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
+                  f"{' (padded to full width)' if config.fov_pad else ''}")
+        else:
+            print(f"For Epoch {epoch}: Ground FOV ~ logU[{fov_floor:.4f}, 360] "
+                  f"(geo-mean {fov_dynamic:.4f})"
+                  f"{', padded to full width' if config.fov_pad else ''}")
+
+        if config.use_rnc:
+            # Hand the curriculum state to the dataset, which now performs the
+            # crops itself. The aerial sector reuses the same easy-to-hard
+            # schedulers as the ground branch rather than introducing new ones.
+            train_dataloader.dataset.ground_fov = fov_dynamic
+            train_dataloader.dataset.ground_fov_floor = fov_floor
+            # Per-batch mode needs the batch width and the epoch so the draw is
+            # reproducible from the batch index in every worker.
+            train_dataloader.dataset.fov_batch_size = (
+                config.batch_size
+                if config.fov_sampling in ("loguniform_batch", "gaussian_batch") else None)
+            train_dataloader.dataset.fov_epoch = epoch
+            # Gaussian band. `None` outside that mode, which keeps the
+            # log-uniform path in the dataset untouched.
+            train_dataloader.dataset.ground_fov_mean = fov_mean
+            train_dataloader.dataset.ground_fov_std = config.fov_gaussian_std
+            train_dataloader.dataset.fov_lo = (
+                config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None
+                else config.fov_curriculum_end)
+            train_dataloader.dataset.fov_hi = 360.0
+            # Full-panorama injection: the window is applied here, so the dataset
+            # only ever sees the probability that applies to THIS epoch.
+            in_window = (config.fov_full_pano_epochs == 0
+                         or epoch <= config.fov_full_pano_epochs)
+            full_pano_p = config.fov_full_pano_prob if in_window else 0.0
+            train_dataloader.dataset.fov_full_pano_prob = full_pano_p
+            if config.fov_full_pano_prob > 0.0:
+                print("For Epoch {}: full-panorama injection p = {:.2f}{}".format(
+                    epoch, full_pano_p,
+                    "" if config.fov_full_pano_epochs == 0
+                    else " (window: epochs 1-{})".format(config.fov_full_pano_epochs)))
+            train_dataloader.dataset.fov_border_px = config.fov_border_px
+            train_dataloader.dataset.fov_border_q1 = config.fov_border_q1
+
+            if config.enable_aerial_crop:
+                # `aerial_ramp_frac < 1` compresses both aerial schedules into
+                # the first fraction of the run, so the hardest wedge geometry
+                # is reached while the learning rate is still high. At 1.0 they
+                # ramp linearly across the whole run, which is the original
+                # behaviour -- and the same anti-alignment the ground FoV
+                # curriculum had: run round1a reached its narrowest sector and
+                # widest drift at epochs 75-80, where the cosine LR is ~1e-6,
+                # and was still gaining +3.4 R@1 at FoV 360 per eval when the
+                # schedule ran out.
+                ramp = max(1e-6, config.aerial_ramp_frac)
+                aerial_progress = min(1.0, epoch / (config.epochs * ramp))
+                aerial_epoch = aerial_progress * config.epochs
+
+                sat_arc_dynamic = get_dynamic_fov(aerial_epoch, config.epochs,
+                                                  fov_start=config.aerial_arc_start,
+                                                  fov_end=config.aerial_arc_end)
+                sat_rot_max = get_dynamic_rotation_angle(aerial_epoch, config.epochs,
+                                                         min_angle=0.0,
+                                                         max_angle=config.aerial_rot_max)
+                train_dataloader.dataset.sat_arc = sat_arc_dynamic
+                train_dataloader.dataset.sat_rot_max = sat_rot_max
+                print(f"For Epoch {epoch}: Aerial sector = {sat_arc_dynamic:.4f}, "
+                      f"max rotation = {sat_rot_max:.4f}")
+
+        # After the epoch's curriculum state is set, so the collage shows exactly
+        # what this epoch will train on.
+        if collage is not None:
+            collage.capture(train_dataloader.dataset, epoch)
 
         print("\n{}[Epoch: {}]{}".format(30*"-", epoch, 30*"-"))
 
-        train_loss = train_contrast_singeo(config,
-                        model,
-                        dataloader=train_dataloader,
-                        loss_function=loss_function,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        scaler=scaler)
 
+        if config.use_rnc:
+            train_loss = train_contrast_singeo_rnc(config,
+                            model,
+                            dataloader=train_dataloader,
+                            loss_function=loss_function,
+                            optimizer=optimizer,
+                            rnc_loss=rnc_loss,
+                            distance_builder=distance_builder,
+                            scheduler=scheduler,
+                            scaler=scaler)
+        else:
+            train_loss = train_contrast_singeo(config,
+                            model,
+                            dataloader=train_dataloader,
+                            loss_function=loss_function,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler)
+        
         print("Epoch: {}, Train Loss = {:.3f}, Lr = {:.6f}".format(epoch,
                                                                    train_loss,
                                                                    optimizer.param_groups[0]['lr']))
@@ -462,23 +1973,48 @@ if __name__ == '__main__':
         
             print("\n{}[{}]{}".format(30*"-", "Evaluate", 30*"-"))
         
-            r1_test = evaluate(config=config,
-                               model=model,
-                               reference_dataloader=reference_dataloader_test,
-                               query_dataloader=query_dataloader_test, 
-                               ranks=[1, 5, 10],
-                               step_size=1000,
-                               cleanup=True)
-            
-            # update similiarity sampling dict at the same time.
+            # One gallery encode for every FoV. The checkpoint FoV is scored
+            # first; each extra prints its 'Extra eval with FoV' line as on CVUSA.
+            loaders = {"main": query_dataloader_test}
+            loaders.update(query_dataloaders_extra)
+            scores = evaluate_fovs(config=config,
+                                   model=model,
+                                   reference_dataloader=reference_dataloader_test,
+                                   query_dataloaders=loaders,
+                                   ranks=[1, 5, 10],
+                                   step_size=1000)
+            r1_test = scores.pop("main")
+            # after we evaluate, we update the similiarity sampling dictionary for training the dataset.
             if config.sim_sample:
-                r1_train, sim_dict = calc_sim(config=config,
+                # Re-aim the sim-sampling crop at the FoV this epoch really
+                # trained on. The transform set before training used an analytic
+                # representative; the trainer has since published the measured
+                # mean, and calc_sim has not run yet, so applying it here costs
+                # no epoch of lag.
+                measured = getattr(train_dataloader.dataset, "measured_ground_fov", None)
+                if config.dss_fov_from_measured and measured:
+                    _, ground_transforms_measured = get_transforms_val(
+                        image_size_sat, img_size_ground, mean=mean, std=std,
+                        fov=measured,
+                        fov_pad=config.fov_pad,
+                        fov_pad_random_start=config.fov_pad_random_start,
+                        fov_border_px=config.fov_border_px,
+                        fov_scatter_pad=config.fov_pad_batch_max,
+                        fov_gap_segments=config.fov_gap_segments,
+                        mask_fill=config.mask_fill,
+                        ground_cutting=config.ground_cutting,
+                    )
+                    query_dataloader_train.dataset.transforms = ground_transforms_measured
+                    print("DSS FoV: measured {:.2f} deg this epoch "
+                          "(analytic representative was {:.2f})".format(measured, fov_dynamic))
+                r1_train, sim_dict = calc_sim(config=config, # Update the sim_dict when training with dynamic_fov
                                               model=model,
                                               reference_dataloader=reference_dataloader_train,
                                               query_dataloader=query_dataloader_train, 
                                               ranks=[1, 5, 10],
                                               step_size=1000,
                                               cleanup=True)
+                
             if r1_test > best_score:
 
                 best_score = r1_test
@@ -487,7 +2023,7 @@ if __name__ == '__main__':
                     torch.save(model.module.state_dict(), '{}/weights_e{}_{:.4f}.pth'.format(model_path, epoch, r1_test))
                 else:
                     torch.save(model.state_dict(), '{}/weights_e{}_{:.4f}.pth'.format(model_path, epoch, r1_test))
-                
+
 
         if config.custom_sampling:
             train_dataloader.dataset.shuffle(sim_dict,
@@ -498,10 +2034,3 @@ if __name__ == '__main__':
         torch.save(model.module.state_dict(), '{}/weights_end.pth'.format(model_path))
     else:
         torch.save(model.state_dict(), '{}/weights_end.pth'.format(model_path))            
-                
-
-
-
-
-
-                

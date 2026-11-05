@@ -10,7 +10,7 @@ import time
 
 from singeo.distances import META_DIM, M_GROUND_CENTER, M_GROUND_EXTENT, M_SAT_CENTER, M_SAT_EXTENT
 from singeo.transforms import (apply_limited_fov, apply_aerial_sector, draw_log_uniform_fov,
-                               draw_gaussian_fov,
+                               draw_gaussian_fov, ProcessLocalRNG, roll_panorama,
                                draw_discrete_aerial_rotation, draw_quarter_rotation,
                                scatter_blank_columns, add_blank_border)
 from torch.utils.data._utils.collate import default_collate
@@ -452,15 +452,16 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # rather than a widening support, so an epoch trains on a tight range of
         # widths. Takes precedence over the log-uniform path when set.
         #
-        # The Generator is built lazily in __getitem__, never here: this object
-        # is created in the parent process and forked into every dataloader
-        # worker, so a Generator made now would be copied and all workers would
-        # draw the same sequence.
+        # This object is created in the parent and forked into every dataloader
+        # worker, so the per-sample FoV Generator is keyed to the process: a
+        # plain Generator made in the parent (here, or by the input collage
+        # calling dataset[i]) would be copied and all workers would draw the
+        # same sequence.
         self.ground_fov_mean = None
         self.ground_fov_std = 20.0
         self.fov_lo = 70.0
         self.fov_hi = 360.0
-        self._fov_rng = None
+        self._fov_rng = ProcessLocalRNG()
         # Probability that a sample's FoV is overridden to exactly 360, giving a
         # seamless rolled panorama. The trainer sets this per epoch, so a window
         # (warm-up) and a constant rate (injection) are both expressible.
@@ -519,6 +520,9 @@ class CVUSADatasetTrainSinGeo(Dataset):
         # Give the full panorama its own uniform roll, independent of the
         # paired rotate below. Off by default; see __getitem__ for why.
         self.roll_q1 = False
+        # Ramped version of the same roll: q1 is rolled by U(-A, +A) degrees with
+        # A = this value, which the trainer raises each epoch. 0 means no roll.
+        self.roll_q1_max_deg = 0.0
 
         # Per-channel tensor value for every blank region this dataset writes:
         # the ground crop's padding or border, the panorama border, the aerial
@@ -605,10 +609,9 @@ class CVUSADatasetTrainSinGeo(Dataset):
                                             lo=self.fov_lo, hi=self.fov_hi,
                                             rng=np.random.default_rng(seed))
                 else:
-                    if self._fov_rng is None:
-                        self._fov_rng = np.random.default_rng()
                     fov = draw_gaussian_fov(self.ground_fov_mean, self.ground_fov_std,
-                                            lo=self.fov_lo, hi=self.fov_hi, rng=self._fov_rng)
+                                            lo=self.fov_lo, hi=self.fov_hi,
+                                            rng=self._fov_rng.get())
             elif self.ground_fov_floor is None:
                 fov = self.ground_fov
             elif self.fov_batch_size:
@@ -762,6 +765,10 @@ class CVUSADatasetTrainSinGeo(Dataset):
         if self.roll_q1:
             width = query_img1.shape[2]
             query_img1 = torch.roll(query_img1, shifts=random.randint(0, width - 1), dims=2)
+        elif self.roll_q1_max_deg > 0:
+            # Same roll, bounded: U(-A, +A) degrees, A ramped by the trainer from 0
+            # (q1 aligned with the tile) to 180 (the full roll above).
+            query_img1 = roll_panorama(query_img1, self.roll_q1_max_deg)
 
         # Last, so every roll above acts on the bare panorama.
         if self.fov_border_q1 and self.fov_border_px:

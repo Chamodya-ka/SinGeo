@@ -129,9 +129,16 @@ class Configuration:
     overlap_gated_infonce: bool = True
 
     # "loguniform" | "loguniform_batch" | "gaussian" | "gaussian_batch" | "deterministic"
+    # | "uniform" (per sample, a random whole degree in fov_curriculum_end..360, no curriculum)
     fov_sampling: str = "loguniform"
     fov_curriculum_end: float = 70.0   # narrowest FoV the curriculum reaches
     fov_ramp_frac: float = 0.2         # fraction of the run spent lowering the floor
+    # Shape of the "deterministic" schedule. 0 = the original SinGeo linear walk;
+    # > 0 = exponential fast-to-slow, (1 - exp(-lam x)) / (1 - exp(-lam)) with
+    # x = epoch / epochs: lam = 5 over 360 -> 70 is at or below 180 from epoch 16
+    # and at or below 90 from epoch 42 (linear: 50 and 75). See get_dynamic_fov.
+    # The other sampling modes refuse it at startup rather than ignore it.
+    fov_schedule_lambda: float = 0.0
 
     # Gaussian FoV band, ported from train_singeo_cvusa.py (same fields, same
     # defaults, same behaviour) so the roundP23 recipe can run on CVACT. Each
@@ -151,6 +158,12 @@ class Configuration:
     # Rescale the six gate-derived term weights onto a fixed total each batch.
     infonce_gate_normalise_mass: bool = False
     infonce_gate_mass_target: Optional[float] = None
+    # Hold loss1's (q1-r1) share of the gated InfoNCE mass fixed: loss1 is scaled
+    # by the mean gate of loss2..loss6 each batch, so its share stays at 1/6 with
+    # flat term weights instead of drifting ~17% -> ~36% as the crop and wedge
+    # narrow. Needs the circle gate with infonce_gate_scales_terms; excludes
+    # infonce_gate_normalise_mass. See singeo.trainer._loss1_share_scale.
+    infonce_hold_loss1_share: bool = False
 
     # Colour of every blank region the masks write: ground pad/border, panorama
     # border, aerial wedge mask and rotation corners. "mean" (default) is a
@@ -161,7 +174,7 @@ class Configuration:
     mask_fill: str = "mean"
 
 
-    crop_dropout_strength: float = 1
+    crop_dropout_strength: float = 0.5   # same as train_singeo_cvusa.py
 
 
     
@@ -402,6 +415,11 @@ def write_run_info(path, cfg, run_name, note, overrides):
             lines.append("  DROPPED as hard positives: {}".format(", ".join(dropped)))
     lines.append("")
 
+    if getattr(cfg, "infonce_hold_loss1_share", False):
+        lines.append("loss1 (q1-r1) share HELD: loss1 is scaled by the mean gate of loss2..loss6")
+        lines.append("  every batch, so it keeps its epoch-1 share of the InfoNCE mass (1/6 with")
+        lines.append("  flat weights) instead of drifting ~17% -> ~36% as the crop and wedge narrow.")
+        lines.append("")
     lines.append("Ground FoV curriculum: {}".format(cfg.fov_sampling))
     if cfg.fov_sampling.startswith("loguniform"):
         lines.append("  fresh FoV per {} from [floor, 360], floor ramping 360 -> {} deg".format(
@@ -419,6 +437,18 @@ def write_run_info(path, cfg, run_name, note, overrides):
             cfg.fov_gaussian_std, clip_lo))
         lines.append("  360 -> {} deg over the first {:.0%} of the run, then holding there.".format(
             cfg.fov_curriculum_end, cfg.fov_gaussian_ramp_frac))
+    elif cfg.fov_sampling == "uniform":
+        lines.append("  fresh FoV per sample, a random whole degree in {:.0f}..360 (equally likely),"
+                     " at every epoch: no curriculum.".format(cfg.fov_curriculum_end))
+    elif cfg.fov_schedule_lambda > 0:
+        lines.append("  one FoV per epoch, exponential fast-to-slow 360 -> {} deg across the run,".format(
+            cfg.fov_curriculum_end))
+        lines.append("  (1 - exp(-lam x)) / (1 - exp(-lam)) with lam = {}.".format(cfg.fov_schedule_lambda))
+        reached = lambda limit: next((e for e in range(1, cfg.epochs + 1)
+                                      if get_dynamic_fov(e, cfg.epochs, 360.0, cfg.fov_curriculum_end,
+                                                         lam=cfg.fov_schedule_lambda) <= limit), None)
+        lines.append("  at or below 180 deg from epoch {}, at or below 90 deg from epoch {}.".format(
+            reached(180.0), reached(90.0)))
     else:
         lines.append("  one FoV per epoch, linear 360 -> {} deg across the whole run.".format(
             cfg.fov_curriculum_end))
@@ -864,6 +894,16 @@ if __name__ == '__main__':
         raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
                             "every negative is already in the rank sets")
 
+    if config.infonce_hold_loss1_share:
+        if not (config.overlap_gated_infonce and config.infonce_gate_scales_terms
+                and config.overlap_gate_measure == "circle"):
+            raise ValueError(
+                "infonce_hold_loss1_share needs overlap_gated_infonce=True, "
+                "infonce_gate_scales_terms=True and overlap_gate_measure='circle': only then "
+                "does each term count at its mean gate, which is the share being held.")
+        if config.infonce_gate_normalise_mass:
+            raise ValueError("infonce_hold_loss1_share and infonce_gate_normalise_mass cannot be "
+                             "combined: the mass renormalisation assumes loss1 counts at 1.")
     if config.infonce_gate_normalise_mass and not config.infonce_gate_scales_terms:
         raise ValueError(
             "infonce_gate_normalise_mass needs infonce_gate_scales_terms=True: without it the "
@@ -948,10 +988,25 @@ if __name__ == '__main__':
             "fov_pad_random_start=False needs use_rnc=True (the training crop only honours it "
             "on the dataset path, which return_meta enables).")
 
+    if config.fov_schedule_lambda < 0:
+        raise ValueError("fov_schedule_lambda must be >= 0 (0 = linear), got {}".format(
+            config.fov_schedule_lambda))
+    if config.fov_schedule_lambda and config.fov_sampling != "deterministic":
+        raise ValueError("fov_schedule_lambda shapes the 'deterministic' schedule only; it would be "
+                         "inert under fov_sampling={!r}".format(config.fov_sampling))
     if config.fov_sampling not in ("loguniform", "loguniform_batch", "gaussian",
-                                   "gaussian_batch", "deterministic"):
+                                   "gaussian_batch", "deterministic", "uniform"):
         raise ValueError("fov_sampling must be 'loguniform', 'loguniform_batch', 'gaussian', "
-                         "'gaussian_batch' or 'deterministic', got {!r}".format(config.fov_sampling))
+                         "'gaussian_batch', 'deterministic' or 'uniform', got {!r}"
+                         .format(config.fov_sampling))
+    if config.fov_sampling == "uniform":
+        if not config.fov_pad:
+            raise ValueError("fov_sampling='uniform' needs fov_pad=True: the draw is per sample, "
+                             "so crop widths differ inside a batch.")
+        if not config.use_rnc:
+            raise ValueError("fov_sampling='uniform' needs use_rnc=True (the per-sample draw "
+                             "lives in CVACTDatasetTrainSinGeo, which only crops when "
+                             "return_meta is on).")
     if config.fov_sampling.startswith("gaussian"):
         if config.fov_sampling == "gaussian" and not (config.fov_pad or config.fov_pad_batch_max):
             raise ValueError(
@@ -1108,7 +1163,7 @@ if __name__ == '__main__':
             # (keep_prob=1.0) rather than stacking two unrelated rotations. In
             # "discrete" mode the same +-90 schedule moves into the dataset,
             # where the angle is known and the sector is placed consistently.
-            rotate_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25)
+            rotate_prob = 1.0
             wedge_keep_prob = get_dynamic_rotate_prob(epoch, config.epochs, min_prob=1.0, max_prob=0.25)
             train_dataloader.dataset.aerial_rotate_keep_prob = wedge_keep_prob
             if config.aerial_rotation == "discrete":
@@ -1141,11 +1196,17 @@ if __name__ == '__main__':
                                               fov_end=config.fov_curriculum_end,
                                               ramp_frac=config.fov_ramp_frac)
             fov_dynamic = math.sqrt(fov_floor * 360.0)
+        elif config.fov_sampling == "uniform":
+            # Same range every epoch; the mean is the representative for the
+            # sim-sampling loader (dss_fov_from_measured replaces it anyway).
+            fov_floor = None
+            fov_dynamic = 0.5 * (config.fov_curriculum_end + 360.0)
         else:
             fov_floor = None
             fov_dynamic = get_dynamic_fov(epoch, config.epochs,
                                           fov_start=360,
-                                          fov_end=config.fov_curriculum_end)
+                                          fov_end=config.fov_curriculum_end,
+                                          lam=config.fov_schedule_lambda)
 
         # With RNC the crop moves into the dataset (which records its window),
         # so the transform pipeline is built without one.
@@ -1179,6 +1240,10 @@ if __name__ == '__main__':
             print(f"For Epoch {epoch}: Ground FOV ~ N({fov_mean:.2f}, {config.fov_gaussian_std:.1f}) "
                   f"clipped to [{(config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None else config.fov_curriculum_end):.0f}, 360]{settled}"
                   f"{', padded to full width' if config.fov_pad else ''}")
+        elif config.fov_sampling == "uniform":
+            print(f"For Epoch {epoch}: Ground FOV ~ uniform over whole degrees "
+                  f"{config.fov_curriculum_end:.0f}..360 per sample"
+                  f"{', padded to full width' if config.fov_pad else ''}")
         elif fov_floor is None:
             print(f"For Epoch {epoch}: Ground FOV = {fov_dynamic:.4f}"
                   f"{' (padded to full width)' if config.fov_pad else ''}")
@@ -1207,6 +1272,9 @@ if __name__ == '__main__':
                 config.fov_gaussian_clip_lo if config.fov_gaussian_clip_lo is not None
                 else config.fov_curriculum_end)
             train_dataloader.dataset.fov_hi = 360.0
+            train_dataloader.dataset.fov_uniform = (config.fov_sampling == "uniform")
+            if config.fov_sampling == "uniform":
+                train_dataloader.dataset.fov_lo = config.fov_curriculum_end
             train_dataloader.dataset.fov_border_px = config.fov_border_px
             train_dataloader.dataset.fov_border_q1 = config.fov_border_q1
 

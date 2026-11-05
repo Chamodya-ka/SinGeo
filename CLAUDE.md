@@ -21,6 +21,11 @@ overlap. Last updated 2026-10-08.
   with `log.txt`, `info.txt`, a `train.py` snapshot, `rnc_epoch_*.png` collages and
   `weights_e<N>_<fov90>.pth` (saved only on a new best FoV 90) plus `weights_end.pth`.
 - **GPS dict:** `data/CVUSA/CVPR_subset/gps_dict.pkl` in the repo, 35,532 × 128.
+- **VIGOR:** `/home/71/25021871/data/chamodya/VIGOR` (extracted 2026-11-03). Trainer
+  `train_singeo_vigor.py` is a copy of the CVUSA one (same `SINGEO_*` fields), launcher
+  `./run_vigor.sh`, checkpoints under `Singeo_data/VIGOR/`. Its wedge radiates from the
+  camera's position in the tile (split offsets), not the centre; column 0 faces 180° (measured).
+  GPS dicts `data/VIGOR/gps_dict_{cross,same}.pkl`. See `EXPERIMENTS.md`, "VIGOR port".
 - **`satellite_embeddings_2024.csv`** sits beside the data; only
   `negative_tiering=embed` with `rnc_positives_only=False` reads it.
 - **Hardware:** H100 NVL, 95 GiB, 62 GB RAM. One run ≈ 23 GB and 3.8 it/s (10 min/epoch);
@@ -143,6 +148,13 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
   or `fov_pad_batch_max` which pads to the batch's widest crop.
 - `fov_border_px` excludes `fov_pad`; `fov_border_q1` needs `fov_border_px > 0`;
   `rnc_hardest_negative` needs `rnc_positives_only=True`.
+- `fov_schedule_lambda` (ported 2026-11-04 from branch `investigating-padding-issue-a40`)
+  shapes only `fov_sampling="deterministic"`: 0 is the linear walk, 5 the exponential
+  fast-to-slow one (≤ 180 from e16, ≤ 90 from e42 over 360 → 70). Other modes refuse it.
+- `infonce_hold_loss1_share` (2026-11-05) scales loss1 by the mean gate of loss2..loss6, so
+  q1-r1 keeps a 1/6 share instead of drifting 17% → 36%. Needs circle + gate-scaled terms;
+  refuses `infonce_gate_normalise_mass`. Every run now prints `InfoNCE epoch averages` (the
+  six gated terms) into `log.txt`; the console's tqdm postfix is cut at screen width.
 - Circular conv padding fails below ~64 input columns (about FoV 30).
 - Input collages are captured **before** collation, so a `fov_pad_batch_max` run's collage
   shows unpadded crops.

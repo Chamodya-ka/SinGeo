@@ -13,7 +13,7 @@ TOP_K = 128
 
 SAME_AREA = True
 
-dataset = VigorDatasetTrain(data_folder="./data/VIGOR",
+dataset = VigorDatasetTrain(data_folder="/home/71/25021871/data/chamodya/VIGOR",
                             same_area=SAME_AREA)
 
 df_sat = dataset.df_sat
@@ -67,7 +67,7 @@ with open("./data/VIGOR/gps_dict_same.pkl", "wb") as f:
 
 SAME_AREA = False
 
-dataset = VigorDatasetTrain(data_folder="./data/VIGOR",
+dataset = VigorDatasetTrain(data_folder="/home/71/25021871/data/chamodya/VIGOR",
                             same_area=SAME_AREA)
 
 df_sat = dataset.df_sat

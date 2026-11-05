@@ -2,8 +2,10 @@ import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from albumentations.core.transforms_interface import ImageOnlyTransform
+import os
 import random
 import torch
+from torch.utils.data import get_worker_info
 import numpy as np
 from torchvision.transforms import Resize
 import math
@@ -39,8 +41,27 @@ def get_dynamic_fov_exp(epoch, max_epoch, fov_start=360.0, fov_end=90.0, k=5):
 def get_dynamic_rotate_prob(epoch, max_epoch, min_prob=1.0, max_prob=0.25):
     return min_prob - (min_prob - max_prob) * (epoch / max_epoch)
 
-def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0):
-    return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
+def get_dynamic_fov(epoch, max_epoch, fov_start=360.0, fov_end=90.0, lam=0.0):
+    """One FoV per epoch, walked from `fov_start` to `fov_end` over the run.
+
+    `lam` = 0 is the original SinGeo linear walk (this exact expression).
+    `lam` > 0 is the exponential fast-to-slow shape
+
+        f(x) = (1 - exp(-lam * x)) / (1 - exp(-lam)),   x = epoch / max_epoch
+
+    which moves quickly at first and slows towards `fov_end`; f(0) = 0,
+    f(1) = 1, and f -> x as lam -> 0. With 360 -> 70 over 80 epochs, lam = 5
+    reaches 180 at epoch 16 and 90 at epoch 42 (linear: 50 and 75).
+
+    Ported from branch investigating-padding-issue-a40 (CVACT roundC11 there).
+    The aerial sector schedule also calls this, always with the default lam = 0.
+    """
+    if lam < 0:
+        raise ValueError("lam must be >= 0 (0 = linear), got {!r}".format(lam))
+    if lam == 0:
+        return fov_start - (fov_start - fov_end) * (epoch / max_epoch)
+    progress = (1.0 - math.exp(-lam * epoch / max_epoch)) / (1.0 - math.exp(-lam))
+    return fov_start - (fov_start - fov_end) * progress
 
 
 def get_dynamic_fov_floor(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_frac=0.2):
@@ -128,12 +149,40 @@ def get_gaussian_fov_mean(epoch, max_epoch, fov_start=360.0, fov_end=70.0, ramp_
     return fov_start - (fov_start - fov_end) * progress
 
 
+def get_q1_roll_max(epoch, max_epoch, ramp_frac=1.0, max_deg=180.0):
+    """Half-width A of the ramped q1 roll at `epoch`; the roll is drawn from U(-A, +A).
+
+    A rises linearly from 0 at epoch 1 to `max_deg` once `ramp_frac` of the run has
+    passed, then holds. Unlike :func:`get_gaussian_fov_mean`, epoch 1 maps to exactly
+    0, so the first epoch keeps q1 aligned with the tile. At 180 the draw covers the
+    whole circle, the same roll as `ground_roll_q1`. `ramp_frac <= 0` means no roll.
+    """
+    if ramp_frac <= 0:
+        return 0.0
+    span = max(1.0, float(max_epoch) * ramp_frac - 1.0)
+    progress = min(1.0, max(0.0, (epoch - 1) / span))
+    return max_deg * progress
+
+
+def roll_panorama(img, max_deg, rng=random):
+    """Roll a full (C, H, W) panorama by a uniform draw from [-max_deg, +max_deg] degrees.
+
+    The panorama is cyclic in azimuth, so this is an exact rotation with no seam. The
+    shift is rounded to whole columns. Only for a full 360 view, never a crop.
+    """
+    if max_deg <= 0:
+        return img
+    width = img.shape[-1]
+    deg = rng.uniform(-max_deg, max_deg)
+    return torch.roll(img, shifts=int(round(deg * width / 360.0)), dims=-1)
+
+
 def draw_gaussian_fov(mean, std=20.0, lo=70.0, hi=360.0, rng=None):
     """One FoV drawn from `N(mean, std)` and clipped to `[lo, hi]`.
 
     `rng` is a `numpy.random.Generator`; one is created from OS entropy when it
-    is None. Create it lazily per worker process rather than once in the parent:
-    a Generator built before `fork` is copied into every worker, and all of them
+    is None. A Generator kept on a dataset must come from `ProcessLocalRNG`:
+    one that exists at `fork` time is copied into every worker, and all of them
     would then draw the identical sequence.
 
     Clipping, not rejection: a draw outside the range is pinned to the boundary,
@@ -147,6 +196,34 @@ def draw_gaussian_fov(mean, std=20.0, lo=70.0, hi=360.0, rng=None):
         rng = np.random.default_rng()
     draw = float(rng.normal(loc=mean, scale=std, size=1)[0])
     return float(min(hi, max(lo, draw)))
+
+
+class ProcessLocalRNG:
+    """A numpy Generator that is rebuilt the first time each process uses it.
+
+    A dataset is built in the parent and forked into every DataLoader worker.
+    If its Generator already exists at fork time, each worker gets a copy in
+    the same state and they all draw the same sequence. Creating it lazily in
+    `__getitem__` is not enough: anything that calls `dataset[i]` in the parent,
+    such as the input collage, creates it there first. Keying the Generator to
+    the process id rebuilds it in each worker regardless.
+
+    In a worker it is seeded from torch's per-worker seed, which differs per
+    worker and per epoch and follows the run's seed, so a seeded run stays
+    reproducible. In the parent it is seeded from OS entropy.
+    """
+
+    def __init__(self):
+        self._pid = None
+        self._rng = None
+
+    def get(self):
+        pid = os.getpid()
+        if self._rng is None or self._pid != pid:
+            info = get_worker_info()
+            self._rng = np.random.default_rng(None if info is None else info.seed)
+            self._pid = pid
+        return self._rng
 
 
 def draw_log_uniform_fov(floor, fov_max=360.0, rng=None):
@@ -672,8 +749,35 @@ def draw_quarter_rotation(rng=None):
     return 90.0 * source.randint(0, 3)
 
 
+def _bearing_grid_about(height, width, apex_row, apex_col, device):
+    """`[H, W]` compass bearing of every pixel, measured from (apex_row, apex_col).
+
+    Same convention as `_bearing_grid` (0 = up, 90 = right), which it equals
+    when the apex is the image centre. Not cached: the apex differs per sample.
+    """
+    ys = torch.arange(height, dtype=torch.float32, device=device).unsqueeze(1)
+    xs = torch.arange(width, dtype=torch.float32, device=device).unsqueeze(0)
+    bearing = torch.rad2deg(torch.atan2(xs - float(apex_col), float(apex_row) - ys))
+    return torch.remainder(bearing, 360.0)
+
+
+def rotate_apex(apex, rot_deg, height, width):
+    """Where pixel `apex` = (row, col) lands after rotating the image CCW by `rot_deg`.
+
+    The rotation is about the image centre ((H-1)/2, (W-1)/2), as both
+    `torch.rot90` and `TF.rotate` do it, so a point offset (dx right, dy up)
+    from the centre moves to (dx cos - dy sin, dx sin + dy cos).
+    """
+    cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
+    dx, dy = apex[1] - cx, cy - apex[0]
+    theta = math.radians(float(rot_deg))
+    dx_r = dx * math.cos(theta) - dy * math.sin(theta)
+    dy_r = dx * math.sin(theta) + dy * math.cos(theta)
+    return cy - dy_r, cx + dx_r
+
+
 def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, return_mask=False,
-                        fill=None):
+                        fill=None, apex=None):
     """Aerial analogue of the ground FoV crop: rotate the tile, keep a wedge.
 
     The aerial branch's counterpart to a limited ground FoV is a limited
@@ -700,6 +804,12 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
         fill: per-channel tensor value for everything outside the kept region,
             rotation corners included, from :func:`mask_fill_values`. `None`
             (default) is a tensor zero, the dataset mean colour.
+        apex: `(row, col)` pixel the wedge radiates from, in the input (north-up,
+            unrotated) tile. `None` (default) is the tile centre, which is where
+            the camera sits in CVUSA and CVACT. VIGOR places the camera anywhere
+            in the central quarter of its tile, so its wedge passes the camera's
+            position here; the point is carried through `rot_deg` with the
+            pixels. The inscribed disc stays centred on the tile.
 
     Returns:
         `[C, H, W]` tensor, same shape as the input; with `return_mask`, the
@@ -726,7 +836,11 @@ def apply_aerial_sector(x, rot_deg, arc_center, arc_extent, circular_mask=True, 
         return (x, torch.ones_like(x[:1])) if return_mask else x
 
     height, width = x.shape[1], x.shape[2]
-    bearing = _bearing_grid(height, width, x.device)
+    if apex is None:
+        bearing = _bearing_grid(height, width, x.device)
+    else:
+        apex_row, apex_col = rotate_apex(apex, rot_deg, height, width)
+        bearing = _bearing_grid_about(height, width, apex_row, apex_col, x.device)
 
     mask = torch.ones_like(bearing, dtype=torch.bool)
 

@@ -14,10 +14,12 @@ in distribution":
     --angles           fixed rolls instead of the random one (0 = native frame)
 
 Rolls come from CVUSADatasetEval's per-index seed, so every input and every
-checkpoint scores the same azimuths. See EXPERIMENTS.md, "FoV 360: the logged
-column mixes an input artefact with embedding quality".
+checkpoint scores the same azimuths (with --dataset cvact they are unseeded).
+See EXPERIMENTS.md, "FoV 360: the logged column mixes an input artefact with
+embedding quality".
 
     python eval_fov360_probe.py <run_dir | weights.pth> [more ...] [--borders 0 16 64] [--angles 0 45 90]
+                                [--dataset cvact]
 """
 
 import argparse
@@ -33,6 +35,7 @@ from albumentations.core.transforms_interface import ImageOnlyTransform
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader
 
+from singeo.dataset.cvact import CVACTDatasetEval
 from singeo.dataset.cvusa import CVUSADatasetEval
 from singeo.model import TimmModel_SinGeo
 from singeo.transforms import apply_limited_fov, get_transforms_val
@@ -92,23 +95,40 @@ def main(argv=None):
                    help="blank columns on each side of the rotated panorama")
     p.add_argument("--angles", type=int, nargs="*", default=[],
                    help="also score fixed rolls (degrees, flush)")
-    p.add_argument("--data-folder", default="/home/71/25021871/data/chamodya/CVPR_subset")
+    p.add_argument("--dataset", choices=("cvusa", "cvact"), default="cvusa")
+    p.add_argument("--data-folder", default=None,
+                   help="defaults to the CVUSA subset or the CVACT folder, per --dataset")
     p.add_argument("--model", default="convnext_base.fb_in22k_ft_in1k_384")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=6)
     args = p.parse_args(argv)
 
+    if args.data_folder is None:
+        args.data_folder = {"cvusa": "/home/71/25021871/data/chamodya/CVPR_subset",
+                            "cvact": "/home/71/25021871/data/chamodya/CVACT"}[args.dataset]
+
+    # Both datasets' trainers use these sizes: CVACT's ground height is
+    # round(224 / 1232 * 768) = 140.
     sat_size, ground_size = (384, 384), (140, 768)
     sat_t = get_transforms_val(sat_size, ground_size, mean=MEAN, std=STD, fov=0.0)[0]
-    reference = CVUSADatasetEval(data_folder=args.data_folder, split="test",
-                                 img_type="reference", transforms=sat_t)
+
+    def eval_set(img_type, transforms):
+        # The splits the training-time evaluation reports: CVUSA "test", CVACT "val".
+        if args.dataset == "cvact":
+            # CVACTDatasetEval has no per-index seed, so its rolls are random per
+            # call: compare inputs within a checkpoint up to ~0.3 of roll noise.
+            return CVACTDatasetEval(data_folder=args.data_folder, split="val", img_type=img_type,
+                                    transforms=transforms)
+        return CVUSADatasetEval(data_folder=args.data_folder, split="test", img_type=img_type,
+                                transforms=transforms, crop_seed=EVAL_CROP_SEED)
+
+    reference = eval_set("reference", sat_t)
 
     def queries(border_px, angle):
         t = A.Compose([A.Resize(ground_size[0], ground_size[1],
                                 interpolation=cv2.INTER_LINEAR_EXACT, p=1.0),
                        A.Normalize(MEAN, STD), ToTensorV2(), Panorama360(border_px, angle)])
-        return CVUSADatasetEval(data_folder=args.data_folder, split="test", img_type="query",
-                                transforms=t, crop_seed=EVAL_CROP_SEED)
+        return eval_set("query", t)
 
     inputs = [("rotated + {} px".format(b) if b else "rotated flush", b, None) for b in args.borders]
     inputs.append(("north flush", 0, 0))
