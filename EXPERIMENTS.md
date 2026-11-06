@@ -1445,6 +1445,54 @@ is ~17 min and a five-FoV eval plus the train-set similarity rebuild ~23 min, so
 an 80-epoch run takes ~31 h. Zero-shot (ImageNet weights) is chance level:
 R@1 0.03-0.06 at every FoV, R@1% 5.6-8.9.
 
+## RnC overlap ordering probes on roundC15 e64 (eval-only, 2026-11-06)
+
+Checkpoint `roundC15 _20261105-115724/weights_e64_46.7470.pth`, CVACT val (8,884),
+padded protocol, centred crop. Scripts in `LowFoVGradCAM/` (`wedge_heading_sweep.py`,
+`aerial_cam_four_headings.py`, shared `probe_common.py`); figures, CSV/npz and
+`*_summary.txt` under `LowFoVGradCAM/figures/<run>_<weights>_{sweep,fourheadings}/`.
+The example location is index 14 (id 0000014), picked by `--index auto`: the first
+location whose 90° crops at N/E/S/W all retrieve at rank 1, chosen on retrieval only.
+
+**1. Wedge heading sweep** (90° ground crop vs a 180° wedge of the north-up tile,
+wedge heading swept 0-355° in 5° steps, `circle` label). 300 random locations,
+random crop headings, seed 0:
+
+| \|dev\| | 0 | 30 | 45 | 60 | 90 | 120 | 135 | 180 | full tile |
+|---|---|---|---|---|---|---|---|---|---|
+| own wedge cos | .263 | .265 | .262 | .248 | .194 | .136 | .110 | .079 | .233 |
+| RnC label | .250 | .250 | .250 | .208 | .125 | .042 | 0 | 0 | .250 |
+| hardest-negative wedge cos | .192 | .194 | .194 | .191 | .185 | .179 | .175 | .175 | .243 |
+
+- **The cosine tracks the label's shape**: flat where the ground arc sits inside the
+  wedge (\|dev\| ≤ 45), falling where the label falls. Median Spearman ρ(cos, label)
+  **0.88** [IQR 0.75, 0.93], ρ > 0 at 94.7% of locations; peak inside the ±45°
+  plateau for 61% (chance 25%). The hardest negative's wedges are flat in deviation,
+  so the bump is not a heading bias. Location 14 alone: ρ 0.87.
+- **Below the label's zero, the cosine keeps falling** (.110 at 135 → .079 at 180),
+  where the label is flat: the model separates "pointing away" from "pointing sideways".
+- **Containing wedges beat the full tile** (.263 vs .233; the full tile tops every own
+  wedge at only 2% of locations). The `circle` label ties them, so this is not a
+  violation; the full tile carries 270° the crop cannot see.
+- **The "partial < negative" half of the ordering holds against a typical negative,
+  not the hardest one.** Zero-overlap own wedges (~.09) beat the median gallery tile
+  (−.002) 92% of the time but the 99th-percentile tile only 33%, and lose to the
+  hardest gallery negative's full tile (.243) at 99.7% of locations. The gallery's hardest of 8,884 is far
+  harder than a batch-of-16 hardest negative, and retrieval only ever scores full tiles.
+- **No control yet**: no CVACT run has `rnc_weight=0`, so this shows the ordering
+  exists in C15, not that RnC put it there. The clean test is C15 with `RNC_WEIGHT=0`
+  (or CVUSA P23 vs P28, which differ in `rnc_weight` alone).
+
+**2. Full-tile HiResCAM (stage 3) for four 90° crops 90° apart.** Location 14:
+in-sector mass 67/73/76/68% (chance 25%), map-bearing error +17/+2/+7/−18° at
+N/E/S/W, all four at rank 1. 300 random locations × 4 crops (random base heading):
+crop R@1 46.2% (logged FoV 90: 46.75); in-sector mass median **71%** [57, 81], above
+chance for 95.2%; map bearing within ±45° of the crop heading for **87.7%**, median
+\|error\| 13°. Crops that miss rank 1 still localise: 65.5% median in-sector, 81.1%
+within ±45° (rank-1 crops 76.1% / 95.3%). This also confirms
+`CVACT_PANO_COL0_BEARING = 180` on real geography: a wrong convention would put the
+maps 180° off.
+
 ## All runs
 
 | run | pad | FoV samp | wedge | mask | rncW | τ | q1 roll | FoV 360 | 180 | 90 | 70 | Avg | ep |
