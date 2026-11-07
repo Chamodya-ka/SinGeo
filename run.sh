@@ -57,7 +57,9 @@
 #   roundP32  P23 with RnC on the cross-domain groups only (g2g and a2a weight 0)
 #   roundP33  P32 with rnc_weight 0.4: the cross-domain RnC dose
 #   roundP34  P32 with a ramped q1 roll, U(-A, +A) with A 0 -> 180 deg over the run
-#   roundP35  P32 with the exponential per-epoch FoV schedule of CVACT C11 on server A, lam 5
+#   roundP35  CVUSA twin of CVACT C16: P32 + exponential FoV (lam 5) + a2g 0.5 + loss1 share held
+#   roundP36  P32 with a2g RnC at 0.5, one variable
+#   roundP37  P32 with the loss1 share held (CVUSA twin of CVACT C15), one variable
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -1892,10 +1894,12 @@ eval_fov360_probe.py for aligned against rotated. Post-fix P32-family reference:
 roundP33 80.47 (rnc_weight 0.4).'
     ;;
 roundP35)
-    echo "Round P35 - P32 with the exponential per-epoch FoV schedule, lam = 5, 360 -> 70 (padded) [80 ep]"
-    echo "  control roundP32 82.58 (Gaussian band); source: CVACT roundC11 on server A, 56.78 Avg at e68"
+    echo "Round P35 - CVUSA twin of CVACT C16: P32 + exponential per-epoch FoV (lam 5, 360 -> 70) + a2g RnC 0.5 + loss1 share held [80 ep]"
+    echo "  control roundP32 _20261028-234233 82.58 (pre RNG fix); CVACT twin roundC16 _20261106-084248 (running)"
     echo "  schedule: FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)); <=180 from e16, <=90 from e42"
-    launch roundP35-p32-expfov-lam5 \
+    # P32's field list with the Gaussian band swapped for the exponential walk, plus
+    # C16's held loss1 share, a2g 0.5 and the FoV 0 (north-aligned) eval.
+    launch roundP35-p32-expfov-a2g05-hold \
         SINGEO_SEED=None \
         SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
         SINGEO_FOV_SAMPLING=deterministic \
@@ -1903,35 +1907,125 @@ roundP35)
         SINGEO_FOV_SCHEDULE_LAMBDA=5.0 \
         SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
         SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
-        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_MASK_FILL=mean \
+        SINGEO_CROP_DROPOUT_STRENGTH=0.5 \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P35. The CVUSA twin of CVACT roundC16. roundP32 with three changes.
+(1) Ground FoV schedule: the per-sample Gaussian band (std 40, mean 360 to 90 by
+epoch 24, clipped at 70) is replaced by one FoV per epoch shared by every sample,
+walked 360 to 70 on the exponential fast-to-slow curve with lam 5. (2)
+rnc_group_weights (1, 0, 0.5, 0): a2g at 0.5 instead of 1.0. (3)
+infonce_hold_loss1_share: loss1 (q1-r1) is scaled by the mean gate of loss2 to
+loss6, so it keeps a fixed 1/6 share of the gated InfoNCE mass instead of drifting
+from 17 to 36 percent as q2 and the wedge narrow. FoV 0 (north-aligned panorama) is
+added to the eval list so the roll gap is logged. Padded to full width, as in P32.
+
+SCHEDULE. FoV(e) = 360 - 290 (1 - exp(-5 e/80)) / (1 - exp(-5)). At or below 180
+from epoch 16 and at or below 90 from epoch 42. With the held share, loss1 weight
+is about 0.56 at e24 and 0.32 at e80.
+
+WHY. On CVACT each change helped against C9 (the P32 recipe, 55.20 Avg final).
+C15 (held share) led C9 by 1.95 Avg at e64 and held the roll gap near 8 against
+14.5. C14 (exponential schedule, a2g 0.25) finished 55.68 with FoV 90 and 70 both
+about 1.9 above C9. C13 (a2g 0.25 alone) led C9 by 0.79 at e68. C16 combines them
+and is running. This asks whether the combination carries over to CVUSA.
+
+READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
+95.05/92.17/76.16/66.94). P32 ran before the per-worker FoV RNG fix; this run has
+no per-sample FoV draw, so that fix does not reach its ground FoV. Post-fix P32
+family: P33 80.47, P34 72.91. Avg is over 360/180/90/70; roll gap = FoV 0 minus
+FoV 360. Three changes at once, so a gain over P32 credits the set, not any one.
+Watch FoV 360 after e44.'
+    ;;
+roundP36)
+    echo "Round P36 - P32 with a2g RnC at 0.5, nothing else changed [80 ep]"
+    echo "  control roundP32 _20261028-234233 82.58 (pre RNG fix); roundP35 (P32 + exp FoV + a2g 0.5 + held share) ~80.5"
+    launch roundP36-p32-a2g05 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' \
         SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
         SINGEO_OVERLAP_GATE_MEASURE=circle \
         SINGEO_INFONCE_GATE_SCALES_TERMS=true \
         SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
         SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
         SINGEO_NUM_WORKERS=4 \
-        SINGEO_RUN_NOTE='P35. roundP32 with the ground FoV schedule swapped and nothing else changed.
-The per-sample Gaussian band (std 40, mean 360 to 90 by epoch 24, clipped at 70) is
-replaced by one FoV per epoch shared by every sample, walked 360 to 70 on the
-exponential fast-to-slow curve with lam 5. Padded to full width, as in P32.
+        SINGEO_RUN_NOTE='P36. roundP32 with rnc_group_weights (1, 0, 0.5, 0): a2g at 0.5 instead of
+1.0, one variable. Everything else is P32, including the per-sample Gaussian band.
+FoV 0 (north-aligned panorama) is appended to the eval list, after the P32 columns
+so their crop seeds are unchanged; it does not touch training.
 
-SCHEDULE. FoV(e) = 360 - 290 f(e/80) with f(x) = (1 - exp(-lam x)) / (1 - exp(-lam)).
-Epoch 5 at 282, 10 at 224, 20 at 152, 30 at 113, 40 at 92, 60 at 75, 80 at 70. At or
-below 180 from epoch 16 and at or below 90 from epoch 42 (linear walk: 50 and 75).
+WHY. roundP35 (P32 + exponential FoV schedule + a2g 0.5 + held loss1 share)
+trailed P32 by 1.88 Avg at e76, all of it at the narrow FoVs (180 -2.02, 90 -3.18,
+70 -2.62; 360 +0.31), while the same three changes gave +3.45 on CVACT (C16 vs C9).
+On CVUSA the cross-domain RnC carried P23 to P32 (+2.6 at FoV 90, +3.05 at FoV 70),
+so halving a2g is one of two suspects for the narrow-FoV loss; the deterministic
+schedule is the other. On CVACT a2g 0.25 alone (C13) led C9 by 0.79 at e68, mostly
+at FoV 70.
 
-WHY. Ported from branch investigating-padding-issue-a40. There, on CVACT with black
-fill, roundC11 ran this schedule and reached 56.78 Avg at e68, against 55.48 final
-for the Gaussian band (C9 there, the P32 recipe) and 54.70 final for the linear walk
-(C10). Its FoV 90 of 47.97 was the best of any padded CVACT run on that server, and
-its rolled FoV 360 peaked at e32 and gave back about 5 points afterwards. On CVUSA
-the linear walk lost 1.54 to per-sample log-uniform draws in older rounds, so this
-asks whether the exponential shape closes that gap against the Gaussian band.
+READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
+95.05/92.17/76.16/66.94). CONFOUND: P32 ran before the per-worker FoV RNG fix and
+this run draws per-sample Gaussian FoVs after it, so a gap to P32 mixes a2g with
+the fix. Post-fix P32 family: P33 80.47 (rnc 0.4), P35 about 80.5. A P32 replicate
+would separate the two. Roll gap = FoV 0 minus FoV 360 (P32 probe: 1.77).'
+    ;;
+roundP37)
+    echo "Round P37 - P32 with the loss1 share held (CVUSA twin of CVACT C15), nothing else changed [80 ep]"
+    echo "  control roundP32 _20261028-234233 82.58 (pre RNG fix); CVACT C15 beat C9 by 2.64 Avg"
+    launch roundP37-p32-hold-l1share \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P37. roundP32 with infonce_hold_loss1_share: loss1 (q1-r1) is scaled by the
+mean gate of loss2 to loss6, so it keeps a fixed 1/6 share of the gated InfoNCE
+mass instead of drifting from 17 to 36 percent as q2 and the wedge narrow. One
+variable; everything else is P32, including the per-sample Gaussian band and a2g
+at 1.0. FoV 0 (north-aligned panorama) is appended to the eval list after the P32
+columns, eval only. Loss1 weight with the band: about 0.95 at e1, 0.50 at e24,
+0.36 at e80.
 
-READING. Control roundP32 82.58 (FoV 360/180/90/70 = 95.05/92.17/76.16/66.94). P32
-ran before the per-worker FoV RNG fix, but this run has no per-sample FoV draw, so
-that confound does not reach the ground FoV. Read all four columns and the trend of
-FoV 360 after e32, where C11 started to fall. Post-fix P32 family: P33 80.47, P34
-72.91.'
+WHY. The CVUSA twin of CVACT roundC15, the largest single CVACT gain: C15 beat C9
+(the P32 recipe) by 2.64 Avg final, with FoV 360 +7.42, 90 +1.34, 70 +2.02, and
+held the roll gap near 8 against 15. roundP35 (P32 + exponential schedule + a2g
+0.5 + held share) trailed P32 by 1.88 Avg at e76, all of it at the narrow FoVs, so
+the held share is one of three suspects there. roundP36 (P32 + a2g 0.5) runs
+alongside.
+
+READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
+95.05/92.17/76.16/66.94), roll gap 1.77 in the probe. CONFOUND: P32 ran before the
+per-worker FoV RNG fix and this run draws per-sample Gaussian FoVs after it, so a
+gap to P32 mixes the held share with the fix. Roll gap = FoV 0 minus FoV 360.'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"

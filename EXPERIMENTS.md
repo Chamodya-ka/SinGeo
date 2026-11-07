@@ -117,6 +117,9 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP32 `_20261028-234233` | B | padded, per-sample | P23 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)'` — RnC on the cross-domain groups only; g2g/a2a are a hardest-negative triplet with no overlap ranking | 95.05 | 92.17 | **76.16** | **66.94** | **82.58** | final — best overall; CVACT twin roundC9 running |
 | roundP33 `_20261031-152053` | B | padded, per-sample | P32 + `RNC_WEIGHT=0.4` — first P32-family run after the per-worker FoV RNG fix, so the dose and the fix are confounded | 94.69 | 90.61 | 72.79 | 63.77 | **80.47** | final |
 | roundP34 `_20261101-233600` | B | padded, per-sample | P32 + `GROUND_ROLL_Q1_RAMP_FRAC=1.0`: q1 rolled by U(−A, +A), A linear 0° (e1) → 180° (e80). Only q1 changes; q2/r1/r2, meta and overlap labels verified bit-identical. Post RNG fix | | | | | | running |
+| roundP35 `_20261106-210035` | B | padded, **per-epoch** | CVUSA twin of CVACT roundC16. P32 with the Gaussian fields replaced by `FOV_SAMPLING=deterministic FOV_CURRICULUM_END=70.0 FOV_SCHEDULE_LAMBDA=5.0` (exponential fast-to-slow, ≤180 from e16, ≤90 from e42), plus `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' INFONCE_HOLD_LOSS1_SHARE=true EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)'` (FoV 0 = north-aligned, for the roll gap). Three changes on P32, so a gain credits the set. No per-sample FoV draw, so the RNG fix does not reach the ground FoV | 94.87 | 90.03 | 72.99 | 64.26 | **80.54** | stopped in e79; last eval e76 (FoV 0 95.67, roll gap 0.80); best weights e72. −1.88 vs P32 at e76, all at the narrow FoVs; CVACT twin C16 +3.45 over C9 |
+| roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | | | | | | running |
+| roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | | | | | | running |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -1073,9 +1076,28 @@ down to 0.5) and a wider band.
 > 14.5 for C9 at e60, and has stayed at 8–10 since e20. FoV 0 still eases (87.3 at
 > e24 → 85.3), as C9's aligned score did.
 >
-> **roundC16 `_20261106-084248`, running: the combined recipe.** C15 + C14's
+> **roundC16 `_20261106-084248`: the combined recipe.** C15 + C14's
 > exponential schedule + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'`. Three changes on
 > C9, so a gain over C15 credits the pair, not either one.
+>
+> **Finals (e80).**
+>
+> | run | 360 | 0 | 180 | 90 | 70 | Avg | roll gap |
+> |---|---|---|---|---|---|---|---|
+> | C9 (P32 recipe) | 69.03 | — | 70.70 | 45.80 | 35.27 | 55.20 | ~15 (probe) |
+> | C15 (+ held loss1 share) | 76.45 | 84.32 | 70.49 | 47.14 | 37.29 | **57.84** | 7.87 |
+> | C16 (C15 + exp schedule + a2g 0.5) | 75.51 | 83.71 | 71.43 | 48.71 | 38.95 | **58.65** | 8.21 |
+>
+> C15 − C9: 360 +7.42, 180 −0.21, 90 +1.34, 70 +2.02, Avg +2.64. C16 − C15: 360
+> −0.94, 180 +0.94, 90 +1.57, 70 +1.66, Avg +0.81. C16 − C9 +3.45, the best CVACT run.
+> C16's FoV 360 still eases late (79.56 at e44 → 75.51), less than C14's.
+>
+> **The CVUSA twin does not transfer (roundP35, stopped in e79).** P35 − P32 at e76:
+> 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88. The CVACT gain at FoV 360
+> fixes a roll gap CVUSA barely has (P32 1.77 in the probe; P35 0.80, closed by the
+> aligned score falling to 95.7, not by the rotated one rising), and the narrow FoVs
+> move the other way. One-variable follow-ups on P32: roundP36 (a2g 0.5) and roundP37
+> (held share); both post RNG fix, P32 is not.
 
 ---
 
@@ -1493,6 +1515,285 @@ within ±45° (rank-1 crops 76.1% / 95.3%). This also confirms
 `CVACT_PANO_COL0_BEARING = 180` on real geography: a wrong convention would put the
 maps 180° off.
 
+## Padding slide probe on roundC15 e64: one crop, five fills (eval-only, 2026-11-06)
+
+`LowFoVGradCAM/padding_slide.py`, CVACT val location 14, one 100° crop facing north
+(213 of 768 columns). The crop's pixels are fixed; it is placed at every column of a
+768 px canvas from flush left (left pad 0) to flush right (right pad 0) in 4 px
+steps. The padding is filled with the mean colour (as C15 trained, tensor zero),
+black, white, one fixed draw of uniform pixel noise, or the crop reflected outward.
+References are the full panorama and the bare 213 px crop. C15 trains with
+`fov_pad=True` and a uniformly random crop start, so every position is in its
+training range. Figures:
+`LowFoVGradCAM/figures/roundC15-..._weights_e64_46.7470_padslide/idx14_h0_fov100_L3/`
+(stage-2 maps beside it in `_L2/`). **One location: read the numbers as an
+illustration, not a measurement.**
+
+| input | cos, flush left | 4 px | 16 px | centred | 16 px from right | flush right | rank range |
+|---|---|---|---|---|---|---|---|
+| full panorama | 0.370 (rank 1) | | | | | | |
+| **mean (trained)** | 0.182 | 0.204 | 0.226 | **0.238** | 0.241 | 0.192 | 1–4 |
+| black | 0.185 | 0.178 | 0.200 | 0.225 | 0.217 | 0.185 | 1–6 |
+| white | 0.206 | 0.228 | 0.243 | 0.248 | 0.239 | 0.179 | 1–6 |
+| noise | 0.152 | 0.160 | 0.149 | 0.144 | 0.127 | 0.127 | 3–53 |
+| reflect | 0.189 | 0.189 | 0.192 | 0.188 | 0.219 | 0.220 | 8–284 |
+| no padding (bare crop) | 0.133 (rank 22) | | | | | | |
+
+- **The tensor-edge loss shows on CVACT and under random-start padded training.**
+  With mean fill, a crop flush against either tensor edge loses 0.05 cosine (rank 1 → 4);
+  4 px of fill recovers 40% of that and 16 px recovers 80%, matching round4a's CVUSA
+  slide. The bare crop, flush on both sides, drops to 0.133 (rank 22).
+- **A flat fill acts as a feature; the colour hardly matters.** Black and white
+  behave like mean (centred 0.225 / 0.248 vs 0.238; descriptor cosine with the
+  centred mean-fill crop ≥ 0.88 for black, ≥ 0.81 for white). Noise (min 0.73) and
+  reflection (min 0.42) move the descriptor far more; noise ranks 3–53, reflection up
+  to 284. Reflection invents scene, so its aerial map spreads past the sector
+  (48% in-sector centred vs 67% for mean).
+- **The stage-3 ground map puts a hot spot in the blank just right of the crop.**
+  With flat fills and at least 96 px of padding on the right, 13–35% of the map lies
+  within 96 px right of the crop's right edge, against 1–14% within 96 px left of its
+  left edge. In each such row that blank seam is the map's brightest region. With
+  16 px or less on the right there is no room for it: the map moves back into the
+  crop, and flush right the cosine drops. The asymmetry may be specific to this
+  crop's content; one location cannot say. At stage 2 it is weaker (~15% right).
+- **The aerial maps barely move.** At every position under the flat fills the tile map
+  correlates 0.96–1.00 with the centred mean-fill map and keeps 66–78% in the crop's
+  sector (chance 28%); noise 0.93–0.98, reflection 0.56–0.96; the bare crop is 79%
+  (r 0.91). Placement and fill change how strongly the crop matches its tile, not
+  where on the tile it looks.
+- The cosine curves ripple with the network strides (32 px for mean and black, about
+  0.01; 8 px for white, about 0.02): ConvNeXt's strided downsampling is not
+  shift-invariant. The edge losses are 3–5× larger.
+- **150° crop, mean fill only** (`idx14_h0_fov150_L3/`): centred 0.264 (rank 1),
+  flush left 0.232 (1), flush right 0.233 (2), bare 320 px crop 0.176 (rank 129).
+  The edge loss is smaller than at 100° (0.03 vs 0.05) and the rank holds. Both seams
+  now light up: 25–32% of the map within 96 px right of the crop, 9–16% left of it.
+  So the 100° crop's right-only hot spot was not a fixed rule. Flush, the spot at the
+  open seam remains. The bare crop's map sits on both tensor edges. Aerial maps
+  r 0.94–1.00, 68–75% in sector.
+- **90° crop at 100° (ESE), mean fill only** (`idx14_h100_fov90_L3/`): centred 0.270
+  (rank 1), flush left 0.257 (1), flush right 0.237 (3), bare 192 px crop 0.212
+  (rank 3). **No hot spot in the padding here**: the map stays on the tree in the crop
+  and at most 10% lies within 96 px of either side. So the seam hot spot at 0° depends
+  on the crop's content, not on the padding alone. The edge loss remains, larger on the
+  right. Flush right, and in the bare crop, a hot spot appears at the tensor's
+  bottom-right corner, as in the 0° reflection rows. Aerial maps r 0.94–1.00, 70–81%
+  in sector.
+- **100° crop at 100°, mean fill only** (`idx14_h100_fov100_L3/`): centred 0.270
+  (rank 1), 4 px from the left 0.290, 16 px 0.284, 16 px from the right 0.283, flush
+  left 0.248 (2), flush right 0.261 (1), bare 0.215 (rank 3). Same picture as the 90°
+  crop at this heading: no seam hot spot (≤ 8%), and the map stays on the tree. The
+  bottom-right corner spot appears again whenever the crop touches the right tensor
+  edge (flush right, bare crop), never the bottom-left. A few px of padding scores
+  higher than centring here, so "centred is best" is not a rule either. Aerial r ≥ 0.92
+  padded, 69–84% in sector.
+- **100° crop at 90° (E), mean fill only** (`idx14_h90_fov100_L3/`): centred 0.275
+  (rank 1), 16 px from either edge 0.285–0.286, best 0.299, flush left 0.236 (1), flush
+  right 0.245 (2), bare 0.184 (rank 7). The same as at 100°: no seam spot (≤ 11%), the
+  map on the tree, the bottom-right corner spot flush right and on the bare crop.
+  Aerial r ≥ 0.93, 74–90% in sector.
+- **Second location, eval index 18** (next after 14 whose 100° crops at 0° and 90° both
+  rank 1; a suburban street), mean fill, 100° crops:
+
+  | heading | flush left | 16 px | centred | 16 px from right | flush right | bare crop |
+  |---|---|---|---|---|---|---|
+  | 0° | 0.302 | 0.358 | 0.349 | 0.331 | 0.295 | 0.247 (rank 3) |
+  | 90° | 0.239 | 0.278 | 0.266 | 0.271 | 0.237 | 0.196 (rank 4) |
+
+  Every padded position ranks 1. The edge loss is 0.03–0.06 again, and a few px of
+  padding again matches or beats centring. **The seam hot spots are strong here at
+  both headings.** At 0°, 54–61% of the map is on the padding, mostly a tall bar just
+  right of the crop (26–36%) plus a spot at its bottom-left. At 90°, 21% sits just left of
+  the crop when centred. **The tensor-edge corner spot is bottom-left here**
+  (bare crop and the 16 px-left row at 0°), so location 14's "right edge only" was
+  that location's content. Aerial maps r ≥ 0.95, 54–61% in sector at 0° (two blobs
+  either side of the apex), 75–83% at 90°.
+- **Index 18, 100° crop at 100°**: centred 0.359, best 0.381, flush left 0.326, flush
+  right 0.316, bare 0.232 (rank 2); every padded position ranks 1. **The seam spot is
+  now on the right** (41–42% of the map within 96 px right of the crop, 47–61% on the
+  padding), where at 90° it was on the left (21% left, 7% right). Ten degrees moves the
+  crop's edges by 21 px and flips the side, so the spot follows what sits at the crop's
+  edge, within reach of the last stage. Flush right it vanishes, the map drops to the
+  road and the cosine falls 0.04. Aerial r ≥ 0.98, 68–74% in sector.
+- **Across the seven slides (two locations):** a crop flush against a tensor edge always
+  loses similarity (0.02–0.06 cosine), 4–16 px of padding always recovers it, and the
+  aerial map never moves (r ≥ 0.92 padded). Whether the ground map draws on the blank
+  seam, and on which side, changes with location and heading.
+
+### What the padding activations are: stage-3 region ablation (2026-11-06)
+
+`LowFoVGradCAM/padding_decompose.py`. The descriptor is the mean of the stage-3 cells
+(32 px each, 24 across the canvas) through the head's LayerNorm, so each cell casts one
+vote. Each region's cells (crop / blank within 96 px left or right of the crop / far
+blank) are replaced by the cells of an all-blank canvas: **removed** takes that region
+out, **kept** leaves only that region. Ranks are of 8,884; an empty canvas ranks
+3,461 (idx 14) and 5,631 (idx 18). Centred crop, 100° FoV, mean fill:
+
+| run | as fed | left seam alone | right seam alone | Δcos, left / right seam removed | crop cells removed | far blank removed |
+|---|---|---|---|---|---|---|
+| 14 · 0° | 0.238 r1 | r276 | r101 | +0.001 / −0.011 | 0.149 r11 | ±0.000 |
+| 14 · 90° | 0.275 r1 | r253 | **r24** | +0.011 / −0.005 | 0.149 r10 | +0.001 |
+| 14 · 100° | 0.270 r1 | r331 | r76 | +0.011 / −0.001 | 0.126 r37 | +0.001 |
+| 18 · 0° | 0.349 r1 | **r3** | **r3** | −0.016 / −0.015 | **0.280 r1** | +0.002 |
+| 18 · 90° | 0.266 r1 | r21 | r290 | −0.017 / −0.001 | 0.173 r3 | +0.001 |
+| 18 · 100° | 0.359 r1 | r11 | **r1** | −0.009 / −0.030 | **0.318 r1** | +0.002 |
+
+- **The far blank carries nothing.** Removing it moves the cosine ≤ 0.002, and kept
+  alone it scores like an empty canvas. The ~10% of map mass there is a constant vote.
+- **The three blank cells beside each crop edge describe the crop.** Kept alone, one
+  seam retrieves the right tile at rank 1–331 of 8,884 in every run, including idx 14
+  at 90°/100°, where HiResCAM shows nothing there. Their 7×7 receptive field reaches
+  into the crop, so these are crop-edge features that happen to sit on blank pixels.
+- **The seam evidence duplicates the crop cells.** Removing a seam costs ≤ 0.03. At
+  idx 18 the crop cells can go entirely and the seams alone still rank 1 (0°: 0.280,
+  100°: 0.318). The model spreads its evidence wherever the receptive fields reach.
+- **HiResCAM brightness is a poor guide to seam evidence.** The ReLU hides negative
+  votes (idx 14's left seam votes against the tile at 90°/100°: removing it raises the
+  cosine 0.011), and per-map scaling lets a strong central landmark (idx 14's tree)
+  make an informative seam look cold. The seam looks hot when discriminative content
+  sits within ~96 px of the crop's edge (idx 14 0°, all of idx 18); idx 18's 90° → 100°
+  flip is that content crossing the edge.
+- **The flush-edge loss has two parts, and their split explains the two locations.**
+  Kept alone, the crop cells lose 0.03–0.06 cosine at idx 14 when flush (0° and 90°;
+  0.02–0.04 at 100°), but only 0.01–0.03 at idx 18. The crop's own edge cells degrade
+  against the tensor border. At idx 18 most of the 0.03–0.05 flush loss is the seam
+  that disappears, which removing that seam at the centred position roughly reproduces
+  (right seam at 100°: −0.030 of −0.043).
+
+### The flush-edge loss is learned: padded vs flush-trained CVUSA pair (2026-11-07)
+
+`LowFoVGradCAM/padding_flush_many.py`. CVUSA `roundP23-band90-std40_20261022-144655`
+(`fov_pad=True`, random crop position, mean fill) against
+`roundP31-p23-nopad-batchfov_20261027-103328` (P23 with `fov_pad=False`, so it always
+trained on bare crops whose edges touch the tensor border; it also needs
+`fov_sampling="gaussian_batch"` to collate). Both are `weights_end.pth`. There are 200
+random test locations, one random heading each, with 100° crops (213 px) on the 768 px
+mean-fill canvas. The two models see identical inputs. `L<p>`/`R<p>` means p px of blank
+between the crop's left/right edge and the border. Each paired change is mean ± s.e.,
+followed by the share of locations where the cosine rises:
+
+| change | P23 (trained padded) | P31 (trained flush) |
+|---|---|---|
+| 4 px of blank beside the edge, L4 − L0 / R4 − R0 | **+0.021 / +0.019** (76% / 74%) | **−0.007 / −0.011** (36% / 27%) |
+| 16 px, L16 − L0 / R16 − R0 | **+0.025 / +0.024** (86% / 79%) | **−0.012 / −0.011** (22% / 21%) |
+| same 16 px move in the interior, C+16 − centre | −0.0001 ± 0.0002 | +0.0005 ± 0.0002 |
+| centred − flush (L / R) | +0.028 / +0.026 | −0.008 / −0.011 |
+| 16 px border each side − bare crop | +0.069 (95%) | −0.020 (20%) |
+| bare crop − centred | −0.093 | −0.001 |
+| R@1: flush L0 / L16 / centred / bare | 71.0 / 76.0 / 78.5 / 56.0 | 63.5 / 62.0 / 61.5 / 65.0 |
+
+- **The sign flips with training.** The padded model gains when a blank neighbour is
+  added at the edge, and the flush-trained model loses the same amount or more, at the same
+  pixels. An interior shift of the same size does nothing in either (|Δ| ≤ 0.0005), so this
+  is about the edge's neighbour, not position or stride phase. The dependence is learned,
+  not built into ConvNeXt's zero conv padding.
+- **Each model wants its training-time edge.** P23 recovers most of the loss with 4 px of
+  blank and needs about 16 px to recover it all. P31 loses most at 8–16 px of blank and
+  recovers by 64 px. A thin blank strip is the most foreign input to it.
+- **P31 is nearly indifferent to the amount of blank** (bare crop vs centred on the canvas:
+  −0.001), while P23 drops 0.093 cosine and 22.5 R@1 without its canvas. The canvas-width
+  insensitivity seen on CVUSA earlier holds for the padded model only within padded inputs.
+- Slides (mean fill only, stage 3) at the first two sample locations both models retrieve:
+  idx 5902 at 115° (P23 flush-left 0.441 vs centred 0.554; P31 0.480 vs 0.471) and idx 7400
+  at 67.5° (P23 0.314 vs 0.354; P31 0.410 vs 0.377). They are under each run's
+  `..._weights_end_padslide/idx{5902_h115.09,7400_h67.5}_fov100_L3/`.
+- Caveat: P31 also differs in per-batch FoV sampling, which is needed to collate unpadded
+  crops. The test is on CVUSA because no CVACT run trained flush; C1/C3/Q1 use a 64 px
+  border. Figure and CSV: `LowFoVGradCAM/figures/flush_vs_training/fov100_n200_seed0.*`.
+
+### Which cells carry the flush loss: locality and Shapley patching (2026-11-07)
+
+`LowFoVGradCAM/padding_patch.py`. The probe uses P23 and P31 on 200 CVUSA locations and
+C15 e64 on 200 CVACT locations, with 100° crops and mean fill. Both edges are tested at
+each location (n = 400).
+- **Placements.** The crop is placed flush (F) and 9 cells (288 px) away from the border
+  (R). The stem and downsampling convs are unpadded with stride equal to kernel, so a 32k px
+  shift moves every stage-3 cell by exactly k columns. Matched cells therefore differ only
+  through the zero-padded 7×7 convs meeting the border. The 32 px control (R vs R moved one
+  more cell) gives a floor of ≤ 0.013 in the crop.
+- **Far-side check.** 1a also places the crop flush on a 480 px canvas, so its far side
+  (267 px of blank, then the border) is identical to R's. This matches F to within 0.006,
+  so the far side's extra blank plays no part.
+- **Decomposition.** The descriptor sees only the mean cell, so cell groups can be swapped
+  between R and F. Exact Shapley values over all 256 subsets of the eight groups sum to
+  flush − ref. One-at-a-time swaps disagree in sign for some groups, so the groups
+  interact.
+
+**1a: relative feature change ‖F − R‖/‖R‖ of matched cells.** Columns are cells counted
+from the touching edge; "far seam 1" is the first blank cell beyond the other edge.
+
+| | edge cell | d1 | d3 | d6 (other edge) | far seam 1 |
+|---|---|---|---|---|---|
+| P23 (padded) | 0.68 | 0.43 | 0.25 | 0.25 | 0.22 |
+| C15 (padded) | 0.78 | 0.58 | 0.35 | 0.13 | 0.09 |
+| P31 (flush) | 0.65 | 0.36 | 0.20 | 0.08 | 0.08 |
+
+**1b: Shapley cosine change per group**, with the share of flush − ref in brackets:
+
+| | flush − ref | edge cells d0–d2 | crop d3+ | near seam (lost) | far seam | blank cells | R@1 ref → flush |
+|---|---|---|---|---|---|---|---|
+| P23 | −0.028 | −0.014 (49%) | −0.009 (32%) | −0.005 (17%) | −0.004 (14%) | +0.003 | 75.0 → 69.8 |
+| C15 | −0.011 | −0.001 (8%) | −0.004 (33%) | **−0.008 (71%)** | −0.000 | +0.002 | 51.5 → 44.2 |
+| P31 | +0.008 | **+0.008 (103%)** | +0.002 (25%) | −0.002 (−23%) | 0.000 | −0.000 | 63.5 → 64.0 |
+
+- **The border reaches the whole crop, not just its edge cells.** Every crop cell changes
+  7× to over 1000× above the floor, decaying from 0.65–0.78 at the edge to 0.08–0.25 at the
+  opposite edge, and the blank beyond that edge changes too. The flush-trained P31 shows
+  the same profile, slightly shallower, so the spreading comes from the architecture.
+  P23, the strongest-padded CVUSA model, carries it furthest (still 0.18–0.25 at the
+  far seam).
+- **Training decides whether the change costs or pays.** In C15 most of the loss is the
+  lost near seam (71%): the blank cells beside the edge that carry crop-edge evidence
+  (see the region ablation above). Interior crop cells add a third. The edge cells change
+  most, yet they cost C15 almost nothing. In P23 the loss is spread over the whole crop
+  plus the far seam. In P31 the gain sits in the edge cells (103%): its trained
+  border-touching form matches the tile better.
+- Swapping in only "edge cells d0–d2 + near seam" recovers 66% (P23) / 79% (C15) of the
+  cosine loss and half of the R@1 loss (C15 48.0 of 44.2 → 51.5).
+- **Correction to the 2026-11-06 wording.** C15's mean flush loss over 200 locations is
+  **0.011**. The 0.02–0.06 came from idx 14/18 only. The claim "the crop's own edge cells
+  change and the seam disappears" is half right: the seam is the main cost, but the cells
+  that change are all of them, and the edge cells are not where C15 loses.
+- Figure, CSVs and summary: `LowFoVGradCAM/figures/flush_patch/fov100_n200_seed0*`.
+
+### Does a crop edge know how wide the crop is? Fixed-edge width decoding (2026-11-07)
+
+`LowFoVGradCAM/edge_width_probe.py`, run on P23, P31 (200 CVUSA locations each) and C15
+e64 (200 CVACT locations).
+- **Setup.** The descriptor knows the width trivially from the number of blank cells, so
+  the probe reads only the stage-3 cells at one edge. That edge is held fixed at the same
+  canvas and panorama column, 96 px (3 cells, one full seam) from the border. The crop
+  widens from it in 30° (64 px) steps from 30° to 270°, always keeping 96 px to the far
+  border. Both orientations are tested.
+- **Decoding.** For each step, a standardised ridge classifier on one cell group learns to
+  tell the two widths apart. It is tested on locations it never saw (5 folds grouped by
+  location, alpha from an inner grouped split). The null fit, with labels swapped at random
+  locations, averages 50.0%.
+
+| held-out accuracy | 30→60° | 90→120° | 120→150° | 150→180° | 180→210° | 210→240° | 240→270° |
+|---|---|---|---|---|---|---|---|
+| C15 seam / edge cell | 91 / 77 | 90 / 82 | 78 / 75 | 60 / 61 | 55 / 54 | 52 / 52 | 50 / 51 |
+| P23 seam / edge cell | 80 / 61 | 83 / 71 | 81 / 75 | 66 / 66 | 55 / 56 | 51 / 51 | 51 / 50 |
+| P31 seam / edge cell | 88 / 65 | 73 / 56 | 73 / 61 | 70 / 61 | 66 / 56 | 58 / 54 | 52 / 53 |
+| descriptor C15 / P23 / P31 | 91 / 70 / 86 | 89 / 72 / 69 | 88 / 70 / 61 | 80 / 57 / 60 | 78 / 53 / 62 | 85 / 59 / 60 | 84 / 55 / 56 |
+
+- **The edge knows the width only while the other edge is within reach.** Width decodes
+  well while the moving edge is ≤ 256–320 px (8–10 cells) away. It fades over the 150→210°
+  steps (60–66%, then 55%) and is at chance past 210° for the padded models. The cells stop
+  moving too:
+  C15's seam changes 0.6% per step at 210→240° and 0.2% at 240→270°. This is the same
+  reach as the border effect in the patching probe above. So the edge carries no global
+  width code; it registers the other edge only when its receptive field reaches it.
+- **Not a product of padded or FoV-aware training.** The flush-trained P31, which never
+  saw a blank canvas, reaches slightly further (seam 66% at 180→210°, 58% at 210→240°).
+- **Where width is known at wide FoV, it is global.** A ridge regression of width over
+  120–270° reaches R² 0.18–0.50 from the edge groups, driven by the 120–180° steps. The
+  descriptor reaches 0.91 for C15 but only 0.50 for P31 and 0.03 for P23. P23's descriptor
+  is close to width-invariant beyond 120°, so the descriptor is no universal positive
+  control.
+- Figure, CSVs and summary: `LowFoVGradCAM/figures/edge_width/n200_seed0*`. Per-run
+  feature caches (`*.npz`, about 90 MB each) are in the same folder.
+
 ## All runs
 
 | run | pad | FoV samp | wedge | mask | rncW | τ | q1 roll | FoV 360 | 180 | 90 | 70 | Avg | ep |
@@ -1591,3 +1892,38 @@ Framed as masked learning, each item attributes one component.
 160 epochs (never completed — round3a died at e8), batch size (16 vs
 Sample4Geo's 128), and FoV 360, the one column where round4a still trails the
 paper.
+
+---
+
+## Split vs contiguous masked crops on roundP35 e72 (eval-only, 2026-11-07)
+
+`LowFoVGradCAM/split_scan.py` on `roundP35 _20261106-210035/weights_e72_72.9851.pth`, all
+8,884 CVUSA val queries, mean fill. For each FoV and compass direction the same
+azimuths are kept in place on a mean-colour canvas (the `masked_crop.py` construction,
+checked equal): **contiguous** = rolled to the compass, crop centred (blank on both
+sides, as the padded eval); **split** = rolled to compass + 180, crop centred on the
+tensor edge (half at each end, blank in the middle). Training places the padded crop
+at a random *non-wrapping* offset since 2026-09-02, so P35 never saw a split crop.
+Full panorama R@1 95.80. Ranks per location in
+`LowFoVGradCAM/figures/roundP35-..._weights_e72_72.9851_split_scan/split_scan_ranks.csv`.
+
+| FoV | compass | contiguous R@1 | split R@1 | split better | split worse |
+|---|---|---|---|---|---|
+| 270 | 0 / 90 / 180 / 270 | 94.44 / 94.24 / 94.46 / 94.18 | 94.27 / 93.25 / 94.70 / 93.43 | | |
+| 270 | all | **94.33** | **93.91** | 2.1% | 2.8% |
+| 180 | 0 / 90 / 180 / 270 | 90.23 / 89.35 / 89.64 / 88.91 | 90.06 / 88.27 / 89.80 / 87.97 | | |
+| 180 | all | **89.53** | **89.03** | 4.0% | 5.4% |
+| 90 | 0 / 90 / 180 / 270 | 70.69 / 74.10 / 70.34 / 73.05 | 70.17 / 68.91 / 69.73 / 67.50 | | |
+| 90 | all | **72.05** | **69.08** | 10.7% | 19.4% |
+
+- Splitting the crop across the tensor edge costs little at wide FoV (−0.42 at 270,
+  −0.50 at 180) and ~3 at FoV 90. The cost sits at compass 90/270 (about −1 at
+  270/180, −5 at 90); at compass 0/180 it is ~0. Not explained yet.
+- Example location for the paper figure, chosen symmetrically (`pick_hard.py`: pano
+  rank 1, median rank over all FoV 270/180 crops of both placements in [3, 20]; 39
+  qualify): **index 8226** (query 3916), a flat rural road. FoV 270 facing east:
+  contiguous rank 11 (cos 0.251) vs split rank 22 (cos 0.245); both maps sit on the same
+  roadside vegetation and the same field edge in the tile (84% vs 81% in sector). The
+  rotated full panoramas already drop to rank 3-4. Figures:
+  `figures/roundP35-..._e72_72.9851_masked/idx8226_r90_h0_fov270_L3_singeo`,
+  `idx8226_r270_h180_fov270_L3_singeo`.

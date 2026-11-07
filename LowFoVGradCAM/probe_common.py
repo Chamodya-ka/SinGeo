@@ -32,8 +32,8 @@ from singeo.model import TimmModel_SinGeo, set_conv_padding_mode  # noqa: E402
 from singeo.transforms import (_bearing_grid, apply_aerial_sector, blank_canvas,  # noqa: E402
                                get_transforms_val, mask_fill_values)
 
-# Categorical slots 1-3 of the reference palette (light mode), in fixed order.
-SERIES = ("#2a78d6", "#eb6834", "#1baf7a")
+# Categorical slots 1-5 of the reference palette (light mode), in fixed order.
+SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")
 INK, INK_2, MUTED = "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS, BAND = "#e1e0d9", "#c3c2b7", "#f0efec"
 
