@@ -8,6 +8,7 @@
 #
 #   roundV1   roundP32 on VIGOR cross-area (train New York + Seattle, test Chicago + San Francisco)
 #   roundV2   roundP32 on VIGOR same-area
+#   roundV3   roundP37 on VIGOR same-area (V2 + held loss1 share + FoV 0 eval)
 #
 # VIGOR notes that differ from CVUSA:
 #   * ground images are 1024x2048 natively and are resized to 384x768, the ratio
@@ -103,6 +104,31 @@ roundV2)
 panoramas from the same areas, scored against all 90,618 tiles. Everything else
 is roundV1, which is roundP32 on VIGOR. SinGeo reports 62.9 at FoV 360 and 24.0
 at FoV 90 here.'
+    ;;
+roundV3)
+    echo "Round V3 - roundP37 on VIGOR same-area: V2 + held loss1 share [80 ep]"
+    echo "  CVUSA P37 81.54 vs P32 82.58 (-1.04); CVACT twin C15 57.84 vs C9 55.20 (+2.64)"
+    echo "  SinGeo published, same-area: 62.9 @ FoV 360, 24.0 @ FoV 90; no V2 control run yet"
+    launch roundV3-vigor-same-p37 "${P32[@]}" \
+        SINGEO_SAME_AREA=true \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_RUN_NOTE='V3. roundP37 on the VIGOR same-area split: roundV2 (roundP32 on VIGOR
+same-area) with infonce_hold_loss1_share on. Each batch loss1 (q1-r1) is scaled
+by the mean gate of loss2 to loss6, so it keeps a fixed 1/6 share of the gated
+InfoNCE mass instead of drifting from about 17 to 36 pct as the crop and wedge
+narrow. FoV 0, the north aligned panorama, is added to the evals so the roll
+gap (FoV 0 minus FoV 360) is logged; it does not touch training.
+
+WHY. The held share went opposite ways on the two datasets so far. CVACT C15
+beat C9 by 2.64 Avg, nearly all at FoV 360 (+7.42), closing a roll gap of about
+15. CVUSA P37 lost 1.04 Avg to P32, at 180 and below, where the roll gap was
+only about 2. VIGOR is a third dataset with a camera off the tile centre, and
+this asks which way it goes there.
+
+READING. No same-area control has run: roundV2 is the one-variable control.
+Until it has, compare with SinGeo published same-area (62.9 at FoV 360, 24.0 at
+FoV 90). Read all five columns, the roll gap and Hit_Rate.'
     ;;
 list)
     screen -list || echo "no sessions"

@@ -11,9 +11,11 @@ def evaluate(config,
                   gallery_loader,
                   ranks=[1, 5, 10],
                   step_size=1000,
-                  cleanup=True):
-    
-    
+                  cleanup=True,
+                  return_metrics=False):
+    """R@1 (a 0-dim tensor, upstream's return), or with `return_metrics` a dict
+    of floats in percent: r1, r5, r10 (one entry per `ranks`), r_top1 and ap."""
+
     print("Extract Features:")
     img_features_query, ids_query = predict(config, model, query_loader)
     img_features_gallery, ids_gallery = predict(config, model, gallery_loader)
@@ -47,14 +49,19 @@ def evaluate(config,
     string.append('Recall@top1: {:.4f}'.format(CMC[top1]*100))
     string.append('AP: {:.4f}'.format(AP))             
         
-    print(' - '.join(string)) 
-    
+    print(' - '.join(string))
+
     # cleanup and free memory on GPU
     if cleanup:
         del img_features_query, ids_query, img_features_gallery, ids_gallery
         gc.collect()
         #torch.cuda.empty_cache()
-    
+
+    if return_metrics:
+        metrics = {"r{}".format(i): float(CMC[i-1]) * 100 for i in ranks}
+        metrics["r_top1"] = float(CMC[top1]) * 100
+        metrics["ap"] = float(AP)
+        return metrics
     return CMC[0]
 
 
@@ -89,12 +96,12 @@ def compute_mAP(index, good_index, junk_index):
         return ap,cmc
 
     # remove junk_index
-    mask = np.in1d(index, junk_index, invert=True)
+    mask = np.isin(index, junk_index, invert=True)  # np.in1d is gone in NumPy 2.4+
     index = index[mask]
 
     # find good_index index
     ngood = len(good_index)
-    mask = np.in1d(index, good_index)
+    mask = np.isin(index, good_index)
     rows_good = np.argwhere(mask==True)
     rows_good = rows_good.flatten()
     

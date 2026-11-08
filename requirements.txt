@@ -1,8 +1,109 @@
-torch>=1.13.1
-timm>=0.8.8
-scipy>=1.10.0
-albumentations>=1.3.0
-scikit-learn>=1.2.1
-transformers>=4.27.0
-pandas
-tqdm
+# Exact environment used for every experiment on server B (H100 NVL), 2026-09-22 onward.
+#
+#   Python 3.12.3   (Ubuntu 24.04 system python, `python3.12 -m venv`)
+#   pip    24.0
+#   torch  2.14.0+cu130 — the default PyPI Linux wheel; needs an NVIDIA driver >= 580
+#          (server B: 580.178.04, CUDA 13.0, cuDNN 9.24)
+#
+# Recreate:
+#   python3.12 -m venv venv
+#   venv/bin/python -m pip install pip==24.0
+#   venv/bin/python -m pip install -r requirements.txt
+#
+# albumentations must stay at 1.3.1: 2.x crashes LimitedFoV and silently ignores
+# CoarseDropout/ImageCompression arguments.
+#
+# Not pinned: earthengine-api (`import ee`), used only by
+# fetch_satellite_embeddings_cvusa.py; it was never installed in this venv.
+
+# --- imported directly by the code ---
+torch==2.14.0
+torchvision==0.29.0
+timm==1.0.29
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+pandas==3.0.6
+opencv-python-headless==5.0.0.93
+albumentations==1.3.1
+transformers==5.17.0
+matplotlib==3.11.2
+pillow==12.3.0
+tqdm==4.70.1
+pytest==9.1.1
+
+# --- dependencies of the above (from pip freeze) ---
+albucore==0.0.24
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+cloudpickle==3.1.2
+contourpy==1.4.0
+cuda-bindings==13.4.2
+cuda-pathfinder==1.8.2
+cuda-toolkit==13.0.3.0
+cycler==0.12.1
+filelock==4.0.1
+fonttools==4.65.0
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.32.0
+idna==3.20
+ImageIO==2.37.4
+iniconfig==2.3.0
+Jinja2==3.1.6
+joblib==1.6.0
+kiwisolver==1.5.1
+lazy-loader==0.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+narwhals==2.26.0
+networkx==3.7
+nvidia-cublas==13.1.1.3
+nvidia-cuda-cupti==13.0.85
+nvidia-cuda-nvrtc==13.0.88
+nvidia-cuda-runtime==13.0.96
+nvidia-cudnn-cu13==9.24.0.43
+nvidia-cufft==12.0.0.61
+nvidia-cufile==1.15.1.6
+nvidia-curand==10.4.0.35
+nvidia-cusolver==12.0.4.66
+nvidia-cusparse==12.6.3.3
+nvidia-cusparselt-cu13==0.8.1
+nvidia-nccl-cu13==2.30.7
+nvidia-nvjitlink==13.4.92
+nvidia-nvshmem-cu13==3.4.5
+nvidia-nvtx==13.0.85
+packaging==26.3
+pluggy==1.6.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+qudida==0.0.4
+regex==2026.9.10
+rich==15.0.0
+safetensors==0.8.0
+scikit-image==0.26.0
+setuptools==84.0.0
+shellingham==1.5.4
+simsimd==6.5.16
+six==1.17.0
+stringzilla==5.1.2
+sympy==1.14.0
+threadpoolctl==3.7.0
+tifffile==2026.9.20
+tokenizers==0.23.2
+triton==3.8.0
+typer==0.27.2
+typing-inspection==0.4.4
+typing_extensions==4.16.0

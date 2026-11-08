@@ -120,6 +120,7 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP35 `_20261106-210035` | B | padded, **per-epoch** | CVUSA twin of CVACT roundC16. P32 with the Gaussian fields replaced by `FOV_SAMPLING=deterministic FOV_CURRICULUM_END=70.0 FOV_SCHEDULE_LAMBDA=5.0` (exponential fast-to-slow, ≤180 from e16, ≤90 from e42), plus `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' INFONCE_HOLD_LOSS1_SHARE=true EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)'` (FoV 0 = north-aligned, for the roll gap). Three changes on P32, so a gain credits the set. No per-sample FoV draw, so the RNG fix does not reach the ground FoV | 94.87 | 90.03 | 72.99 | 64.26 | **80.54** | stopped in e79; last eval e76 (FoV 0 95.67, roll gap 0.80); best weights e72. −1.88 vs P32 at e76, all at the narrow FoVs; CVACT twin C16 +3.45 over C9 |
 | roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | 94.59 | 91.60 | 76.10 | 66.51 | **82.20** | final — FoV 0 96.60, roll gap 2.01. −0.38 vs P32, every column within 0.6, so a2g 0.5 is not what cost P35 its narrow FoVs. Second-best CVUSA Avg after P32 |
 | roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | 95.54 | 90.98 | 74.76 | 64.86 | **81.54** | final — FoV 0 96.21, roll gap 0.66. −1.04 vs P32 (360 +0.50, 180 −1.18, 90 −1.40, 70 −2.08): C15's CVACT gain does not transfer |
+| roundP38 `_20261109-015652` | B | padded, per-sample | P37 + `RNC_WEIGHT=0.0` — RnC off by weight (wedge, arcs, gate and held share kept), one variable. Does RnC still pay once loss1's share is held? CVUSA counterpart of the RnC-off test CVACT lacks (C15 with RnC off). Same code as P37 (train.py identical to its snapshot), both post RNG fix: a clean pair | | | | | | running |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -1477,6 +1478,7 @@ can be the RnC hardest negative. That matches how SinGeo trains on VIGOR.
 | **roundV1 P32** `_20261103-162551`, best FoV 90 (e56) | cross | **31.02** | 24.80 | 15.90 | **7.20** | 5.44 | 14.89 | 7.93 | stopped e71 |
 | roundV1, last eval (e68) | cross | 28.24 | 23.76 | 15.18 | 6.92 | 5.29 | 13.91 | 7.64 | |
 | roundV1, peak FoV 360 (e20) | cross | 32.79 | 27.14 | 16.35 | 6.57 | 4.61 | 15.08 | 7.34 | |
+| roundV3 P37 `_20261109-002907` | same | | | | | | | | running — V1's recipe on same-area + `INFONCE_HOLD_LOSS1_SHARE=true`, FoV 0 added to the evals. No same-area control (roundV2) yet; ~1.8 it/s, disk-bound |
 
 **roundV1 result.** Stopped by hand during epoch 72 (LR already 3e-6), so there is
 no `weights_end.pth`; the checkpoint is `weights_e56_7.1963.pth`. Against SinGeo's
@@ -1494,6 +1496,45 @@ the H100: 3.0-3.15 it/s at 100% GPU (GPU-bound with 8 workers), 38.7 GB; an epoc
 is ~17 min and a five-FoV eval plus the train-set similarity rebuild ~23 min, so
 an 80-epoch run takes ~31 h. Zero-shot (ImageNet weights) is chance level:
 R@1 0.03-0.06 at every FoV, R@1% 5.6-8.9.
+
+## University-1652 port (2026-11-09): the C15 recipe on street photos with no heading
+
+`train_singeo_u1652.py` ports `train_singeo_cvact.py` (same `SINGEO_*` fields, same
+`train_contrast_singeo_rnc`); dataset `singeo/dataset/u1652.py`, launcher
+`./run_u1652.sh`, checkpoints under `Singeo_data/U1652/`, tests `tests/test_u1652.py`.
+Upstream's `train_singeo_university.py` is untouched. Data:
+`/home/71/25021871/data/chamodya/University-Release` (train 2,659 street photos of
+701 buildings; test street → satellite 2,579 queries vs 951 tiles).
+
+What changes, and why:
+
+- **No panorama.** Street views are 512 × 512 perspective photos (resized to 384 ×
+  384). q1 is the photo; q2 a horizontal strip, padded to full width with the mean
+  colour. FoV keeps degree units with the photo = 360, so C15's band (mean 360 → 90
+  by e24, std 40, clip 70) keeps a quarter of the width once settled. The strip
+  never wraps (`apply_strip_crop`): a photo's edges are not adjacent.
+- **No heading, so no wedge.** r2 is the whole tile under C15's continuous rotation
+  (bound 0 → 180° over the run), arc recorded as 360. The circle gate then scores
+  q1-q2, r1-q2 and r2-q2 by the strip's share and the rest at 1, the held loss1
+  share applies unchanged, and RnC's a2g ranks photo > strip > hardest negative.
+  r1 keeps the 90k turn (p 0.75) without the panorama roll.
+- **No GPS**: epoch 1 batches are random unique-building batches; similarity
+  sampling (building level, max over a building's photos) from the first eval on.
+- **Evaluation** on the test split (there is no val split), upstream SinGeo's code:
+  street → satellite on the whole photo is the checkpoint metric, strips at
+  270/180/90/70 are extras (seeded, same strips every eval), satellite → street
+  also logged. As upstream (Sample4Geo convention), gallery buildings with no query
+  are junk, not distractors: 250 of 951 tiles, 342 of 2,921 photos.
+- **Upstream evaluator fixed for NumPy 2.5**: `np.in1d` no longer exists; replaced
+  by `np.isin` in `singeo/evaluate/university.py` (same result). Upstream's own
+  University scripts crashed at the first eval before this.
+
+Smoke run (2 epochs, scratchpad): 2.2 it/s next to roundV3, ~1.3 min per epoch and
+per eval, so an 80-epoch run takes ~2.5 h.
+
+| run | St2S R@1 (photo) | R@5 | AP | strip 270 | 180 | 90 | 70 | S2St R@1 | S2St AP | ep |
+|---|---|---|---|---|---|---|---|---|---|---|
+| roundU1 C15 port `_20261109-012537` | | | | | | | | | | running |
 
 ## RnC overlap ordering probes on roundC15 e64 (eval-only, 2026-11-06)
 

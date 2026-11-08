@@ -60,6 +60,7 @@
 #   roundP35  CVUSA twin of CVACT C16: P32 + exponential FoV (lam 5) + a2g 0.5 + loss1 share held
 #   roundP36  P32 with a2g RnC at 0.5, one variable
 #   roundP37  P32 with the loss1 share held (CVUSA twin of CVACT C15), one variable
+#   roundP38  P37 with RnC off (rnc_weight 0; wedge, arcs and gate kept), one variable
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -2026,6 +2027,46 @@ READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
 95.05/92.17/76.16/66.94), roll gap 1.77 in the probe. CONFOUND: P32 ran before the
 per-worker FoV RNG fix and this run draws per-sample Gaussian FoVs after it, so a
 gap to P32 mixes the held share with the fix. Roll gap = FoV 0 minus FoV 360.'
+    ;;
+roundP38)
+    echo "Round P38 - P37 with RnC off (rnc_weight 0), nothing else changed [80 ep]"
+    echo "  control roundP37 _20261107-173606 81.54 (post RNG fix, same code path)"
+    launch roundP38-p37-nornc \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=true \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P38. roundP37 with rnc_weight 0 and nothing else changed. RnC is disabled by
+weight, not use_rnc=False, so the wedge, the recorded arcs, the circle gate and
+the held loss1 share all stay exactly as in P37; the RnC groups are still computed
+and logged but carry no gradient. The group weights (1, 0, 1, 0) are kept so the
+override list differs from P37 in one field.
+
+WHY. Asks whether RnC still pays once loss1 keeps a fixed 1/6 share of the gated
+InfoNCE mass. On P23 (loss1 share free) RnC was worth 1.11 Avg (P28 79.69 vs P23
+80.80), and dropping the same-domain groups took it to 2.89 (P32 82.58), most of
+it at FoV 90 (+3.25) and 70 (+4.43). It is also the CVUSA counterpart of the RnC
+off test CVACT has never had (C15 with rnc_weight 0).
+
+READING. Control roundP37 _20261107-173606: 360/180/90/70 = 95.54/90.98/74.76/64.86,
+Avg 81.54, FoV 0 96.21, roll gap 0.66. Both runs are post RNG fix on the same code
+path, so this is a clean one variable pair (unseeded, so run to run spread
+applies). P28 suggests RnC off costs the narrow FoVs most and drags the rotated
+flush FoV 360 query (an input artefact); read FoV 0 and the roll gap alongside 360.'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"

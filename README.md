@@ -9,19 +9,26 @@ SinGeo tries to deliver a paradigm shift to learning a single model for robust C
 
 ## Environments
 
-Required environments:
-- Linux
-- Python 3.7+
-- PyTorch 1.10.0+
-- CUDA 9.2+
-- GCC 5+
+Exact environment used for all experiments in `EXPERIMENTS.md` (server B, H100 NVL):
+- Linux x86_64 (Ubuntu 24.04)
+- **Python 3.12.3** (also in `.python-version`)
+- pip 24.0
+- PyTorch 2.14.0 + CUDA 13.0 (the default PyPI wheel), torchvision 0.29.0, timm 1.0.29
+- NVIDIA driver ≥ 580 (server B runs 580.178.04)
+- **albumentations 1.3.1** — 2.x crashes `LimitedFoV` and silently ignores
+  CoarseDropout/ImageCompression arguments
 
-Please use the following commands to prepare the environment.
+`requirements.txt` pins every package in that venv with `==`. To recreate it:
 ```
 git clone https://github.com/Yangchen-nudt/SinGeo.git
 cd SinGeo
-pip install -r requirements.txt
+python3.12 -m venv venv
+venv/bin/python -m pip install pip==24.0
+venv/bin/python -m pip install -r requirements.txt
+venv/bin/python -m pytest tests/ -q   # 143 pass, 1 known failure (see CLAUDE.md)
 ```
+`fetch_satellite_embeddings_cvusa.py` also needs `earthengine-api`, which is not pinned
+because it was never installed in this venv.
 
 ## Training:
 We provide codes for training on 4 datasets (CVUSA/CVACT/VIGOR/University-1652), and take the CVUSA for example.
