@@ -1927,3 +1927,45 @@ Full panorama R@1 95.80. Ranks per location in
   rotated full panoramas already drop to rank 3-4. Figures:
   `figures/roundP35-..._e72_72.9851_masked/idx8226_r90_h0_fov270_L3_singeo`,
   `idx8226_r270_h180_fov270_L3_singeo`.
+
+---
+
+## Padding amount at eval on CVACT roundC9 e60 (eval-only, 2026-11-08)
+
+`LowFoVGradCAM/padding_width_eval.py` on `roundC9 _20261031-005205/weights_e60_46.6569.pth`
+(trained padded, per-sample Gaussian FoV, mean fill), all 8,884 CVACT val queries.
+Each query is cut once per FoV exactly as the eval cuts it (integer roll, leading FoV
+columns, seed 0), and that same crop is scored with different blank around it: none
+(flush), a fixed 4/16/32/64 px border on each side, or the full 768 px canvas at a
+random non-wrapping column (the trained protocol; at FoV 360 that is the flush
+panorama). Paired comparison: only the blank changes. Full-width matches the logged
+e60 column within roll noise (72.30 / 79.47 / 69.27 / 46.66 / 37.30 logged). Results:
+`experiments/padding_width_cvact_roundC9_e60.csv` (R@1/5/10); graphs and per-query
+ranks in `LowFoVGradCAM/figures/roundC9-..._weights_e60_46.6569_padwidth/`
+(`padding_width_plot.py`).
+
+| R@1 | none | 4 px | 16 px | 32 px | 64 px | full width |
+|---|---|---|---|---|---|---|
+| 360 | 71.79 | 79.42 | **82.13** | 82.06 | 81.80 | 71.79 (= none) |
+| 270 | 65.85 | 74.11 | 79.31 | **79.46** | 79.34 | 79.18 |
+| 180 | 42.17 | 60.18 | 69.68 | **69.80** | 69.60 | 69.75 |
+| 90 | 35.96 | 38.86 | 44.29 | 45.35 | 45.72 | **46.03** |
+| 70 | 22.17 | 23.28 | 31.62 | 34.21 | 35.79 | **36.52** |
+| Avg (360/180/90/70) | 43.02 | 50.44 | 56.93 | 57.86 | **58.23** | 56.02 |
+
+- **Some padding is required.** No blank costs 10.1 (FoV 90) to 27.6 (180) against
+  full width; at 360 the flush panorama is 10.3 below a 16 px border.
+- **At FoV ≥ 180 the amount does not matter once it is ≥ 16 px**: 16, 32, 64 px and
+  full width sit within 0.3 of each other at 270 and 180; at 360 16–64 px are within
+  0.35 (full width is flush there).
+- **At FoV 90 and 70 it still matters below 64 px.** R@1 climbs with the blank and
+  approaches full width: FoV 70 22.17 → 23.28 → 31.62 → 34.21 → 35.79 → 36.52. 64 px is
+  within 0.31 (90) and 0.73 (70) of the 768 px canvas. Likely because training gave
+  FoV 70 crops ~80% blank, so the blank share the pooled descriptor sees is part of
+  the trained input there.
+- **4 px recovers much less here than on CVUSA.** The CVUSA "4 px recovers 10.5 of 12"
+  finding was measured on round4a at FoV 90; here 4 px recovers 7.6 of 10.3
+  at 360 but only 1.1 of 14.4 at FoV 70.
+- A 64 px border is the best Avg (58.23, +2.21 over the trained full-width protocol),
+  from FoV 360 (+10.0), where full width leaves the panorama flush; it trails full
+  width by 0.15–0.73 at 180, 90 and 70.
