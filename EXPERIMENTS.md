@@ -118,8 +118,8 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP33 `_20261031-152053` | B | padded, per-sample | P32 + `RNC_WEIGHT=0.4` — first P32-family run after the per-worker FoV RNG fix, so the dose and the fix are confounded | 94.69 | 90.61 | 72.79 | 63.77 | **80.47** | final |
 | roundP34 `_20261101-233600` | B | padded, per-sample | P32 + `GROUND_ROLL_Q1_RAMP_FRAC=1.0`: q1 rolled by U(−A, +A), A linear 0° (e1) → 180° (e80). Only q1 changes; q2/r1/r2, meta and overlap labels verified bit-identical. Post RNG fix | | | | | | running |
 | roundP35 `_20261106-210035` | B | padded, **per-epoch** | CVUSA twin of CVACT roundC16. P32 with the Gaussian fields replaced by `FOV_SAMPLING=deterministic FOV_CURRICULUM_END=70.0 FOV_SCHEDULE_LAMBDA=5.0` (exponential fast-to-slow, ≤180 from e16, ≤90 from e42), plus `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' INFONCE_HOLD_LOSS1_SHARE=true EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)'` (FoV 0 = north-aligned, for the roll gap). Three changes on P32, so a gain credits the set. No per-sample FoV draw, so the RNG fix does not reach the ground FoV | 94.87 | 90.03 | 72.99 | 64.26 | **80.54** | stopped in e79; last eval e76 (FoV 0 95.67, roll gap 0.80); best weights e72. −1.88 vs P32 at e76, all at the narrow FoVs; CVACT twin C16 +3.45 over C9 |
-| roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | | | | | | running |
-| roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | | | | | | running |
+| roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | 94.59 | 91.60 | 76.10 | 66.51 | **82.20** | final — FoV 0 96.60, roll gap 2.01. −0.38 vs P32, every column within 0.6, so a2g 0.5 is not what cost P35 its narrow FoVs. Second-best CVUSA Avg after P32 |
+| roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | 95.54 | 90.98 | 74.76 | 64.86 | **81.54** | final — FoV 0 96.21, roll gap 0.66. −1.04 vs P32 (360 +0.50, 180 −1.18, 90 −1.40, 70 −2.08): C15's CVACT gain does not transfer |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -1098,6 +1098,34 @@ down to 0.5) and a wider band.
 > aligned score falling to 95.7, not by the rotated one rising), and the narrow FoVs
 > move the other way. One-variable follow-ups on P32: roundP36 (a2g 0.5) and roundP37
 > (held share); both post RNG fix, P32 is not.
+>
+> **roundP36 `_20261107-172318` and roundP37 `_20261107-173606`, final (e80).**
+>
+> | run | 360 | 0 | 270 | 180 | 90 | 70 | Avg | roll gap |
+> |---|---|---|---|---|---|---|---|---|
+> | P32 (control) | 95.05 | — | 95.08 | 92.17 | 76.16 | 66.94 | **82.58** | 1.77 (probe) |
+> | P36 (a2g 0.5) | 94.59 | 96.60 | 95.19 | 91.60 | 76.10 | 66.51 | **82.20** | 2.01 |
+> | P37 (held loss1 share) | 95.54 | 96.21 | 94.82 | 90.98 | 74.76 | 64.86 | **81.54** | 0.66 |
+>
+> P36 − P32: 360 −0.46, 180 −0.56, 90 −0.06, 70 −0.43, Avg −0.38. P37 − P32: 360
+> +0.50, 180 −1.18, 90 −1.40, 70 −2.08, Avg −1.04. P36 − P37: 360 −0.96, 180 +0.62,
+> 90 +1.34, 70 +1.65, Avg +0.66.
+>
+> - **Halving a2g is not what cost P35 its narrow FoVs.** At e76 P36 − P32 is −0.12
+>   at FoV 90 and −0.52 at 70, against P35's −3.18 and −2.62. The small gap also
+>   bounds the RNG fix: unless a2g 0.5 and the fix happen to cancel, the fix alone
+>   costs little.
+> - **The held loss1 share does not transfer.** On CVACT it was worth +2.64 Avg (C15 −
+>   C9) with every narrow column up; on CVUSA it costs 1.04, growing toward the narrow
+>   end. It does shrink the roll gap further (0.66, below P35's 0.80), and here mostly
+>   by raising the rotated query: P37 − P36 is +0.95 at FoV 360 and −0.39 at FoV 0.
+>   CVUSA's gap is ~2 to begin with, so there is little to win.
+> - **P35's narrow-FoV loss is mostly the held share.** At e76 P37 − P32 is −1.77 at
+>   FoV 90 and −2.36 at 70, against P35's −3.18 and −2.62 (assuming the effects
+>   roughly add). The remaining ~1.4 at FoV 90 is left to the exponential schedule,
+>   which has no one-variable CVUSA run.
+> - Both peak in Avg at e80. P36's FoV 0 peaks at 97.23 (e44) and eases to 96.60;
+>   P37's stays at 95.8–96.3 from e36. P37's loss1 weight ends at 0.335.
 
 ---
 
