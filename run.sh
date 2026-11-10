@@ -61,6 +61,7 @@
 #   roundP36  P32 with a2g RnC at 0.5, one variable
 #   roundP37  P32 with the loss1 share held (CVUSA twin of CVACT C15), one variable
 #   roundP38  P37 with RnC off (rnc_weight 0; wedge, arcs and gate kept), one variable
+#   roundP39  P32 with rnc_exclude_ties: equal-overlap references stop competing, one variable
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -2067,6 +2068,52 @@ Avg 81.54, FoV 0 96.21, roll gap 0.66. Both runs are post RNG fix on the same co
 path, so this is a clean one variable pair (unseeded, so run to run spread
 applies). P28 suggests RnC off costs the narrow FoVs most and drags the rotated
 flush FoV 360 query (an input artefact); read FoV 0 and the roll gap alongside 360.'
+    ;;
+roundP39)
+    echo "Round P39 - P32 with rnc_exclude_ties=True, nothing else changed [80 ep]"
+    echo "  control roundP32 _20261028-234233 82.58 (pre RNG fix); roundP36 82.20 bounds the fix"
+    launch roundP39-p32-exclties \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_EXCLUDE_TIES=true \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P39. roundP32 with rnc_exclude_ties True and nothing else changed. Only the
+rows where the full and the masked reference get the same circle overlap with the
+anchor change: their rank sets drop the tied partner, so each becomes its own
+two-way term against the hardest negative and nothing relates the two. Untied rows
+are bit-identical to P32 (RINCE-uni). With ties excluded the loss is exactly a RINCE
+variant everywhere: RINCE-uni on untied rows, RINCE-out with r1 and r2 sharing rank 1
+on tied rows.
+
+WHY. With ties kept, a tied row costs 2 lse(s1, s2, sn) - s1 - s2, minimised when
+s(a, r1) = s(a, r2): it pulls the full tile and the wedge to equal similarity and can
+push s(q2, r1) down once r1 holds more than half the softmax, against the eval
+pair. Ties are frequent: a q2 anchor ties whenever its crop lies inside the sector,
+about 72 percent of q2 rows over the run under this curriculum (about 100 percent
+from e16 to e24, 23 percent at e80), about 19 percent of all RnC rows. q1 never
+ties; r1 and r2 anchors only in the first few epochs. Also makes the paper text
+(RINCE) match the code.
+
+READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
+95.05/92.17/76.16/66.94). CONFOUND: P32 ran before the per-worker FoV RNG fix and
+this run after it; P36 (a2g 0.5, post fix) was within 0.6 of P32 on every column,
+so the fix alone costs little. Expect the effect, if any, at FoV 90 and 70 where
+q2 rows dominate. The logged g2a group loss drops on the switch by construction
+(tied terms lose a denominator entry), so do not compare it with P32.'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"

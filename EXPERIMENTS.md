@@ -120,7 +120,8 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP35 `_20261106-210035` | B | padded, **per-epoch** | CVUSA twin of CVACT roundC16. P32 with the Gaussian fields replaced by `FOV_SAMPLING=deterministic FOV_CURRICULUM_END=70.0 FOV_SCHEDULE_LAMBDA=5.0` (exponential fast-to-slow, ≤180 from e16, ≤90 from e42), plus `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)' INFONCE_HOLD_LOSS1_SHARE=true EVAL_FOV_EXTRA='(360.0, 0.0, 270, 180.0, 70.0)'` (FoV 0 = north-aligned, for the roll gap). Three changes on P32, so a gain credits the set. No per-sample FoV draw, so the RNG fix does not reach the ground FoV | 94.87 | 90.03 | 72.99 | 64.26 | **80.54** | stopped in e79; last eval e76 (FoV 0 95.67, roll gap 0.80); best weights e72. −1.88 vs P32 at e76, all at the narrow FoVs; CVACT twin C16 +3.45 over C9 |
 | roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | 94.59 | 91.60 | 76.10 | 66.51 | **82.20** | final — FoV 0 96.60, roll gap 2.01. −0.38 vs P32, every column within 0.6, so a2g 0.5 is not what cost P35 its narrow FoVs. Second-best CVUSA Avg after P32 |
 | roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | 95.54 | 90.98 | 74.76 | 64.86 | **81.54** | final — FoV 0 96.21, roll gap 0.66. −1.04 vs P32 (360 +0.50, 180 −1.18, 90 −1.40, 70 −2.08): C15's CVACT gain does not transfer |
-| roundP38 `_20261109-015652` | B | padded, per-sample | P37 + `RNC_WEIGHT=0.0` — RnC off by weight (wedge, arcs, gate and held share kept), one variable. Does RnC still pay once loss1's share is held? CVUSA counterpart of the RnC-off test CVACT lacks (C15 with RnC off). Same code as P37 (train.py identical to its snapshot), both post RNG fix: a clean pair | | | | | | running |
+| roundP38 `_20261109-015652` | B | padded, per-sample | P37 + `RNC_WEIGHT=0.0` — RnC off by weight (wedge, arcs, gate and held share kept), one variable. Does RnC still pay once loss1's share is held? CVUSA counterpart of the RnC-off test CVACT lacks (C15 with RnC off). Same code as P37 (train.py identical to its snapshot), both post RNG fix: a clean pair | 94.99 | 89.98 | 73.03 | 62.72 | **80.18** | **stopped by hand during e60** (2026-11-10, to free the slot for P39); numbers are e56, best FoV-90 checkpoint `weights_e56_73.0302.pth`, no `weights_end`. FoV 0 96.74. P37 at the same epoch: 95.27/89.94/72.61/62.79, Avg 80.15, so RnC off was level with P37 at e56 (+0.03) |
+| roundP39 `_20261110-013000` | B | padded, per-sample | P32 + `RNC_EXCLUDE_TIES=true` — one variable (FoV 0 appended to the eval list, eval only). Only tied rows change: when the full and masked reference share the same `circle` overlap with the anchor (a q2 crop inside the sector: ~72% of q2 rows over the run, ~19% of all RnC rows, simulated from P32's curriculum), each becomes its own two-way term against the hardest negative instead of the pair being pulled to equal similarity. Makes the loss exactly RINCE (uni on untied rows, out on tied rows). Post RNG fix; P36 bounds the fix. Logged g2a/a2g drop on the switch by construction, not comparable with P32 | | | | | | running |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -1127,6 +1128,30 @@ down to 0.5) and a wider band.
 >   which has no one-variable CVUSA run.
 > - Both peak in Avg at e80. P36's FoV 0 peaks at 97.23 (e44) and eases to 96.60;
 >   P37's stays at 95.8–96.3 from e36. P37's loss1 weight ends at 0.335.
+> - **Per epoch, the schedule's cost is early and shrinks** (read from the three
+>   `log.txt`, 2026-11-09). P35 − P37 isolates the schedule (plus a2g 0.5, worth
+>   ≤ 0.5 per P36); P37 − P32 is the held share:
+>
+>   | epoch | P35 train FoV | FoV 90: P35 − P37 | P37 − P32 | FoV 70: P35 − P37 | P37 − P32 |
+>   |---|---|---|---|---|---|
+>   | 8 | 245 | −4.83 | +0.13 | −4.31 | +0.60 |
+>   | 20 | 151 | −5.35 | +0.27 | −5.97 | +0.38 |
+>   | 28 | 119 | −3.18 | −1.33 | −5.31 | −1.48 |
+>   | 40 | 92 | −1.82 | −1.43 | −2.14 | −1.57 |
+>   | 60 | 75 | −1.50 | −1.88 | −0.94 | −2.52 |
+>   | 76 | 70 | −1.41 | −1.77 | −0.26 | −2.36 |
+>
+>   Through e28 the whole narrow-FoV deficit is the schedule: one FoV per epoch, still
+>   ≥ 150° at e20, while P32/P37's per-sample band already draws narrow crops. It
+>   closes once the schedule reaches the eval FoVs (≤ 92° from e40) and ends at −1.4
+>   (FoV 90) and −0.3 (FoV 70). The held share's cost opens at e24 and stays. At e76,
+>   P35 − P32 minus both one-variable effects (P36 − P32 and P37 − P32), i.e. the
+>   schedule if the three add: 360 +0.12, 180 −0.03, 90 −1.29, 70 +0.25, Avg −0.23.
+>   By the end the schedule costs FoV 90 alone; the held share is most of the rest.
+>   "Schedule" here is deterministic per-epoch sampling *and* the exponential shape;
+>   the one-variable P32 + `FOV_SAMPLING=deterministic FOV_CURRICULUM_END=70.0
+>   FOV_SCHEDULE_LAMBDA=5.0` run (plus a λ=0 twin to split the shape from per-epoch
+>   sampling) has not been made.
 
 ---
 
@@ -1478,7 +1503,8 @@ can be the RnC hardest negative. That matches how SinGeo trains on VIGOR.
 | **roundV1 P32** `_20261103-162551`, best FoV 90 (e56) | cross | **31.02** | 24.80 | 15.90 | **7.20** | 5.44 | 14.89 | 7.93 | stopped e71 |
 | roundV1, last eval (e68) | cross | 28.24 | 23.76 | 15.18 | 6.92 | 5.29 | 13.91 | 7.64 | |
 | roundV1, peak FoV 360 (e20) | cross | 32.79 | 27.14 | 16.35 | 6.57 | 4.61 | 15.08 | 7.34 | |
-| roundV3 P37 `_20261109-002907` | same | | | | | | | | running — V1's recipe on same-area + `INFONCE_HOLD_LOSS1_SHARE=true`, FoV 0 added to the evals. No same-area control (roundV2) yet; ~1.8 it/s, disk-bound |
+| roundV3 P37 `_20261109-002907`, e28 (best FoV 90) | same | 66.64 | 60.21 | 46.28 | **24.68** | 18.55 | 39.04 | 29.13 | stopped by hand in e29 (2026-11-09 19:05) to free the GPU for roundV2; checkpoint `weights_e28_24.6783.pth`. V1's recipe on same-area + `INFONCE_HOLD_LOSS1_SHARE=true`; FoV 0 68.13, roll gap 1.49. Already above SinGeo's published same-area FoV 90 (24.0) at e28; ~1.8 it/s, disk-bound |
+| roundV2 P32 `_20261109-190613` | same | | | | | | | | running — started 2026-11-09 19:05, `./run_vigor.sh roundV2`: roundV1's recipe on same-area, the one-variable control for V3 (V3 minus the held share; no FoV 0 eval) |
 
 **roundV1 result.** Stopped by hand during epoch 72 (LR already 3e-6), so there is
 no `weights_end.pth`; the checkpoint is `weights_e56_7.1963.pth`. Against SinGeo's
@@ -2038,3 +2064,152 @@ ranks in `LowFoVGradCAM/figures/roundC9-..._weights_e60_46.6569_padwidth/`
 - A 64 px border is the best Avg (58.23, +2.21 over the trained full-width protocol),
   from FoV 360 (+10.0), where full width leaves the panorama flush; it trails full
   width by 0.15–0.73 at 180, 90 and 70.
+
+## SinGeo consistency check (OC / FC, paper Sec. 4 and Table 5) on P23, P28, P1 (eval-only, 2026-11-09)
+
+`LowFoVGradCAM/consistency_eval.py`, all 8,884 CVUSA test locations, `weights_end.pth`,
+seed 0 (one random heading per location, shared by every FoV and every checkpoint).
+The paper's Eq. 6-7: Grad-CAM maps of the query embedding on the reference image,
+compared with SSIM. OC = rotation alone (FoV 360); FC = mean over FoV 180/90/70.
+`_sat` compares tile maps driven by the aligned panorama and by the turned/cut query;
+`_grd` compares the panorama's own map, rolled and cut to the query's window, with the
+map computed on the query. The authors released no code (their repo has retrieval eval
+only), so the open details are ours: stage-3 Grad-CAM, ReLU, bilinear upsampling;
+each map min-max scaled before SSIM (Wang et al.: 11x11 Gaussian, sigma 1.5, matches
+skimage to 1e-7); padded queries compared on their scene columns only; pairs with a
+constant map skipped (ground side at 90/70 only: P23 303 of 26,652, P28 44, P1 23).
+SE ≤ 0.0015 on every number. Summaries, per-location CSVs (with gallery ranks) and
+three example figures per run in `LowFoVGradCAM/figures/<run>_weights_end_consistency/`.
+R@1 of these crops matches each run's logged columns within ~1.2.
+
+| run | OC grd | OC sat | FC grd | FC sat | Avg R@1 (logged) |
+|---|---|---|---|---|---|
+| **roundP23** `_20261022-144655` (wedge + RnC) | **0.75** | **0.82** | **0.51** | 0.50 | **80.80** |
+| roundP28 `_20261026-114557` (P23, `RNC_WEIGHT=0`) | 0.64 | 0.75 | 0.47 | 0.30 | 79.69 |
+| roundP1 `_20260922-160105` (no wedge, no RnC) | 0.54 | 0.79 | 0.47 | **0.68** | 80.08 |
+| SinGeo paper, Table 5 (their implementation) | 0.81 | 0.92 | 0.66 | 0.76 | 79.1 |
+
+- **RnC raises every consistency score** (P23 vs P28, which differ in `rnc_weight`
+  alone): OC grd +0.10, OC sat +0.08, FC grd +0.04, FC sat +0.20. P28's recall loss is
+  at FoV 360 alone (92.40 vs 95.14), the view OC measures.
+- **The wedge lowers FC sat; RnC wins part of it back** (P1 0.68 → P28 0.30 → P23 0.50).
+  FC sat rewards a tile map that stays put when the ground view narrows; wedge-trained
+  models move it toward the visible sector. **FC sat does not track recall across
+  models**: P1 has the highest FC sat and a lower Avg than P23.
+- **OC grd does not track FoV-360 recall either**: P1 0.54 vs P23 0.75 at equal
+  FoV-360 R@1 (95.01 vs 95.14).
+- **Per location, consistency barely predicts retrieval.** Spearman of SSIM with
+  −log rank is |ρ| ≤ 0.11 for P23 and P28 at every view. Only P1's FC sat carries a
+  signal (ρ +0.31 at 90, +0.38 at 70; hits 0.70 vs misses 0.62 at 90). On the ground
+  side at 90/70 the sign is mostly *negative* (P23 −0.09/−0.11, P1 −0.05/−0.10): crops
+  retrieved at rank 1 have slightly lower ground SSIM than misses.
+- Absolute values sit below the paper's Table 5. Calibrated against a SinGeo checkpoint
+  in the next subsection: our implementation lands within 0.04 of Table 5 on the aerial
+  side and ~0.1 below it on the ground side.
+
+### roundP32 vs SinGeo, each under both eval protocols (2026-11-09)
+
+SinGeo checkpoint: `Singeo_data/as-is-singeo-64px-pad/weights_e80_72.7150.pth`, weights
+only (no `train.py`, no `log.txt`, not in this log before). Taken to be SinGeo's code
+as-is with a 64 px border, from the folder name and because only the 64 px border
+protocol reproduces its saved FoV-90 R@1: 72.22 here vs 72.72 in the name (full padding
+69.9, bare crop ~60). Scored through scratch run folders that copy the current
+`train_singeo_cvusa.py` with `fov_pad`/`fov_border_px` overrides; P32 under the border
+is its own snapshot plus `fov_pad=False fov_border_px=64`. Script fix first: the aligned
+panorama (for `Hg`, `Hs`) is now fed with the run's own FoV-360 protocol, so a border
+run's `Hg` is computed on the bordered panorama like its `H*g`. Padded runs are
+unchanged (P23 re-run bit-identical), so the table above stands.
+
+| model | eval protocol | OC grd | OC sat | FC grd | FC sat | R@1 360 / 180 / 90 / 70 | Avg |
+|---|---|---|---|---|---|---|---|
+| SinGeo as-is | **64 px border (own)** | 0.72 | **0.94** | **0.56** | **0.72** | 96.57 / 92.05 / 72.22 / 61.13 | 80.49 |
+| SinGeo as-is | full padding | 0.66 | 0.86 | 0.26 | 0.64 | 96.23 / 91.56 / 69.91 / 57.86 | 78.89 |
+| roundP32 `_20261028-234233` | **full padding (own)** | 0.72 | 0.77 | 0.45 | 0.45 | 95.20 / 91.72 / 76.18 / 67.09 | 82.55 |
+| roundP32 | 64 px border | 0.65 | 0.84 | 0.50 | 0.61 | 96.27 / 91.67 / 75.92 / 66.72 | **82.65** |
+| SinGeo paper, Table 5 | (theirs) | 0.81 | 0.92 | 0.66 | 0.76 | 96.8 / 91.8 / 70.1 / 58.0 | 79.1 |
+
+- **P32 retrieves better and is less consistent.** Under SinGeo's own protocol (border)
+  SinGeo is ahead on all four metrics (+0.08 / +0.10 / +0.07 / +0.10) while P32 leads
+  Avg R@1 by 2.15 (+3.70 at FoV 90, +5.59 at 70). Between these two models, the paper's
+  "consistency goes with recall" runs the other way.
+- **The aerial gap holds under either protocol.** P32 vs SinGeo, same protocol: OC sat
+  −0.10 under both; FC sat −0.10 (border) and −0.19 (padding); each under its own
+  protocol −0.17 and −0.27. FC sat is the wedge effect seen in P1 → P28. OC sat is lower for
+  every padded run (P1 0.79, P23 0.82) and P32 recovers to 0.84 with the border, so
+  part of that gap is the input protocol, not the wedge.
+- **The ground metrics follow the protocol more than the model.** Under full padding
+  P32 is ahead (OC grd +0.06, FC grd +0.19); SinGeo's FC grd collapses to 0.26 there.
+  A 64 px border raises P32's FC grd (0.45 → 0.50) and FC sat (0.45 → 0.61).
+- **Our implementation is close to the paper's on SinGeo weights**: aerial 0.94 / 0.72
+  vs 0.92 / 0.76, ground 0.72 / 0.56 vs 0.81 / 0.66.
+- P32 scored with a 64 px border at eval matches its padded Avg (82.65 vs 82.55; +1.07
+  at FoV 360), the same pattern as the C9 padding-amount probe.
+- Outputs in `LowFoVGradCAM/figures/as-is-singeo-64px-pad_weights_e80_72.7150_consistency{,_evalpad}/`
+  and `roundP32-..._weights_end_consistency{,_evalborder64}/`.
+
+### Aerial heat inside the visible sector: roundP32 vs SinGeo (2026-11-09)
+
+`experiments/measure_ground_content_to_aerial_image_consistency.py`, all 8,884 CVUSA
+test locations, seed 0 (same locations and headings as above), each model under its
+own protocol (P32 full padding, SinGeo 64 px border). Grad-CAM stage 3 on the whole
+north-up tile for its cosine with the crop; score = share of the map's mass inside the
+crop's sector from the tile centre (raw, no chance correction; "uniform" is the
+sector's area share). SE ≤ 0.002 everywhere. Outputs in
+`experiments/figures/{roundP32-..._weights_end, as-is-singeo-64px-pad_weights_e80_72.7150}_sector_heat/`.
+
+| FoV | uniform | **P32** padded | **P32** 64 px border | SinGeo 64 px border | P32 rank-1 / missed | SinGeo rank-1 / missed |
+|---|---|---|---|---|---|---|
+| 270 | .750 | **.915** | **.915** | .851 | .918 / .847 | .853 / .813 |
+| 180 | .500 | **.805** | **.805** | .710 | .814 / .703 | .714 / .663 |
+| 90 | .250 | .597 | **.598** | .515 | .626 / .504 | .533 / .468 |
+| 70 | .194 | .508 | **.520** | .454 | .542 / .439 | .472 / .427 |
+
+(P32 rank-1 / missed from the padded run; the border run agrees within .016. P32 with
+the border is its own snapshot plus `fov_pad=False fov_border_px=64`; outputs in
+`roundP32-..._weights_end_sector_heat_evalborder64/`. R@1 with the border
+95.29 / 91.67 / 75.92 / 66.72 vs SinGeo 95.94 / 92.05 / 72.22 / 61.13.)
+
+- **P32 puts more heat in the visible sector at every FoV, under the same input
+  protocol too**: with the 64 px border on both, +.064 / +.095 / +.083 / +.066. The
+  protocol barely moves P32's share (identical at 270/180/90, +.012 at 70).
+  Together with its lower FC sat, this says P32's tile map moves *to the part the crop
+  sees*, not that it scatters: lower FC sat is the right behaviour here.
+- **SinGeo localises too, without wedge training**: .515 at FoV 90 against .25 uniform.
+  The wedge adds to an ordering the plain model already partly has.
+- **Rank-1 crops put more heat in the sector than missed ones**, in both models and at
+  every FoV (P32 FoV 90: .626 vs .504).
+- Ground map mass on the crop's own columns falls to about half at 90/70 in both
+  (P32 .59/.48, SinGeo .59/.51); the rest lies on the blank, mostly just outside the
+  crop edges. Part of that is the stage-3 map's 32 px cells straddling the edge. With
+  the same 64 px border P32 keeps more on the scene than SinGeo at 270/180/90
+  (.916 / .887 / .657 vs .768 / .711 / .585) and about the same at 70 (.491 vs .513).
+
+## `experiments/eval_checkpoint.py`: retrieval eval with a chosen padding (eval-only, 2026-11-09)
+
+Scores a checkpoint on `cvusa`, `cvact`, `vigor-cross` or `vigor-same` at FoV
+360/270/180/90/70 with `--pad full`, `--pad N` (N px blank per side, 0 = bare crop) or
+`--pad run`; several paddings share one gallery encode. Uses the trainers' eval
+transforms, datasets and crop seeds (FoV 90 12345, extras 360/270/180/70 1000-1003).
+Validated: **CVUSA P32 `weights_end` reproduces the logged e80 eval exactly** (95.047 /
+95.081 / 92.166 / 76.159 / 66.941); **VIGOR V1 `weights_e56` cross-area FoV 90 7.196,
+Hit_Rate 7.934, exactly as logged**; CVACT C15 e64 FoV 90 46.50 vs 46.75 logged (the
+CVACT trainer's eval is unseeded, so only within orientation noise).
+- **Eval batch size changes CVUSA R@1 by ~0.1.** The CVUSA test gallery has 43 pairs of
+  identical tiles (86 tiles, cosine 1.0 to a twin). Whether a query whose true tile has a
+  twin ranks 1 is decided by fp16 rounding, which depends on the batch size: 128 gave
+  +0.08 to +0.12 R@1 at every FoV with R@5/10/1% identical. The script defaults to the
+  trainers' `batch_size_eval=16`.
+
+SinGeo as-is (`as-is-singeo-64px-pad/weights_e80_72.7150.pth`), CVUSA, three paddings:
+
+| padding | 360 | 270 | 180 | 90 | 70 | Avg |
+|---|---|---|---|---|---|---|
+| none (bare crop, SinGeo's paper protocol) | 96.36 | 94.54 | 89.98 | 62.71 | 50.00 | 74.76 |
+| **64 px border** | **96.61** | 95.53 | **92.28** | **73.32** | **61.79** | **81.00** |
+| full width | 96.36 | **95.62** | 92.22 | 70.98 | 58.44 | 79.50 |
+| SinGeo paper (unpadded) | 96.8 | – | 91.8 | 70.1 | 58.0 | 79.1 |
+
+- Confirms the 64 px border as this checkpoint's protocol, and that it is not plain
+  SinGeo: unpadded it scores 74.76, 4.3 below the paper. With its border it beats the
+  paper by 1.9 Avg. FoV 90 is 73.32 here vs 72.72 in the filename and 72.22 in the
+  sector-heat run: different orientation draws move FoV 90 by ~±0.5.
