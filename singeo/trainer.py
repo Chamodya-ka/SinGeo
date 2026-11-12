@@ -1162,6 +1162,70 @@ def _build_rnc_view_sets(ids, meta, enable_aerial_crop):
     return ids_ground, arcs_ground, ids_aerial, arcs_aerial
 
 
+class RnCRatioHold:
+    """Sets the RnC weight so that weighted RnC stays at `ratio` x weighted InfoNCE.
+
+    A fixed `rnc_weight` lets RnC's share drift. In roundP32 InfoNCE falls
+    6.56 -> 1.64 over 80 epochs while RnC falls only 1.23 -> 0.92, so 0.25 * RnC
+    grows from 5% to 14% of InfoNCE. Here the weight is
+
+        ratio * EMA(infonce_weight * InfoNCE) / EMA(RnC)
+
+    on detached values. It rescales RnC's gradient and sends none through the
+    weight itself. The EMAs are bias-corrected (as in Adam), so the first steps
+    of an epoch use a running mean rather than a single noisy batch.
+    """
+
+    def __init__(self, ratio, momentum=0.99):
+        self.ratio = float(ratio)
+        self.momentum = float(momentum)
+        self._infonce = 0.0
+        self._rnc = 0.0
+        self._steps = 0
+
+    def weight(self, infonce_value, rnc_value):
+        m = self.momentum
+        self._infonce = m * self._infonce + (1.0 - m) * float(infonce_value)
+        self._rnc = m * self._rnc + (1.0 - m) * float(rnc_value)
+        self._steps += 1
+        # The bias corrections are equal and cancel in the ratio, but they keep
+        # the stored averages readable as real loss values.
+        correction = 1.0 - m ** self._steps
+        infonce = self._infonce / correction
+        rnc = self._rnc / correction
+        return self.ratio * infonce / max(rnc, 1e-6)
+
+
+def check_rnc_loss_ratio(cfg):
+    """Startup check for `rnc_loss_ratio`. Raises on configurations it cannot honour."""
+    ratio = getattr(cfg, 'rnc_loss_ratio', None)
+    if ratio is None:
+        return
+    if not ratio > 0:
+        raise ValueError("rnc_loss_ratio must be > 0, got {!r}; use None for a fixed rnc_weight"
+                         .format(ratio))
+    if not getattr(cfg, 'use_rnc', True) or getattr(cfg, 'rnc_weight', 1.0) == 0:
+        raise ValueError("rnc_loss_ratio is set but RnC is off (use_rnc=False or rnc_weight=0). "
+                         "rnc_weight=0 is the off switch; with a ratio set its value is otherwise "
+                         "unused, so leave it at its default.")
+    if getattr(cfg, 'infonce_weight', 1.0) <= 0:
+        raise ValueError("rnc_loss_ratio is relative to infonce_weight * InfoNCE, which is 0 here")
+    if not any(getattr(cfg, 'rnc_group_weights', (1.0,) * 4)):
+        raise ValueError("rnc_loss_ratio with all rnc_group_weights at 0: there is no RnC to scale")
+    momentum = getattr(cfg, 'rnc_loss_ratio_momentum', 0.99)
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError("rnc_loss_ratio_momentum must be in [0, 1), got {!r}".format(momentum))
+
+
+def describe_rnc_weight(cfg):
+    """The RnC weight as info.txt and the startup print should state it."""
+    ratio = getattr(cfg, 'rnc_loss_ratio', None)
+    if ratio is None:
+        return "weight {}".format(cfg.rnc_weight)
+    return ("weight HELD at {} x InfoNCE (EMA momentum {}; rnc_weight {} unused)"
+            .format(ratio, getattr(cfg, 'rnc_loss_ratio_momentum', 0.99), cfg.rnc_weight))
+
+
 def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, optimizer,
                               rnc_loss=None, distance_builder=None,
                               scheduler=None, scaler=None):
@@ -1208,6 +1272,16 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     # magnitude), so this is a genuine on/off rather than a learning-rate
     # change in disguise.
     infonce_weight = getattr(train_config, 'infonce_weight', 1.0)
+    # With `rnc_loss_ratio` set, the RnC weight is recomputed every step (see
+    # RnCRatioHold) and `rnc_weight` is unused. The averages restart each epoch.
+    rnc_ratio = getattr(train_config, 'rnc_loss_ratio', None)
+    ratio_hold = None
+    if use_rnc and rnc_ratio is not None:
+        check_rnc_loss_ratio(train_config)
+        ratio_hold = RnCRatioHold(rnc_ratio, getattr(train_config, 'rnc_loss_ratio_momentum', 0.99))
+    rnc_weight_meter = AverageMeter()
+    rnc_share_meter = AverageMeter()
+    rnc_weight_range = [float('inf'), float('-inf')]
     group_weights = getattr(train_config, 'rnc_group_weights', (1.0, 1.0, 1.0, 1.0))
     group_weights = dict(zip(('g2a', 'g2g', 'a2g', 'a2a'), group_weights))
     enable_aerial_crop = getattr(train_config, 'enable_aerial_crop', True)
@@ -1286,7 +1360,14 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
                                             hardest_negative=rnc_hardest_negative)
 
                 rnc_total = sum(group_weights[k] * v for k, v in groups.items())
-                total = infonce_weight * total + rnc_weight * rnc_total
+                weighted_infonce = infonce_weight * total.detach()
+                w = rnc_weight
+                if ratio_hold is not None:
+                    w = ratio_hold.weight(weighted_infonce, rnc_total.detach())
+                step_info['rnc_weight'] = float(w)
+                step_info['rnc_share'] = float(w * rnc_total.detach() / weighted_infonce) \
+                    if float(weighted_infonce) > 0 else None
+                total = infonce_weight * total + w * rnc_total
 
             return total, terms, groups
 
@@ -1340,6 +1421,13 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
             meter.update(term.item())
         if step_info.get('loss1_scale') is not None:
             loss1_scale_meter.update(float(step_info['loss1_scale']))
+        if step_info.get('rnc_weight') is not None:
+            w = step_info['rnc_weight']
+            rnc_weight_meter.update(w)
+            rnc_weight_range[0] = min(rnc_weight_range[0], w)
+            rnc_weight_range[1] = max(rnc_weight_range[1], w)
+        if step_info.get('rnc_share') is not None:
+            rnc_share_meter.update(step_info['rnc_share'])
 
         if train_config.verbose:
             loss1, loss2, loss3, loss4, loss5, loss6 = terms
@@ -1357,6 +1445,8 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
                 # Log the four raw RNC values, not just their weighted sum.
                 for key in ('g2a', 'g2g', 'a2g', 'a2a'):
                     monitor["rnc_" + key] = "{:.4f}".format(groups[key].item())
+                if ratio_hold is not None:
+                    monitor["rnc_w"] = "{:.4f}".format(step_info['rnc_weight'])
 
             bar.set_postfix(ordered_dict=monitor)
 
@@ -1368,6 +1458,16 @@ def train_contrast_singeo_rnc(train_config, model, dataloader, loss_function, op
     if use_rnc:
         print("RNC epoch averages - " + " ".join(
             "{}: {:.4f}".format(key, rnc_meters[key].avg) for key in ('g2a', 'g2g', 'a2g', 'a2a')))
+        if rnc_weight_meter.count:
+            # Weighted RnC / weighted InfoNCE, averaged over batches. Printed for
+            # fixed-weight runs too, so their drift can be read off log.txt.
+            line = "RNC share - weighted RnC / InfoNCE: {}".format(
+                "{:.4f}".format(rnc_share_meter.avg) if rnc_share_meter.count
+                else "n/a (InfoNCE off)")
+            if ratio_hold is not None:
+                line += " (target {}) | weight mean {:.4f} min {:.4f} max {:.4f}".format(
+                    rnc_ratio, rnc_weight_meter.avg, *rnc_weight_range)
+            print(line)
     if term_meters[0].count:
         line = "InfoNCE epoch averages - " + " ".join(
             "loss{}: {:.4f}".format(i + 1, m.avg) for i, m in enumerate(term_meters))

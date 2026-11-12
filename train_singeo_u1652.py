@@ -44,6 +44,7 @@ from singeo.evaluate.university import evaluate
 from singeo.loss import InfoNCE, RankNContrast
 from singeo.model import TimmModel_SinGeo
 from singeo.trainer import predict, train_contrast_singeo_rnc
+from singeo.trainer import check_rnc_loss_ratio, describe_rnc_weight
 from singeo.transforms import (MASK_FILL_MODES, build_satellite_dynamic_transforms,
                                get_dynamic_fov, get_dynamic_fov_floor, get_dynamic_rotation_angle,
                                get_gaussian_fov_mean, get_transforms_train_singeo,
@@ -102,8 +103,18 @@ class Configuration:
 
     use_rnc: bool = True
     rnc_weight: float = 0.25
+    # Hold the RnC block at a fixed share of InfoNCE instead of a fixed weight.
+    # None (default) keeps `rnc_weight`. A value such as 0.2 makes the weight
+    #   ratio * EMA(infonce_weight * InfoNCE) / EMA(RnC)
+    # every step, on detached values, so weighted RnC stays at ~0.2 x InfoNCE
+    # all run. With a fixed 0.25 that share drifts 0.05 -> 0.14 (roundP32), as
+    # InfoNCE falls ~4x and RnC barely moves. `rnc_weight` must stay non-zero
+    # (0 is the off switch) but is otherwise unused. See singeo.trainer.RnCRatioHold.
+    rnc_loss_ratio: Optional[float] = None
+    rnc_loss_ratio_momentum: float = 0.99   # EMA momentum, ~100 steps of memory
     rnc_tau: float = 0.5
     rnc_exclude_ties: bool = False
+    rnc_tau_rank1: Optional[float] = None  # RINCE tau_1; None = one tau (see train_singeo_cvusa.py)
     rnc_positives_only: bool = True
     rnc_hardest_negative: bool = True
     rnc_similarity: str = "cosine"
@@ -216,6 +227,7 @@ def check_config(cfg):
     if cfg.overlap_gate_measure not in ("containment", "circle", "iou"):
         raise ValueError("overlap_gate_measure must be 'containment', 'circle' or 'iou', got {!r}"
                          .format(cfg.overlap_gate_measure))
+    check_rnc_loss_ratio(cfg)
     if cfg.infonce_hold_loss1_share:
         if not (cfg.overlap_gated_infonce and cfg.infonce_gate_scales_terms
                 and cfg.overlap_gate_measure == "circle"):
@@ -280,8 +292,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
             tuple(cfg.infonce_term_weights), "on" if cfg.overlap_gated_infonce else "off",
             cfg.overlap_gate_measure, cfg.infonce_gate_scales_terms, cfg.infonce_hold_loss1_share),
         "RnC: {}".format(
-            "weight {}, tau {}, positives{} , groups (g2a, g2g, a2g, a2a) {}".format(
-                cfg.rnc_weight, cfg.rnc_tau,
+            "{}, tau {}, positives{} , groups (g2a, g2g, a2g, a2a) {}".format(
+                describe_rnc_weight(cfg), cfg.rnc_tau,
                 " + hardest negative" if cfg.rnc_hardest_negative else " only",
                 tuple(cfg.rnc_group_weights)) if rnc_on else "OFF"),
         "Mask fill: {}".format(cfg.mask_fill),
@@ -496,13 +508,14 @@ if __name__ == '__main__':
     rnc_loss, distance_builder = None, None
     if config.use_rnc:
         rnc_loss = RankNContrast(temperature=config.rnc_tau, similarity=config.rnc_similarity,
-                                 exclude_ties=config.rnc_exclude_ties)
+                                 exclude_ties=config.rnc_exclude_ties,
+                                 rank1_temperature=config.rnc_tau_rank1)
         distance_builder = RnCDistanceBuilder(positive_scale=config.rnc_positive_scale,
                                               negative_tiering="none",
                                               negative_margin=config.rnc_negative_margin,
                                               positive_overlap=config.rnc_positive_overlap)
-        print("Using RNC Loss - weight: {} - tau: {} - {} - groups (g2a, g2g, a2g, a2a) {}".format(
-            config.rnc_weight, config.rnc_tau,
+        print("Using RNC Loss - {} - tau: {} - {} - groups (g2a, g2g, a2g, a2a) {}".format(
+            describe_rnc_weight(config), config.rnc_tau,
             "positives + hardest negative" if config.rnc_hardest_negative
             else ("positives only" if config.rnc_positives_only else "all pairs"),
             config.rnc_group_weights))

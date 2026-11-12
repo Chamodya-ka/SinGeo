@@ -133,19 +133,38 @@ class RankNContrast(nn.Module):
             another and such a term costs 0. The mean is still taken over all
             valid pairs, so the reported loss drops on the switch for that
             reason alone -- it is not comparable across the flag.
+        rank1_temperature: RINCE-style per-rank temperature (Hoffmann et al.).
+            `None` (default) uses `temperature` for every term, the original
+            RnC. Otherwise the term of a rank-1 reference -- one at its row's
+            smallest valid distance, so every member of a tie at the top --
+            is computed at this temperature, and every other term at
+            `temperature`. Each term uses one temperature throughout, in its
+            numerator and its whole denominator.
+
+            With a location's two views plus one hardest negative per row
+            this is (tau_1, tau_2) = (rank1_temperature, temperature): tau_1
+            sets how hard "the full view beats the partial view and the
+            negative" is enforced, tau_2 how hard "the partial view beats the
+            negative" is. RINCE recommends tau_1 < tau_2; in an aerial-anchored
+            row the rank-2 reference is the test crop, and tau_1 < tau_2 turns
+            the net force on that pair into a push (EXPERIMENTS.md, a2g force
+            probe). The negative's own term is 0 at any temperature.
     """
 
     def __init__(self, temperature=2.0, similarity='cosine', chunk_size=None,
-                 exclude_ties=False):
+                 exclude_ties=False, rank1_temperature=None):
         super().__init__()
 
         if similarity not in ('cosine', 'l2'):
             raise ValueError("similarity must be 'cosine' or 'l2', got {!r}".format(similarity))
+        if rank1_temperature is not None and not rank1_temperature > 0:
+            raise ValueError("rank1_temperature must be > 0, got {!r}".format(rank1_temperature))
 
         self.t = temperature
         self.similarity = similarity
         self.chunk_size = chunk_size
         self.exclude_ties = exclude_ties
+        self.t1 = rank1_temperature
 
     def _similarity(self, anchor, reference):
         if self.similarity == 'cosine':
@@ -178,7 +197,8 @@ class RankNContrast(nn.Module):
         """
         # Similarities and distances in fp32: logsumexp over -inf-masked rows is
         # not something to trust to fp16 under autocast.
-        sims = self._similarity(anchor, reference).float() / self.t
+        raw = self._similarity(anchor, reference).float()
+        sims = raw / self.t
         dist = distances.float()
 
         n_anchor, n_ref = sims.shape
@@ -187,6 +207,13 @@ class RankNContrast(nn.Module):
             valid = torch.ones_like(sims, dtype=torch.bool)
         else:
             valid = valid.bool()
+
+        # Per-term temperature `[B_a, B_r]` when rank-1 terms get their own.
+        tau = None
+        if self.t1 is not None:
+            d_min = dist.masked_fill(~valid, float('inf')).min(dim=1, keepdim=True).values
+            rank1 = valid & (dist == d_min)
+            tau = torch.where(rank1, sims.new_tensor(float(self.t1)), sims.new_tensor(float(self.t)))
 
         total = sims.new_zeros(())
         count = sims.new_zeros(())
@@ -223,16 +250,148 @@ class RankNContrast(nn.Module):
             # denominator; `v` discards their contribution below.
             ge = torch.where(v.unsqueeze(2), ge, v.unsqueeze(1).expand_as(ge))
 
-            logits = s.unsqueeze(1).expand(-1, n_ref, -1)
+            if tau is None:
+                own = s
+                logits = s.unsqueeze(1).expand(-1, n_ref, -1)
+            else:
+                # Term (i, j) at tau[i, j]: its own score and every score in
+                # its rank set divided by the same temperature.
+                r = raw[start:stop]
+                t_ij = tau[start:stop]
+                own = r / t_ij
+                logits = r.unsqueeze(1) / t_ij.unsqueeze(2)
             logits = logits.masked_fill(~ge, float('-inf'))
 
-            term = torch.logsumexp(logits, dim=-1) - s   # [b, B_r]
+            term = torch.logsumexp(logits, dim=-1) - own   # [b, B_r]
             term = torch.where(v, term, torch.zeros_like(term))
 
             total = total + term.sum()
             count = count + v.sum()
 
         return total / count.clamp(min=1.0)
+
+
+class RINCE(nn.Module):
+    """Ranking InfoNCE (Hoffmann et al., AAAI 2022) over one anchor/reference view-set pair.
+
+    Each row splits its valid references into positives (views of the anchor's
+    own location, given by `positive`) and negatives (every other valid
+    reference). Positives are ranked by target distance, closest first; equal
+    distances share a rank. Negatives are never ranked: they sit at the bottom
+    of every denominator and get no term of their own, so "how far is Kansas
+    from Oregon" is never asked.
+
+    Rank i contributes, at temperature t_i,
+
+        in   l_i = -log  sum_{p in P_i} e^{s_p/t_i} / (sum_{p in P_>=i} e^{s_p/t_i} + sum_n e^{s_n/t_i})
+        out  l_i = -sum_{p in P_i} log e^{s_p/t_i} / (e^{s_p/t_i} + sum_{p' in P_>i} e^{s_p'/t_i} + sum_n e^{s_n/t_i})
+
+    ("in" is RINCE Eq. 5 / Lin, "out" generalises Lout, Eq. 2, to ranks). With one
+    positive per rank both are RINCE-uni. In neither do positives of the same
+    rank compete: "out" gives each tied positive its own term against the lower
+    ranks and the negatives, "in" puts them in one shared numerator.
+
+    The loss is the mean over anchors (rows with at least one positive) of
+    sum_i l_i, MaskGeo Eq. 11. Not a mean over (anchor, reference) pairs as in
+    RankNContrast: with all in-batch negatives that would divide by 2B and
+    count every negative's empty term. For the record, on the same inputs
+    `RankNContrast(exclude_ties=True)` equals RINCE "out" divided by the number of
+    valid references per row (tests/test_rince.py).
+
+    Args:
+        temperature: t_i for every rank below the first (t_2, t_3, ...).
+        similarity: "cosine" or "l2", as in RankNContrast.
+        rank1_temperature: t_1 for the closest rank. None uses `temperature`.
+            RINCE recommends t_1 < t_2 (0.1 / 0.15-0.225 in the paper).
+        variant: "out" (default) or "in"; only rows with a tie differ.
+        tie_tol: distances closer than this share a rank. Overlaps of a crop
+            inside a sector come out equal, but not always to the last bit.
+    """
+
+    needs_positive_mask = True
+
+    def __init__(self, temperature=0.1, similarity='cosine', rank1_temperature=None,
+                 variant='out', tie_tol=1e-6):
+        super().__init__()
+        if similarity not in ('cosine', 'l2'):
+            raise ValueError("similarity must be 'cosine' or 'l2', got {!r}".format(similarity))
+        if variant not in ('in', 'out'):
+            raise ValueError("variant must be 'in' or 'out', got {!r}".format(variant))
+        if not temperature > 0:
+            raise ValueError("temperature must be > 0, got {!r}".format(temperature))
+        if rank1_temperature is not None and not rank1_temperature > 0:
+            raise ValueError("rank1_temperature must be > 0, got {!r}".format(rank1_temperature))
+        self.t = temperature
+        self.t1 = rank1_temperature
+        self.similarity = similarity
+        self.variant = variant
+        self.tie_tol = tie_tol
+
+    def _similarity(self, anchor, reference):
+        if self.similarity == 'cosine':
+            return F.normalize(anchor, dim=-1) @ F.normalize(reference, dim=-1).T
+        return -torch.cdist(anchor, reference, p=2)
+
+    def forward(self, anchor, reference, distances, valid=None, positive=None):
+        """
+        Args:
+            anchor: `[A, D]` features.
+            reference: `[R, D]` features.
+            distances: `[A, R]` target distances; only their order among a row's
+                positives is read. Negatives' distances are ignored.
+            valid: optional `[A, R]` bool mask of references allowed in the row at
+                all (drops the self-pair diagonal, or limits the negatives to the
+                hardest one).
+            positive: `[A, R]` bool mask, True for views of the anchor's location.
+
+        Returns:
+            Scalar: mean over anchors with a positive of the summed rank terms.
+        """
+        if positive is None:
+            raise ValueError("RINCE needs the `positive` mask (same-location references)")
+        raw = self._similarity(anchor, reference).float()
+        d = distances.float()
+        n_anchor, n_ref = raw.shape
+        valid = torch.ones_like(raw, dtype=torch.bool) if valid is None else valid.bool()
+        pos = positive.bool() & valid
+        neg = valid & ~positive.bool()
+
+        tau = raw.new_full(raw.shape, float(self.t))
+        if self.t1 is not None:
+            d_top = d.masked_fill(~pos, float('inf')).min(dim=1, keepdim=True).values
+            rank1 = pos & ((d - d_top).abs() <= self.tie_tol)
+            tau = torch.where(rank1, raw.new_tensor(float(self.t1)), tau)
+
+        # [A, j, k]: reference k relative to the term of positive j.
+        dj, dk = d.unsqueeze(2), d.unsqueeze(1)
+        pos_k = pos.unsqueeze(1)
+        same = pos_k & ((dk - dj).abs() <= self.tie_tol)          # k shares j's rank
+        lower = pos_k & (dk > dj + self.tie_tol)                   # k ranks below j
+        eye = torch.eye(n_ref, dtype=torch.bool, device=raw.device).unsqueeze(0)
+        if self.variant == 'in':
+            num = same
+            den = same | lower | neg.unsqueeze(1)
+        else:
+            num = eye.expand(n_anchor, -1, -1)
+            den = eye | lower | neg.unsqueeze(1)
+        # Rows of non-positive j get {j} / {j}: a finite 0 whose gradient is 0,
+        # instead of logsumexp over nothing (-inf, then NaN in backward).
+        is_term = pos.unsqueeze(2)
+        num = torch.where(is_term, num, eye)
+        den = torch.where(is_term, den, eye)
+
+        logits = raw.unsqueeze(1) / tau.unsqueeze(2)               # term j at its own t
+        term = torch.logsumexp(logits.masked_fill(~den, float('-inf')), dim=-1) \
+            - torch.logsumexp(logits.masked_fill(~num, float('-inf')), dim=-1)   # [A, R]
+
+        if self.variant == 'in':
+            # Every member of a rank produces the same term; count the rank once.
+            term = term / same.sum(dim=-1).clamp(min=1)
+        term = torch.where(pos, term, torch.zeros_like(term))
+        has_pos = pos.any(dim=1)
+        if not bool(has_pos.any()):
+            return raw.sum() * 0.0
+        return term.sum(dim=1)[has_pos].mean()
 
 
 def rnc_same_domain_mask(batch_size, device=None):
@@ -252,7 +411,8 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
     terms are also computed as separate pairwise losses.
 
     Args:
-        rnc: a :class:`RankNContrast` instance.
+        rnc: a :class:`RankNContrast` or :class:`RINCE` instance. RINCE also
+            receives the same-location mask as `positive`.
         builder: a :class:`singeo.distances.RnCDistanceBuilder`.
         features_ground: `[N_g, D]` stacked ground views.
         features_aerial: `[N_a, D]` stacked aerial views.
@@ -328,6 +488,12 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
             mask = no_self if mask is None else (mask & no_self)
         return mask
 
+    def same_location(ids_a, ids_b):
+        # RINCE separates positives from negatives by location, not by distance.
+        if not getattr(rnc, 'needs_positive_mask', False):
+            return {}
+        return {'positive': ids_a.unsqueeze(1) == ids_b.unsqueeze(0)}
+
     groups = {}
 
     # (a) ground anchors -> aerial references
@@ -336,6 +502,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         builder(ids_ground, arcs_ground, ids_aerial, arcs_aerial,
                 hardness=hardness(features_ground, features_aerial)),
         valid=scope(ids_ground, ids_aerial, False, features_ground, features_aerial),
+        **same_location(ids_ground, ids_aerial),
     )
 
     # (b) ground anchors -> ground references (self-pairs dropped)
@@ -344,6 +511,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         builder(ids_ground, arcs_ground, ids_ground, arcs_ground,
                 hardness=hardness(features_ground, features_ground)),
         valid=scope(ids_ground, ids_ground, True, features_ground, features_ground),
+        **same_location(ids_ground, ids_ground),
     )
 
     # (c) aerial anchors -> ground references
@@ -352,6 +520,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         builder(ids_aerial, arcs_aerial, ids_ground, arcs_ground,
                 hardness=hardness(features_aerial, features_ground)),
         valid=scope(ids_aerial, ids_ground, False, features_aerial, features_ground),
+        **same_location(ids_aerial, ids_ground),
     )
 
     # (d) aerial anchors -> aerial references (self-pairs dropped)
@@ -360,6 +529,7 @@ def compute_rnc_groups(rnc, builder, features_ground, features_aerial,
         builder(ids_aerial, arcs_aerial, ids_aerial, arcs_aerial,
                 hardness=hardness(features_aerial, features_aerial)),
         valid=scope(ids_aerial, ids_aerial, True, features_aerial, features_aerial),
+        **same_location(ids_aerial, ids_aerial),
     )
 
     return groups

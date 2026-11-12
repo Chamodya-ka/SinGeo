@@ -22,7 +22,8 @@ from singeo.transforms import get_q1_roll_max
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
-from singeo.loss import InfoNCE, RankNContrast
+from singeo.trainer import check_rnc_loss_ratio, describe_rnc_weight
+from singeo.loss import InfoNCE, RankNContrast, RINCE
 from singeo.distances import GeoNeighbourRanks, GeoCoordinates, SatelliteEmbeddings, RnCDistanceBuilder
 from singeo.model import PADDING_MODES, TimmModel_SinGeo, set_conv_padding_mode
 from singeo.visualize import RnCSampleVisualizer
@@ -124,6 +125,15 @@ class Configuration:
     # Added alongside the six InfoNCE terms, never replacing them.
     use_rnc: bool = True              # master switch for the whole RNC path
     rnc_weight: float = 0.25            # weight of the summed RNC term
+    # Hold the RnC block at a fixed share of InfoNCE instead of a fixed weight.
+    # None (default) keeps `rnc_weight`. A value such as 0.2 makes the weight
+    #   ratio * EMA(infonce_weight * InfoNCE) / EMA(RnC)
+    # every step, on detached values, so weighted RnC stays at ~0.2 x InfoNCE
+    # all run. With a fixed 0.25 that share drifts 0.05 -> 0.14 (roundP32), as
+    # InfoNCE falls ~4x and RnC barely moves. `rnc_weight` must stay non-zero
+    # (0 is the off switch) but is otherwise unused. See singeo.trainer.RnCRatioHold.
+    rnc_loss_ratio: Optional[float] = None
+    rnc_loss_ratio_momentum: float = 0.99   # EMA momentum, ~100 steps of memory
 
     # RNC temperature. 2.0 is the value from the Rank-N-Contrast paper, which
     # ranks on *unbounded* L2 distances. This repo ranks on cosine similarity,
@@ -170,6 +180,30 @@ class Configuration:
     # The reported RNC group losses drop on this switch simply because those
     # zeros are averaged in, so they are not comparable across the flag.
     rnc_exclude_ties: bool = False
+    # RINCE-style per-rank temperature. None keeps one temperature (rnc_tau) for
+    # every term, the original RnC. Set, it is tau_1: the term of a row's closest
+    # reference (the full view; both members of a tie) uses it, every other term
+    # uses rnc_tau, so rnc_tau becomes tau_2 (the partial view vs the negative).
+    # tau_1 > tau_2 softens "full view above partial view" and sharpens "partial
+    # view above the hardest negative". See RankNContrast(rank1_temperature).
+    rnc_tau_rank1: Optional[float] = None
+    # Which ranking loss fills the RNC slot (same groups, weights and scopes).
+    #   "rnc"   Rank-N-Contrast: one term per (anchor, reference) pair, mean over
+    #           pairs, ties per rnc_exclude_ties.
+    #   "rince" RINCE (Hoffmann et al. 2022, singeo.loss.RINCE): a location's own
+    #           views are ranked by overlap, every negative sits unranked in every
+    #           denominator with no term of its own, mean over anchors (MaskGeo
+    #           Eq. 11). rnc_tau_rank1 / rnc_tau are tau_1 / tau_2. Negatives are
+    #           never ranked, so negative_tiering is not read. Scope as for RnC:
+    #           rnc_positives_only=False uses every in-batch negative,
+    #           rnc_positives_only + rnc_hardest_negative only the hardest one.
+    #           With infonce_weight=0 it is the whole loss.
+    rnc_loss_form: str = "rnc"
+    # Tied positives under RINCE (a crop inside the sector, FoV 360 against the
+    # tile): "out" gives each its own term against the lower ranks and the
+    # negatives (Lout, Eq. 2); "in" puts both in one numerator (Lin, Eq. 3/5).
+    # Tied positives never compete in either. Ignored by "rnc".
+    rince_variant: str = "out"
     # Restrict RNC to views of the SAME location, so it ranks a location's own
     # views against each other and never against another location's.
     #
@@ -798,6 +832,31 @@ def apply_env_overrides(cfg):
     return applied
 
 
+def negatives_unranked(cfg):
+    """True when no loss reads a ranking among negatives, so no tiering table is needed."""
+    return cfg.rnc_positives_only or getattr(cfg, "rnc_loss_form", "rnc") == "rince"
+
+
+def check_rince_config(cfg):
+    """Refuse RINCE settings that silently mean something else."""
+    form = getattr(cfg, "rnc_loss_form", "rnc")
+    if form not in ("rnc", "rince"):
+        raise ValueError("rnc_loss_form must be 'rnc' or 'rince', got {!r}".format(form))
+    if form != "rince":
+        return
+    if cfg.rince_variant not in ("in", "out"):
+        raise ValueError("rince_variant must be 'in' or 'out', got {!r}".format(cfg.rince_variant))
+    if cfg.rnc_exclude_ties:
+        raise ValueError("rnc_exclude_ties is RnC's tie rule; RINCE handles ties by "
+                         "rince_variant ('out' or 'in'), so leave rnc_exclude_ties=False")
+    if cfg.rnc_positives_only and not cfg.rnc_hardest_negative:
+        raise ValueError("RINCE needs negatives: set rnc_positives_only=False (every in-batch "
+                         "negative) or rnc_hardest_negative=True (the hardest one per row)")
+    if cfg.rnc_loss_ratio is not None and cfg.infonce_weight == 0:
+        raise ValueError("rnc_loss_ratio scales RINCE against InfoNCE, which is off "
+                         "(infonce_weight=0); use a fixed rnc_weight")
+
+
 def write_run_info(path, cfg, run_name, note, overrides):
     """Write `info.txt` describing what this run is and what it tests.
 
@@ -809,7 +868,7 @@ def write_run_info(path, cfg, run_name, note, overrides):
     `SINGEO_RUN_NOTE` supplies the free-text "what we are testing" line.
     """
     rnc_on = cfg.use_rnc and cfg.rnc_weight != 0
-    gee_on = rnc_on and cfg.negative_tiering == "embed"
+    gee_on = rnc_on and cfg.negative_tiering == "embed" and not negatives_unranked(cfg)
 
     # The wedge's existence is decided by `use_rnc and enable_aerial_crop` at
     # dataset construction -- rnc_weight only scales the loss term. Reporting it
@@ -832,19 +891,34 @@ def write_run_info(path, cfg, run_name, note, overrides):
 
     lines.append("METHOD")
     lines.append("-" * 70)
+    infonce_off = cfg.infonce_weight == 0
+    if infonce_off:
+        lines.append("InfoNCE: OFF  (infonce_weight = 0)")
+        lines.append("  -> its six terms are still computed and logged but weighted 0: the gate,")
+        lines.append("     term weights and logit scale below do not affect training.")
+    else:
+        lines.append("InfoNCE: ON  (infonce_weight = {})".format(cfg.infonce_weight))
+    lines.append("")
     if rnc_on:
-        lines.append("Rank-N-Contrast (RnC) auxiliary loss: ON")
-        lines.append("  weight {}, temperature {}, similarity {}".format(
-            cfg.rnc_weight, cfg.rnc_tau, cfg.rnc_similarity))
+        lines.append("{} loss: ON{}".format(
+            "RINCE ranking" if cfg.rnc_loss_form == "rince" else "Rank-N-Contrast (RnC)",
+            "  - the whole training loss" if infonce_off else "  (auxiliary to InfoNCE)"))
+        lines.append("  {}, temperature {}, similarity {}".format(
+            describe_rnc_weight(cfg), cfg.rnc_tau, cfg.rnc_similarity))
         lines.append("  positive pairs  : arc overlap, measure '{}', scale {}".format(
             cfg.rnc_positive_overlap, cfg.rnc_positive_scale))
         # Report the EFFECTIVE tiering: positives-only forces it to "none" and the
         # embedding table is never even loaded, so printing the requested value
         # would claim a dependency the run does not have.
-        effective_tiering = "none" if cfg.rnc_positives_only else cfg.negative_tiering
+        if cfg.rnc_loss_form == "rince":
+            lines.append("  loss form: RINCE ({}) - own views ranked by overlap, negatives "
+                         "unranked in every denominator, mean over anchors".format(cfg.rince_variant))
+        effective_tiering = "none" if negatives_unranked(cfg) else cfg.negative_tiering
         if effective_tiering != cfg.negative_tiering:
             lines.append("  negative tiering: '{}'  (requested '{}', overridden by "
-                         "rnc_positives_only)".format(effective_tiering, cfg.negative_tiering))
+                         "{})".format(effective_tiering, cfg.negative_tiering,
+                                      "RINCE" if cfg.rnc_loss_form == "rince"
+                                      else "rnc_positives_only"))
             lines.append("    -> negatives all sit at distance 1.0; no GEE table is read")
         else:
             lines.append("  negative tiering: '{}'".format(effective_tiering))
@@ -867,8 +941,15 @@ def write_run_info(path, cfg, run_name, note, overrides):
         else:
             lines.append("  scope: all pairs -- every negative in the batch joins the rank sets")
         lines.append("  group weights (g2a, g2g, a2g, a2a): {}".format(cfg.rnc_group_weights))
-        lines.append("  ties: {}".format("excluded from rank sets" if cfg.rnc_exclude_ties
-                                         else "compete (original RnC)"))
+        if cfg.rnc_loss_form == "rince":
+            lines.append("  ties: RINCE-{} (tied positives never compete)".format(cfg.rince_variant))
+        else:
+            lines.append("  ties: {}".format("excluded from rank sets" if cfg.rnc_exclude_ties
+                                             else "compete (original RnC)"))
+        if cfg.rnc_tau_rank1 is not None:
+            lines.append("  per-rank temperature: tau_1 {} for each row's closest reference "
+                         "(the full view; both members of a tie), tau_2 {} for every other "
+                         "term".format(cfg.rnc_tau_rank1, cfg.rnc_tau))
     else:
         lines.append("Rank-N-Contrast (RnC) auxiliary loss: OFF"
                      "{}".format("  (rnc_weight = 0)" if cfg.use_rnc else ""))
@@ -888,7 +969,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
         lines.append("  tile rotation: {}{}".format(
             rotation_text,
             ", disc mask ON" if cfg.aerial_circular_mask else ", disc mask OFF"))
-        lines.append("InfoNCE overlap gating: {}".format(
+        lines.append("InfoNCE overlap gating{}: {}".format(
+            " [inactive, InfoNCE off]" if infonce_off else "",
             "ON  - each positive weighted by the {} overlap of the two views' arcs,".format(
                 cfg.overlap_gate_measure)
             if cfg.overlap_gated_infonce else "OFF - every (q2, r2) pair is a hard positive,"))
@@ -911,7 +993,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
     default_terms = (1.0, 0.5, 0.5, 0.25, 0.25, 0.25)
     if tuple(cfg.infonce_term_weights) != default_terms:
         names = ("q1-r1", "q1-q2", "r1-r2", "r1-q2", "r2-q1", "r2-q2")
-        lines.append("InfoNCE term weights: {}".format(", ".join(
+        lines.append("InfoNCE term weights{}: {}".format(
+            " [inactive, InfoNCE off]" if infonce_off else "", ", ".join(
             "{} {}".format(n, w) for n, w in zip(names, cfg.infonce_term_weights))))
         dropped = [n for n, w in zip(names, cfg.infonce_term_weights) if w == 0]
         if dropped:
@@ -991,7 +1074,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
         if getattr(cfg, "dss_fov_from_measured", False)
         else "analytic representative (log-uniform geometric mean / Gaussian pre-clip mean)"))
     if cfg.overlap_gated_infonce and cfg.overlap_gate_measure != "containment":
-        lines.append("InfoNCE gate measure: {} (every term weighted, not just loss6)".format(
+        lines.append("InfoNCE gate measure{}: {} (every term weighted, not just loss6)".format(
+            " [inactive, InfoNCE off]" if cfg.infonce_weight == 0 else "",
             cfg.overlap_gate_measure))
     if cfg.conv_padding_mode != "zeros":
         lines.append("Conv padding mode: {} (all 36 padding convs; stock is zeros)".format(
@@ -1296,7 +1380,7 @@ if __name__ == '__main__':
     geo_ranks = None
     geo_coords = None
     sat_embeddings = None
-    if config.use_rnc and config.negative_tiering == "embed" and not config.rnc_positives_only:
+    if config.use_rnc and config.negative_tiering == "embed" and not negatives_unranked(config):
         df_split = pd.read_csv(f"{config.data_folder}/splits/train-19zl.csv", header=None)
         train_ids = df_split[0].map(lambda x: int(x.split("/")[-1].split(".")[0])).values
         sat_embeddings = SatelliteEmbeddings.from_csv(config.sat_embedding_csv, ids=train_ids)
@@ -1308,7 +1392,7 @@ if __name__ == '__main__':
                     len(train_ids) - covered, len(train_ids), config.sat_embedding_csv))
         print("RNC embed tiering: {} x {}-d satellite embeddings from {}".format(
             covered, sat_embeddings.vectors.shape[1], config.sat_embedding_csv))
-    if config.use_rnc and config.negative_tiering == "geo":
+    if config.use_rnc and config.negative_tiering == "geo" and not negatives_unranked(config):
         if config.rnc_geo_source == "coords":
             # Raw (lat, lon) per training location; separations are computed
             # per batch rather than looked up, so no pair is ever quantised
@@ -1390,14 +1474,21 @@ if __name__ == '__main__':
     rnc_loss = None
     distance_builder = None
     if config.use_rnc:
-        rnc_loss = RankNContrast(temperature=config.rnc_tau,
-                                 similarity=config.rnc_similarity,
-                                 exclude_ties=config.rnc_exclude_ties)
+        if config.rnc_loss_form == "rince":
+            rnc_loss = RINCE(temperature=config.rnc_tau,
+                             similarity=config.rnc_similarity,
+                             rank1_temperature=config.rnc_tau_rank1,
+                             variant=config.rince_variant)
+        else:
+            rnc_loss = RankNContrast(temperature=config.rnc_tau,
+                                     similarity=config.rnc_similarity,
+                                     exclude_ties=config.rnc_exclude_ties,
+                                     rank1_temperature=config.rnc_tau_rank1)
         # With positives-only scoping the negative block is masked out of every
         # rank set, so whatever tiering would have filled it is never read.
         # Force the no-op source rather than letting a stale 'embed'/'geo'
         # setting demand a table that was deliberately not loaded.
-        effective_tiering = "none" if config.rnc_positives_only else config.negative_tiering
+        effective_tiering = "none" if negatives_unranked(config) else config.negative_tiering
         distance_builder = RnCDistanceBuilder(positive_scale=config.rnc_positive_scale,
                                               negative_tiering=effective_tiering,
                                               negative_margin=config.rnc_negative_margin,
@@ -1406,8 +1497,8 @@ if __name__ == '__main__':
                                               geo_max_km=config.rnc_geo_max_km,
                                               positive_overlap=config.rnc_positive_overlap,
                                               sat_embeddings=sat_embeddings)
-        print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
-            config.rnc_weight, config.rnc_tau, effective_tiering))
+        print("Using RNC Loss - {} - tau: {} - negative tiering: {}".format(
+            describe_rnc_weight(config), config.rnc_tau, effective_tiering))
         if config.rnc_positives_only:
             if config.rnc_hardest_negative:
                 print("RNC scope: POSITIVES + HARDEST NEGATIVE - a location's own views plus the "
@@ -1423,13 +1514,24 @@ if __name__ == '__main__':
         else:
             print("RNC scope: all pairs (positives ranked against negatives)")
         print("RNC positive overlap:", config.rnc_positive_overlap)
-        print("RNC tie handling:", "ties excluded from rank sets"
-              if config.rnc_exclude_ties else "ties compete (original RnC)")
+        print("RNC loss form:", "RINCE-{} (Hoffmann et al.): own views ranked by overlap, "
+              "negatives unranked in every denominator, mean over anchors".format(
+                  config.rince_variant) if config.rnc_loss_form == "rince"
+              else "Rank-N-Contrast, mean over (anchor, reference) pairs")
+        print("RNC tie handling:", "RINCE-{}: tied positives never compete".format(
+            config.rince_variant) if config.rnc_loss_form == "rince"
+            else "ties excluded from rank sets" if config.rnc_exclude_ties
+            else "ties compete (original RnC)")
+        print("RNC temperature per rank:", "tau_1 {} (closest reference) / tau_2 {} (rest)".format(
+            config.rnc_tau_rank1, config.rnc_tau) if config.rnc_tau_rank1 is not None
+            else "one temperature, {}".format(config.rnc_tau))
         print("RNC group weights (g2a, g2g, a2g, a2a):", config.rnc_group_weights)
         print("Aerial crop:", "enabled" if config.enable_aerial_crop else "disabled")
 
     # The gate needs the recorded crop arcs, which only exist on the RNC path.
     # Say so rather than reporting "on" for a run where it can never fire.
+    print("InfoNCE:", "OFF (infonce_weight = 0) - terms computed and logged, weighted 0"
+          if config.infonce_weight == 0 else "ON, weight {}".format(config.infonce_weight))
     if not config.use_rnc:
         print("InfoNCE overlap gating: n/a (no RNC -> no recorded arcs)")
     elif config.overlap_gated_infonce:
@@ -1440,10 +1542,12 @@ if __name__ == '__main__':
             else "1.0 for any pair with a full 360 deg side, so only loss6 is gated"))
     else:
         print("InfoNCE overlap gating: off")
+    check_rince_config(config)
     if config.rnc_hardest_negative and not config.rnc_positives_only:
         raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
                          "every negative is already in the rank sets")
 
+    check_rnc_loss_ratio(config)
     if config.infonce_hold_loss1_share:
         if not (config.overlap_gated_infonce and config.infonce_gate_scales_terms
                 and config.overlap_gate_measure == "circle"):

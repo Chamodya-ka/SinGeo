@@ -34,6 +34,7 @@ from singeo.model import TimmModel_SinGeo
 
 from singeo.utils import setup_system, Logger
 from singeo.trainer import train_contrast_singeo, train_contrast_singeo_rnc
+from singeo.trainer import check_rnc_loss_ratio, describe_rnc_weight
 from singeo.loss import InfoNCE, RankNContrast
 from singeo.distances import (GeoNeighbourRanks, GeoCoordinates, ProjectedCoordinates,
                               SatelliteEmbeddings, RnCDistanceBuilder)
@@ -92,8 +93,18 @@ class Configuration:
 
     use_rnc: bool = True              # master switch for the whole RNC path
     rnc_weight: float = 0.25
+    # Hold the RnC block at a fixed share of InfoNCE instead of a fixed weight.
+    # None (default) keeps `rnc_weight`. A value such as 0.2 makes the weight
+    #   ratio * EMA(infonce_weight * InfoNCE) / EMA(RnC)
+    # every step, on detached values, so weighted RnC stays at ~0.2 x InfoNCE
+    # all run. With a fixed 0.25 that share drifts 0.05 -> 0.14 (roundP32), as
+    # InfoNCE falls ~4x and RnC barely moves. `rnc_weight` must stay non-zero
+    # (0 is the off switch) but is otherwise unused. See singeo.trainer.RnCRatioHold.
+    rnc_loss_ratio: Optional[float] = None
+    rnc_loss_ratio_momentum: float = 0.99   # EMA momentum, ~100 steps of memory
     rnc_tau: float = 0.5
     rnc_exclude_ties: bool = False
+    rnc_tau_rank1: Optional[float] = None  # RINCE tau_1; None = one tau (see train_singeo_cvusa.py)
     rnc_positives_only: bool = True
     rnc_hardest_negative: bool = True
 
@@ -343,8 +354,8 @@ def write_run_info(path, cfg, run_name, note, overrides):
     lines.append("-" * 70)
     if rnc_on:
         lines.append("Rank-N-Contrast (RnC) auxiliary loss: ON")
-        lines.append("  weight {}, temperature {}, similarity {}".format(
-            cfg.rnc_weight, cfg.rnc_tau, cfg.rnc_similarity))
+        lines.append("  {}, temperature {}, similarity {}".format(
+            describe_rnc_weight(cfg), cfg.rnc_tau, cfg.rnc_similarity))
         lines.append("  positive pairs  : arc overlap, measure '{}', scale {}".format(
             cfg.rnc_positive_overlap, cfg.rnc_positive_scale))
         # Report the EFFECTIVE tiering: positives-only forces it to "none" and the
@@ -842,7 +853,8 @@ if __name__ == '__main__':
     if config.use_rnc:
         rnc_loss = RankNContrast(temperature=config.rnc_tau,
                                     similarity=config.rnc_similarity,
-                                    exclude_ties=config.rnc_exclude_ties)
+                                    exclude_ties=config.rnc_exclude_ties,
+                                    rank1_temperature=config.rnc_tau_rank1)
         # With positives-only scoping the negative block is masked out of every
         # rank set, so whatever tiering would have filled it is never read.
         # Force the no-op source rather than letting a stale 'embed'/'geo'
@@ -856,8 +868,8 @@ if __name__ == '__main__':
                                                 geo_max_km=config.rnc_geo_max_km,
                                                 positive_overlap=config.rnc_positive_overlap,
                                                 sat_embeddings=sat_embeddings)
-        print("Using RNC Loss - weight: {} - tau: {} - negative tiering: {}".format(
-                    config.rnc_weight, config.rnc_tau, effective_tiering))
+        print("Using RNC Loss - {} - tau: {} - negative tiering: {}".format(
+            describe_rnc_weight(config), config.rnc_tau, effective_tiering))
         if config.rnc_positives_only:
             if config.rnc_hardest_negative:
                 print("RNC scope: POSITIVES + HARDEST NEGATIVE - a location's own views plus the "
@@ -894,6 +906,7 @@ if __name__ == '__main__':
         raise ValueError("rnc_hardest_negative applies to the positives-only scope; with all pairs "
                             "every negative is already in the rank sets")
 
+    check_rnc_loss_ratio(config)
     if config.infonce_hold_loss1_share:
         if not (config.overlap_gated_infonce and config.infonce_gate_scales_terms
                 and config.overlap_gate_measure == "circle"):

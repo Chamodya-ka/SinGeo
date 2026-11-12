@@ -155,7 +155,27 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
   q1-r1 keeps a 1/6 share instead of drifting 17% → 36%. Needs circle + gate-scaled terms;
   refuses `infonce_gate_normalise_mass`. Every run now prints `InfoNCE epoch averages` (the
   six gated terms) into `log.txt`; the console's tqdm postfix is cut at screen width.
+- `rnc_loss_ratio` (2026-11-10, default `None`) replaces the fixed `rnc_weight` with
+  `ratio · EMA(InfoNCE) / EMA(RnC)` each step, so weighted RnC stays at `ratio` × InfoNCE.
+  With fixed 0.25 the share drifts: P32 0.047 (e1) → 0.141 (e80), mean 0.112; P23 mean
+  0.149. `rnc_weight` must stay non-zero (it is the off switch) but is otherwise unused.
+  Every run now prints `RNC share - weighted RnC / InfoNCE` into `log.txt`.
+- `rnc_tau_rank1` (2026-11-11, default `None`) gives the term of each row's closest
+  reference (the full view; both members of a tie) its own temperature τ₁, RINCE-style;
+  `rnc_tau` then acts as τ₂. In a tile-anchored row rank 2 is the test crop, so τ₁ < τ₂
+  (RINCE's default) pushes the crop–tile pair down. First used by roundP41 (τ₁ 1.0 > τ₂ 0.5).
+- `rnc_loss_form="rince"` (2026-11-12, default `"rnc"`) swaps `RankNContrast` for
+  `singeo.loss.RINCE` in the same four groups: own views ranked by overlap, negatives
+  unranked in every denominator with no term of their own, mean over **anchors** (MaskGeo
+  Eq. 11), not over (anchor, reference) pairs. `rince_variant` `"out"` (each tied positive
+  its own term) or `"in"` (one shared numerator); tied positives never compete in either.
+  Scope as for RnC: `rnc_positives_only=False` = all 30 in-batch negatives, positives-only +
+  hardest negative = one. Refuses `rnc_exclude_ties`, and positives-only without a negative.
+  `RnC(exclude_ties)` over all pairs equals RINCE-out ÷ 2B (tests/test_rince.py). With
+  `infonce_weight=0` it is the whole loss: roundP42 (cross-domain only, stopped e5) and
+  roundP43 (+ same-domain groups at 0.5).
 - Circular conv padding fails below ~64 input columns (about FoV 30).
+- **ViT backbones** (`SINGEO_MODEL=vit_*`, roundP40) go through the same shared `TimmModel_SinGeo`, built with timm `dynamic_img_size` + `dynamic_img_pad` so the 140×768 ground view fits (140 is padded to 144). Conv-only tools (`conv_padding_mode`, `aerial_mask_mode`) do not apply to them.
 - Input collages are captured **before** collation, so a `fov_pad_batch_max` run's collage
   shows unpadded crops.
 - `pgrep -f <script>` matches its own watcher; use `screen -list` or explicit PIDs.

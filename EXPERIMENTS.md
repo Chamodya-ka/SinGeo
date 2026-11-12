@@ -121,7 +121,11 @@ by all: ConvNeXt-B @384, batch 16, AdamW 1e-4 cosine, 80 epochs, label smoothing
 | roundP36 `_20261107-172318` | B | padded, per-sample | P32 + `RNC_GROUP_WEIGHTS='(1.0, 0.0, 0.5, 0.0)'` — a2g halved, one variable (FoV 0 appended to the eval list, eval only). Tests whether halving a2g is what cost P35 its narrow FoVs (P35 − P32 at e76: 360 +0.31, 180 −2.02, 90 −3.18, 70 −2.62, Avg −1.88). Post RNG fix, so a gap to P32 mixes a2g with the fix | 94.59 | 91.60 | 76.10 | 66.51 | **82.20** | final — FoV 0 96.60, roll gap 2.01. −0.38 vs P32, every column within 0.6, so a2g 0.5 is not what cost P35 its narrow FoVs. Second-best CVUSA Avg after P32 |
 | roundP37 `_20261107-173606` | B | padded, per-sample | P32 + `INFONCE_HOLD_LOSS1_SHARE=true` — loss1 held at a 1/6 share of the gated mass, one variable (FoV 0 appended to the eval list, eval only). CVUSA twin of CVACT C15, which beat C9 by +2.64 Avg (360 +7.42, 90 +1.34, 70 +2.02). Post RNG fix, so a gap to P32 mixes the held share with the fix | 95.54 | 90.98 | 74.76 | 64.86 | **81.54** | final — FoV 0 96.21, roll gap 0.66. −1.04 vs P32 (360 +0.50, 180 −1.18, 90 −1.40, 70 −2.08): C15's CVACT gain does not transfer |
 | roundP38 `_20261109-015652` | B | padded, per-sample | P37 + `RNC_WEIGHT=0.0` — RnC off by weight (wedge, arcs, gate and held share kept), one variable. Does RnC still pay once loss1's share is held? CVUSA counterpart of the RnC-off test CVACT lacks (C15 with RnC off). Same code as P37 (train.py identical to its snapshot), both post RNG fix: a clean pair | 94.99 | 89.98 | 73.03 | 62.72 | **80.18** | **stopped by hand during e60** (2026-11-10, to free the slot for P39); numbers are e56, best FoV-90 checkpoint `weights_e56_73.0302.pth`, no `weights_end`. FoV 0 96.74. P37 at the same epoch: 95.27/89.94/72.61/62.79, Avg 80.15, so RnC off was level with P37 at e56 (+0.03) |
-| roundP39 `_20261110-013000` | B | padded, per-sample | P32 + `RNC_EXCLUDE_TIES=true` — one variable (FoV 0 appended to the eval list, eval only). Only tied rows change: when the full and masked reference share the same `circle` overlap with the anchor (a q2 crop inside the sector: ~72% of q2 rows over the run, ~19% of all RnC rows, simulated from P32's curriculum), each becomes its own two-way term against the hardest negative instead of the pair being pulled to equal similarity. Makes the loss exactly RINCE (uni on untied rows, out on tied rows). Post RNG fix; P36 bounds the fix. Logged g2a/a2g drop on the switch by construction, not comparable with P32 | | | | | | running |
+| roundP39 `_20261110-013000` | B | padded, per-sample | P32 + `RNC_EXCLUDE_TIES=true` — one variable (FoV 0 appended to the eval list, eval only). Only tied rows change: when the full and masked reference share the same `circle` overlap with the anchor (a q2 crop inside the sector: ~72% of q2 rows over the run, ~19% of all RnC rows, simulated from P32's curriculum), each becomes its own two-way term against the hardest negative instead of the pair being pulled to equal similarity. Makes the loss exactly RINCE (uni on untied rows, out on tied rows). Post RNG fix; P36 bounds the fix. Logged g2a/a2g drop on the switch by construction, not comparable with P32 | 94.70 | 91.34 | 74.92 | 65.96 | **81.73** | final — FoV 0 96.67. −0.85 vs P32 (360 −0.35, 180 −0.83, 90 −1.24, 70 −0.98); −0.47 vs post-fix P36 (360 +0.11, 180 −0.26, 90 −1.18, 70 −0.55). Below P32 at every eval from e24 (the end of the ~100%-tie phase) to e80, the gap concentrated at FoV 90/70 where tied q2 rows live. Excluding ties costs; keep the default. Size not separable from the RNG fix without a post-fix P32 rerun |
+| roundP41 `_20261111-165807` | B | padded, per-sample | P39 + `RNC_TAU_RANK1=1.0` — RINCE per-rank temperatures, one variable: each row's closest reference (the full view; both members of a tie) runs at τ₁ = 1.0, the partial view's term at τ₂ = `rnc_tau` 0.5. New field 2026-11-11 (`RankNContrast(rank1_temperature)`; `None` is the existing path, τ₁ = τ₂ matches one τ, tests in `tests/test_rnc_rank_temperature.py`). τ₁ > τ₂ is the direction the a2g force probe found pulls the test crop–tile pair for every tile (net +0.46, ~4% of InfoNCE's pull on it); RINCE's default τ₁ < τ₂ pushes it. Risk: the wedge is held less firmly behind the full tile in crop-anchored rows. Control P39, same code path, both post RNG fix | | | | | | running |
+| roundP42 `_20261112-113416` | B | padded, per-sample | **RINCE alone, no InfoNCE**: P32's recipe with `INFONCE_WEIGHT=0.0 RNC_WEIGHT=1.0 RNC_LOSS_FORM=rince RINCE_VARIANT=out RNC_TAU=0.1 RNC_TAU_RANK1=0.15 RNC_POSITIVES_ONLY=false RNC_HARDEST_NEGATIVE=false NEGATIVE_TIERING=none` (groups (1,0,1,0) as P32). New loss 2026-11-12 (`singeo.loss.RINCE`, tests/test_rince.py): four cross-domain rows (q1, q2, r1, r2 anchors), own views ranked by circle overlap, all 30 in-batch negatives unranked in every denominator with no term of their own, mean over anchors; ties RINCE-out (each tied positive its own term, never competing). tau_1 0.15 > tau_2 0.1: full view held softly above the masked one, masked view contrasted hard against negatives. InfoNCE terms still computed, weight 0. Not one variable: the recipe test is whether RINCE alone matches InfoNCE + RINCE. Controls P32 82.58 (pre RNG fix), P36 82.20 (post fix); P28 79.69 InfoNCE alone. Lost vs P32: same-domain InfoNCE q1-q2 and r1-r2, the gate, label smoothing, learned logit scale. Old RnC-only runs (round5b 10.28, round7b 13.95) were all-pairs RnC with negative-vs-negative terms, which RINCE does not have. Start: loss 13.6 -> 11.7 in 73 steps (2 x log 32 per row at init), InfoNCE loss1 (weight 0) falling alongside | 47.83 | 19.63 | 6.84 | 4.54 | 19.71 @e4 | stopped by hand during e5 (2026-11-12) to restart as roundP43 with the same-domain groups on; numbers are its only eval, e4 (FoV 270 35.40, FoV 0 48.91), no weights saved. P32 at e4: 60.37/30.97/10.87/6.96. Learning, no collapse, but behind P32 at e4 |
+| roundP43 `_20261112-130834` | B | padded, per-sample | P42 + `RNC_GROUP_WEIGHTS='(1.0, 0.5, 1.0, 0.5)'` — **RINCE alone with the same-domain groups on**, one variable against P42. With the self pair dropped each same-domain row has one positive (q1 with q2, r1 with r2, and back) against the 30 other views of its domain, so g2g and a2a are plain InfoNCE terms at tau_1 0.15. Restores the q1-q2 and r1-r2 terms (SinGeo rotated-tile supervision) that P42 lost with InfoNCE; 0.5 matches the SinGeo weight of loss2/loss3. Control P42 at e4 (47.83/19.63/6.84/4.54); P32 82.58, P36 82.20, P28 79.69. Start: loss 16.1 -> 14.3 in 61 steps (P42 plus 0.5 x two same-domain groups) | | | | | | running |
+| roundP40 `_20261111-163932` | B | padded, per-sample | P32 + `MODEL=vit_base_patch16_384.augreg_in21k_ft_in1k` — backbone swap ConvNeXt-B → ViT-B/16 @384, one variable (FoV 0 appended to the eval list, eval only). Same provenance (in21k → in1k ft @384), 86.1M vs 88.6M params, still one encoder shared by both views, CLS descriptor 768-d vs 1024-d. Ground 140×768 goes in via timm `dynamic_img_size` (24×24 pos-embed resampled to 9×48 each forward) + `dynamic_img_pad` (140 → 144, zero = mean fill). LR 1e-4 / cosine / fp16 kept from P32, not tuned for ViT. Post RNG fix; P36 bounds the fix. ~5.9 it/s sharing the GPU with V2 (ConvNeXt 3.8 alone), 14 GB | | | | | | running — started 2026-11-11 16:39, `./run.sh roundP40` |
 | SinGeo published | — | unpadded | paper Tab. 1 | 96.8 | 91.8 | 70.1 | 58.0 | 79.17 | reference |
 | HCL-Geo published | — | — | AAAI 2026 Tab. 1 — four FoV experts on a shared trunk, panorama-teacher distillation, 240 epochs | 97.6 | 92.4 | 75.2 | 68.3 | 83.38 | reference |
 
@@ -1504,7 +1508,8 @@ can be the RnC hardest negative. That matches how SinGeo trains on VIGOR.
 | roundV1, last eval (e68) | cross | 28.24 | 23.76 | 15.18 | 6.92 | 5.29 | 13.91 | 7.64 | |
 | roundV1, peak FoV 360 (e20) | cross | 32.79 | 27.14 | 16.35 | 6.57 | 4.61 | 15.08 | 7.34 | |
 | roundV3 P37 `_20261109-002907`, e28 (best FoV 90) | same | 66.64 | 60.21 | 46.28 | **24.68** | 18.55 | 39.04 | 29.13 | stopped by hand in e29 (2026-11-09 19:05) to free the GPU for roundV2; checkpoint `weights_e28_24.6783.pth`. V1's recipe on same-area + `INFONCE_HOLD_LOSS1_SHARE=true`; FoV 0 68.13, roll gap 1.49. Already above SinGeo's published same-area FoV 90 (24.0) at e28; ~1.8 it/s, disk-bound |
-| roundV2 P32 `_20261109-190613` | same | | | | | | | | running — started 2026-11-09 19:05, `./run_vigor.sh roundV2`: roundV1's recipe on same-area, the one-variable control for V3 (V3 minus the held share; no FoV 0 eval) |
+| **roundV2 P32** `_20261109-190613`, e72 (best FoV 90) | same | **64.55** | 60.14 | 50.89 | **32.71** | 26.39 | 43.64 | 38.87 | stopped by hand in e79 (2026-11-11 16:53), so no e80 eval and no `weights_end.pth`; checkpoint `weights_e72_32.7079.pth`. roundV1's recipe on same-area, the one-variable control for V3 (no FoV 0 eval). Above SinGeo's published same-area 62.9 / 24.0 at FoV 360 / 90. FoV 90 flat from e64 (32.58 → 32.71 → 32.70) |
+| roundV2, last eval (e76) | same | 63.81 | 60.07 | 50.84 | 32.70 | 26.32 | 43.42 | 38.72 | |
 
 **roundV1 result.** Stopped by hand during epoch 72 (LR already 3e-6), so there is
 no `weights_end.pth`; the checkpoint is `weights_e56_7.1963.pth`. Against SinGeo's
@@ -1522,6 +1527,173 @@ the H100: 3.0-3.15 it/s at 100% GPU (GPU-bound with 8 workers), 38.7 GB; an epoc
 is ~17 min and a five-FoV eval plus the train-set similarity rebuild ~23 min, so
 an 80-epoch run takes ~31 h. Zero-shot (ImageNet weights) is chance level:
 R@1 0.03-0.06 at every FoV, R@1% 5.6-8.9.
+
+### Probe (2026-11-10): roundV2's FoV 360 zigzag is one blank tile
+
+roundV2's FoV 360 R@1 alternated 61.05 / 54.69 / 66.19 / 55.39 / 65.13 / 55.18
+over e20-e40 while its R@5 (~88) and every other FoV rose smoothly.
+`experiments/vigor_rank1_rival_probe.py` re-scored `weights_e36` and `weights_e40`
+against all 90,618 tiles at FoV 360 and FoV 0 (north aligned), reproducing log.txt
+exactly (65.13, 55.18), and classified the tile that beats the true one. Summary in
+`experiments/figures/eval/vigor_rank1_rival_probe.txt`.
+
+| V2 checkpoint | FoV 360 R@1 | without the tile | FoV 0 R@1 | without the tile | queries it takes rank 1 from (360) | in their top 10 (360) |
+|---|---|---|---|---|---|---|
+| e36 | 65.13 | 67.11 | 67.47 | 68.73 | 3,431 (6.5%) | 67.8% |
+| e40 | 55.18 | **66.83** | 59.05 | **68.30** | 13,768 (26.2%) | 97.3% |
+
+- **One tile does it:** NewYork `satellite_40.7827771132_-73.961545472.png` (gallery
+  index 45545), plain water in the Central Park reservoir with only Google
+  watermarks. No panorama, train or test, lists it as positive or semi-positive, so
+  training never saw it. With it removed the two checkpoints differ by 0.3, not 10.
+- **It is a hub.** It sits near the centroid of the embeddings (cosine 0.56 with
+  the mean FoV 360 query at e40; the mean query has norm 0.64, so the embeddings
+  share a large common direction), so it scores well against everything. How close
+  it drifts to that centroid changes between checkpoints. The queries it flips had a
+  thin margin at e36 (median 0.021 over the 2nd tile, against 0.068 for the rest)
+  and drop only to rank 2.
+- **Not rotation:** the north-aligned FoV 0 drops as much (67.47 -> 59.05).
+- **Not the mean fill either; flat colours other than it.** Synthetic 384 px tiles
+  encoded by e36 / e40, "beats true tile" = share of FoV 360 queries it would outrank
+  their positive in: the all-fill tile (tensor 0, what padding and the wedge mask
+  write) has cosine 0.37 / 0.35 with the hub and beats 0.2% / 0.0%; real tiles
+  masked to a 30, 90 or 180 deg wedge with that fill 0.1-0.2%, the same as unmasked
+  tiles; uniform black 0.4% / 0.1%. But a uniform water colour (75, 109, 121) beats
+  84% / 94%, uniform green 78% / 69%, uniform light grey 97% / 98%, all with cosine
+  0.66-0.83 to the mean query. The model has learnt that the fill colour means
+  nothing there (every crop and wedge carries it); any other flat image is unseen
+  and lands near the centre of the panorama embeddings. The real tile is milder
+  (15% / 35%) because of its watermarks and faint texture. It sits at the north
+  edge of VIGOR's New York area, beside the Guggenheim; panoramas run only along
+  the paths around the water.
+- **Not the nearest training panorama.** The "twin" (a training panorama a median
+  18.8 m away) was the first guess; its tile is the rival for 0.4-0.7% of wrong
+  queries, below its 1.3% share of the 8 nearest tiles not containing the camera.
+- **Why roundV1 cannot show it:** the tile is in New York; the cross-area test
+  gallery is Chicago and San Francisco.
+
+Reading: a single same-area eval at FoV 360 (or 0) is partly a draw on where this
+tile lands, so compare V2 and V3 there over several evals, not one. The standard
+protocol keeps the tile, so reported numbers should too; the hub-free R@1 is a
+diagnostic. Not yet checked: FoV 270 / 180. V3's e8-e12 collapse (FoV 360 22.7 /
+24.3) is the same tile, and no other blank tile is a hub: both checked below.
+
+**FoV 90, the checkpoint metric, is untouched.** Same checkpoints, the trainer's
+crop seed (12345), against the cached gallery features: R@1 27.8605 / 28.6950
+(logged 27.8605 / 28.6969; one query apart from the fp16 cache). The reservoir
+takes rank 1 from 0 queries and is in no query's top 10 at either checkpoint; no
+tile takes rank 1 from more than 15. So checkpoint saving is unaffected, and
+training never loads the tile (it is no training panorama's positive, and the
+train-split similarity rebuild only holds training-positive tiles).
+
+**Centring the embeddings removes the hub (eval-only, saved e36 / e40 features).**
+Subtract a mean embedding from queries and tiles, then re-normalise:
+
+| | e36 FoV 360 | e40 FoV 360 | e36 FoV 0 | e40 FoV 0 | reservoir rank-1 wins (e40, 360) |
+|---|---|---|---|---|---|
+| as is | 65.13 | 55.17 | 67.47 | 59.05 | 13,768 |
+| minus the training-tile mean (40,007 tiles) | 67.01 | **65.74** | 68.75 | 67.62 | 2,527 |
+| minus the whole-gallery mean (transductive) | 67.14 | 66.29 | 68.84 | 67.99 | 1,820 |
+
+The training-tile mean uses no test data (cosine 0.97 with the gallery mean), so
+it is a fixed post-hoc step, like retrieval PCA-whitening fitted on training data;
+it cuts the e36 / e40 gap from 10 to 1.3. Unchecked: FoV 90 / 270 / 180 (padded
+crops may not like it) and the other datasets, so it is not adopted.
+
+**Follow-up (2026-11-10): no second hub.** From the probe's saved e36 / e40
+features, every one of the 90,618 tiles was scored by the share of FoV 360 test
+queries whose true tile it outranks (its own four queries excluded), alongside
+its rank-1 wins and PNG size.
+
+| | reservoir 45545 | next tile | 99.99th pct | median | tiles > 1% | tiles > 5% |
+|---|---|---|---|---|---|---|
+| e36, outranks the true tile | 14.79% | 4.02% | 1.10% | 0.15% | 14 | 1 |
+| e40, outranks the true tile | **34.77%** | 5.41% | 2.29% | 0.18% | 32 | 2 |
+| e40, rank-1 wins (FoV 360) | **13,768** | 6 | | | | |
+
+- **The second tier is the same kind of image, milder:** the reservoir's southern
+  neighbour 45443 (water plus a strip of shore, 5.41%), East River tiles 34362,
+  44974, 23239 and 36522 (3.1-4.1%), San Francisco Bay 50579 (2.3%), and large flat
+  white roofs: Chicago 14861 (3.25%, the only one with a panorama), the United
+  Center 14742 (1.7%), a Seattle warehouse 78349 (1.4%). All grow from e36 to e40
+  (1.3-3x; the hub 2.4x). 21 of the top 25 have no panorama.
+- **They cost nothing measurable.** They never take rank 1 (the reservoir sits above
+  them), and removing the 31 next tiles changes R@1 by +0.00 on their own and by
+  +0.13 on top of the reservoir (e40 FoV 360: 55.18 -> 66.82 hub only -> 66.95);
+  they outrank the true tile mostly on queries that are wrong anyway.
+- **The reservoir is unique because it is the flattest.** It is the smallest PNG in
+  VIGOR (11 KB; the next is 16 KB, the median 274 KB), and its cosine to the mean
+  query is 0.56 against 0.40 for the next tile. File size does not predict hubness
+  past the extreme tail (Spearman 0.02 over all tiles).
+- Cross-area caveat: SF 50579 and Chicago 14861 / 14742 are in roundV1's test
+  gallery; not scored there, but at 1-3% they are unlikely to move R@1.
+
+**Follow-up (2026-11-10): V3 has the hub too, worse early, milder late.** Every
+saved V2 / V3 checkpoint, FoV 360, on a fixed sample of 3,000 test queries:
+share whose true tile scores below the reservoir tile 45545, below a uniform
+water-colour tile (75, 109, 121) and below uniform light grey (200). The sample
+reproduces the full-gallery shares (V2 e36 14.77 vs 14.79; e40 36.00 vs 34.77).
+
+| ckpt | FoV 360 R@1 (log) | reservoir | water | grey | cos(reservoir, mean query) |
+|---|---|---|---|---|---|
+| V3 e8 | 22.71 | **73.0** | 88.7 | 95.2 | 0.77 |
+| V3 e12 | 24.33 | **71.7** | 48.4 | 85.3 | 0.71 |
+| V3 e16 | 60.41 | 12.2 | 3.8 | 15.9 | 0.53 |
+| V3 e20 | 64.47 | 1.6 | 37.7 | 54.3 | 0.41 |
+| V3 e24 | 65.45 | 5.9 | 50.4 | 64.5 | 0.48 |
+| V3 e28 | 66.64 | 4.3 | 55.3 | 81.1 | 0.44 |
+| V2 e20 | 61.05 | 20.4 | 15.0 | 58.9 | 0.59 |
+| V2 e24 | 54.69 | 35.4 | 75.0 | 83.5 | 0.62 |
+| V2 e28 | 66.19 | 9.1 | 55.4 | 84.5 | 0.47 |
+| V2 e32 | 55.39 | 34.4 | 79.4 | 93.6 | 0.58 |
+| V2 e36 | 65.13 | 14.8 | 84.4 | 96.6 | 0.48 |
+| V2 e40 | 55.18 | 36.0 | 93.7 | 98.3 | 0.56 |
+
+- **V3's e8-e12 collapse is the reservoir.** It outranks the true tile for 72-73%
+  of queries there, twice V2's worst; the R@5 drop to ~52 at those evals suggests
+  the second-tier water tiles sat above the true tile as well.
+- **From e16 V3 keeps it at 2-6%; V2 swings 9-20% / 34-36% on alternate evals**,
+  exactly in step with its R@1 (low R@1 at e24, e32, e40).
+- **Flat images in general stay hubs in both runs** (water 38-55%, grey 54-81% in
+  V3 e20-e28; similar in V2), and the mean-query norm is the same (0.61-0.65), so
+  V3 did not fix the "unseen flat image lands at the centre" weakness. What differs
+  is where the one real tile, with its watermarks and faint texture, ends up.
+- **Not attributable yet.** V2 and V3 differ only in `infonce_hold_loss1_share`,
+  but both ran with `seed = None` (one run each), V3 has only four evals after e16
+  (stopped e29), and its e8-e12 shows it is not immune. Where this tile lands is a
+  per-checkpoint draw that V3 happened to win at e20-e28. A seeded repeat of either
+  arm is needed before crediting the held share. V2's strict two-eval period (8
+  epochs) is unexplained.
+
+**Follow-up (2026-11-11): CVUSA has no hub.** CVUSA roundP32 `_20261028-234233`,
+`weights_end` and `weights_e12` (its one FoV 360 dip, 79.72 -> 74.91 while 270
+rose), all five FoVs against the 8,884 test tiles; R@1 reproduces log.txt.
+
+| P32 final | FoV 360 | 270 | 180 | 90 | 70 |
+|---|---|---|---|---|---|
+| R@1 | 95.05 | 95.08 | 92.17 | 76.16 | 66.94 |
+| most rank-1 wins by one tile | 3 | 4 | 4 | 5 | 5 |
+| R@1 without the top 10 such tiles | 95.13 | 95.22 | 92.28 | 76.25 | 67.09 |
+| most-outranking tile, share of queries | 0.37% | 0.16% | 0.23% | 0.42% | 0.59% |
+| worst synthetic flat tile (6 colours) | 0.0% | 0.2% | 0.4% | 0.3% | 0.3% |
+| gallery-centred R@1 | 94.69 | 94.95 | 91.94 | 75.73 | 66.67 |
+
+- **No tile takes rank 1 from more than 5 queries at any FoV**, and dropping the 10
+  busiest changes R@1 by at most +0.15. The most-outranking tile beats the true one
+  for 0.37% of FoV 360 queries, against the reservoir's 35% on VIGOR V2 e40.
+- **CVUSA has flat tiles, but they are not hubs.** The flattest test tiles (21 KB
+  against a 101 KB median: two pale cloud or snow tiles and two dark water tiles,
+  each pair apparently identical) are below the 0.37% maximum.
+- **The P32 model is not vulnerable to flat images either:** uniform water, grey,
+  green, tan, black and the mean fill outrank the true tile for 0.0-0.4% of
+  queries, against 70-98% for VIGOR V2. Likely because CVUSA's rural and suburban
+  training tiles are full of low-texture ground (fields, desert, water), while
+  VIGOR's four city centres have almost none; not tested.
+- **The e12 dip is not a hub** (no tile above 8 rank-1 wins). At e12 the narrow
+  FoVs were still vulnerable (flat tiles outrank the true tile for 15-18% at FoV
+  90 and 26-30% at FoV 70), which training then removed.
+- **Centring costs CVUSA 0.1-0.4 at every FoV** (gallery mean; the training-tile
+  mean was not tried). It is a VIGOR-specific remedy, not a general eval step.
 
 ## University-1652 port (2026-11-09): the C15 recipe on street photos with no heading
 
@@ -2213,3 +2385,92 @@ SinGeo as-is (`as-is-singeo-64px-pad/weights_e80_72.7150.pth`), CVUSA, three pad
   SinGeo: unpadded it scores 74.76, 4.3 below the paper. With its border it beats the
   paper by 1.9 Avg. FoV 90 is 73.32 here vs 72.72 in the filename and 72.22 in the
   sector-heat run: different orientation draws move FoV 90 by ~±0.5.
+
+## Does the aerial-anchored RnC row push the crop away from its tile? (roundP32, eval-only, 2026-11-11)
+
+`experiments/rnc_a2g_force_probe.py` on roundP32 `_20261028-234233/weights_end.pth`,
+full padding, FoV 90. For a tile anchor r1 the RnC row is l1 (q1 above q2 and n) +
+l2 (q2 above n), and c = s(r1, q2) is exactly the score the test crop gives its own
+tile. l1 always pushes c down (pi_q2 / t1 > 0 for any t1); l2 pulls it up. Forces on c
+per pair, with the hardest negative taken from a batch of the 15 most similar tiles
+(a DSS stand-in; uniform-random batches in brackets where they differ). The
+ground-anchored row g2a, which also pulls c up, is not counted (needs the wedge).
+
+| split (8,884 loc.) | s(r1,q1) | s(r1,q2) | hardest in-batch neg | best other gallery tile | s(r1,q1) > s(r1,q2) |
+|---|---|---|---|---|---|
+| test | 0.424 | 0.336 | 0.263 (0.186) | 0.253 | 88.8% |
+| train (first 8,884) | 0.566 | 0.466 | 0.263 (0.177) | 0.245 | 97.3% |
+
+Train split, similar-tile batches; RnC net is the a2g row only, scaled as in the
+trainer (rnc_weight 0.25 / (3 x 2B)) for the last column. InfoNCE loss4 pulls c by
+0.030 per pair (logit scale 11.5, label smoothing 0.1; with random batches its pull is
+about 0 or slightly negative, the smoothed target capping confidence at 0.906).
+
+| t1 | t2 | l1 push | l2 pull | net (+ pull) | tiles with net push | RnC net / InfoNCE pull |
+|---|---|---|---|---|---|---|
+| **0.5** | **0.5** | 0.691 | 0.804 | +0.113 | 12.1% | +0.009 |
+| 1.0 | 0.5 | 0.342 | 0.804 | +0.462 | 0.0% | +0.039 |
+| 2.0 | 0.5 | 0.169 | 0.804 | +0.635 | 0.0% | +0.054 |
+| 0.5 | 0.25 | 0.691 | 1.246 | +0.554 | 0.2% | +0.047 |
+| 1.0 | 0.25 | 0.342 | 1.246 | +0.904 | 0.0% | +0.077 |
+| 0.1 | 0.5 | 2.598 | 0.804 | −1.796 | 98.0% | −0.151 |
+| 0.1 | 0.1 | 2.598 | 1.209 | −1.359 | 80.0% | −0.113 |
+| *RINCE's t1 < t2:* | | | | | | |
+| 0.25 | 0.5 | 1.358 | 0.804 | −0.552 | 98.0% | −0.046 |
+| 0.2 | 0.5 | 1.656 | 0.804 | −0.850 | 99.0% | −0.071 |
+| 0.5 | 1.0 | 0.691 | 0.451 | −0.240 | 99.8% | −0.020 |
+| 0.25 | 1.0 | 1.358 | 0.451 | −0.908 | 100.0% | −0.076 |
+| 0.1 | 0.2 | 2.598 | 1.353 | −1.243 | 84.5% | −0.103 |
+
+- **RINCE's recommended t1 < t2 (Hoffmann et al., "higher ranks require larger t2") is
+  the direction that creates the push.** In the near-uniform regime the net on c is a
+  pull only while t2 / t1 stays below about 1.2; every t1 < t2 setting above pushes c
+  down for 98-100% of tiles, at 2-10% of InfoNCE's pull and now against it. RINCE's
+  lower ranks are auxiliary positives; here the aerial row's rank 2 (q2) is the test
+  query, which is why t1 = t2 suits this task. (For ground anchors the semi-positive
+  r2 never appears at test time, so t1 < t2 would not touch the eval pair there.)
+- **At P32's tau the row already pulls the crop toward its tile** for 88% of training
+  tiles (test: 98%). Cosines are packed within ~0.3, so the logit spread
+  (s(r1,q1) − s(r1,n)) / t1 is 0.6 and the softmax is near uniform: l1's push is about
+  (1/3)/t1 and l2's pull about (1/2)/t1, so the pull wins by counting, not by tuning.
+- **Its force on the test pair is about 1% of InfoNCE's.** Raising t1 or lowering t2
+  makes the net a pull for every tile, but at most ~8% of InfoNCE's pull (1.0 / 0.25).
+  A temperature change cannot move this pair much in either direction; whatever RnC
+  is worth on CVUSA (~+1 at FoV 90/70, P23 vs P28) must act through other pairs.
+- **Only a small t1 creates the mismatch**: at t1 = 0.1 the logit spread reaches 3 and
+  l1 pushes c down for 98% of tiles. Consistent with the old all-pairs `rnc_tau` sweep,
+  where 0.05-0.2 lost 2.5-7 Avg.
+- **The ranking q1 > q2 for a tile holds for 97% of training tiles**; this probe cannot
+  say whether RnC or the information gap put it there. Control: the same probe on
+  roundP28 (P23 with RnC off).
+
+### More negatives in the RINCE denominator (same features, 2026-11-12)
+
+RINCE needs no ranking among negatives: they share the bottom rank, sit in every
+term's denominator and get no term of their own. Same probe, a2g row, similar-tile
+batches (15 neighbour tiles, so 30 ground negatives: their q1 and q2), hardest k kept.
+"Scaled" uses the trainer's mean over 2 + k valid pairs per row and rnc_weight 0.25.
+
+| t | k | l1 push on c | l2 pull on c | net | tiles with net push | scaled net / InfoNCE pull |
+|---|---|---|---|---|---|---|
+| 0.5 | **1** (P32) | 0.691 | 0.804 | +0.113 | 12.1% | +0.010 |
+| 0.5 | 3 | 0.481 | 1.320 | +0.840 | 0.0% | +0.044 |
+| 0.5 | 30 | 0.109 | 1.883 | +1.774 | 0.0% | +0.014 |
+| 0.2 | 1 | 1.656 | 1.353 | −0.298 | 70.0% | −0.026 |
+| 0.2 | 30 | 0.545 | 4.337 | +3.793 | 0.0% | +0.031 |
+| 0.1 | 1 | 2.598 | 1.209 | −1.359 | 80.0% | −0.118 |
+| 0.1 | 30 | 1.889 | 6.088 | +4.182 | 1.8% | +0.034 |
+
+- **More negatives make the row pull the test crop toward its tile harder**, at any t.
+- **At t = 0.5 they also erase the ranking**: l1's push on c, the only force that puts
+  q1 above q2, falls 0.69 → 0.11 once q2 is 1 of 32 items in l1's denominator. The row
+  becomes a soft copy (logit scale 2) of InfoNCE's r1-q1 and r1-q2 terms (scale 11.5),
+  which is the paper's argument for one hard negative.
+- **With many negatives the ranking survives only at low t** (t = 0.1: push 1.89, net
+  still a pull for 98% of tiles). Many negatives plus low t is RINCE's own regime.
+- **Config-only route is confounded twice.** `RNC_POSITIVES_ONLY=false NEGATIVE_TIERING=none
+  RNC_EXCLUDE_TIES=true` is RINCE with all 30 negatives, but (a) exclude_ties also
+  changes the tied crop rows, which cost −0.85 in P39, and (b) the mean over 32 pairs
+  per row dilutes the gradient about 10x (scaled force +0.014, no more than k = 1).
+  With the default `>=` instead, the 30 tied negatives each get a term that pushes them
+  to equal similarity (pulling easy negatives up), the floor that kept all-pairs RnC flat.

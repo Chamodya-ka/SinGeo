@@ -206,8 +206,13 @@ class TimmModel_SinGeo(nn.Module):
         self.random_fov = random_fov
         
         if "vit" in model_name:
-            # automatically change interpolate pos-encoding to img_size
-            self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0, img_size=img_size) 
+            # One shared encoder takes the square tile and the 140 x 768 ground view.
+            # dynamic_img_size resamples the pos-embed grid (img_size / patch) to each
+            # input's grid on every forward; dynamic_img_pad zero-pads H and W up to
+            # a multiple of the patch (ground 140 -> 144), and zero is the "mean"
+            # mask fill after Normalize. Without these timm rejects any non-square input.
+            self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0, img_size=img_size,
+                                           dynamic_img_size=True, dynamic_img_pad=True)
         else:
             # If you cannot access the model weights due to region constrains, you can pre-download the model weights as "convnxt_overlay" and use "pretrained_cfg_overlay".
             # self.model = timm.create_model(model_name, pretrained=pretrained, pretrained_cfg_overlay=convnxt_overlay, num_classes=0) 

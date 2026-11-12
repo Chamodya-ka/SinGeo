@@ -62,6 +62,10 @@
 #   roundP37  P32 with the loss1 share held (CVUSA twin of CVACT C15), one variable
 #   roundP38  P37 with RnC off (rnc_weight 0; wedge, arcs and gate kept), one variable
 #   roundP39  P32 with rnc_exclude_ties: equal-overlap references stop competing, one variable
+#   roundP40  P32 with a ViT-B/16 @384 backbone instead of ConvNeXt-B, one variable
+#   roundP41  P39 with rnc_tau_rank1 1.0: RINCE per-rank temperatures, tau_1 1.0 > tau_2 0.5, one variable
+#   roundP42  RINCE alone (no InfoNCE): 4 cross-domain rows, all negatives, RINCE-out ties, tau_1 0.15 > tau_2 0.1
+#   roundP43  P42 with same-domain RINCE groups g2g, a2a at 0.5
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -2114,6 +2118,201 @@ this run after it; P36 (a2g 0.5, post fix) was within 0.6 of P32 on every column
 so the fix alone costs little. Expect the effect, if any, at FoV 90 and 70 where
 q2 rows dominate. The logged g2a group loss drops on the switch by construction
 (tied terms lose a denominator entry), so do not compare it with P32.'
+    ;;
+roundP40)
+    echo "Round P40 - P32 with a ViT-B/16 @384 backbone instead of ConvNeXt-B, nothing else changed [80 ep]"
+    echo "  control roundP32 _20261028-234233 82.58 (pre RNG fix); roundP36 82.20 bounds the fix"
+    launch roundP40-p32-vitb16 \
+        SINGEO_MODEL=vit_base_patch16_384.augreg_in21k_ft_in1k \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P40. roundP32 with the backbone swapped from convnext_base.fb_in22k_ft_in1k_384
+to vit_base_patch16_384.augreg_in21k_ft_in1k and nothing else in the config changed
+(FoV 0 appended to the eval list, eval only). Same provenance as the ConvNeXt
+(in21k pretrain, in1k fine-tune at 384) and close in size: 86.1M against 88.6M
+parameters. One encoder is still shared by the ground and aerial views, as with
+ConvNeXt. The descriptor is the CLS token after the final norm, 768-d against 1024-d.
+
+HOW THE VIT TAKES THE GROUND VIEW. The tile is 384 x 384, the native 24 x 24 patch grid.
+The ground view is 140 x 768. singeo.model builds the ViT with dynamic_img_size, which
+resamples the pretrained 24 x 24 position embedding bicubically to each input grid
+on every forward, and dynamic_img_pad, which zero pads 140 to 144 rows (a 9 x 48 grid).
+Zero is the mean colour mask fill after Normalize, so the 4 extra rows look like the
+fov_pad blank. LR, schedule, batch size, fp16 and the 80 epochs are unchanged from
+P32 (AdamW 1e-4, cosine, 1 warmup epoch), so a ViT tuned with its own LR could do better.
+
+WHY. Every finding on this branch was measured on ConvNeXt, and some rest on its
+convolutions: the tensor edge cost (zero padding of the 7 x 7 depthwise convs) and
+the 96 px reach of the last stage. A ViT has no conv padding and global attention from
+the first block, so this tests whether the P32 recipe carries over to a backbone
+without those properties.
+
+READING. Control roundP32 _20261028-234233 82.58 (FoV 360/180/90/70 =
+95.05/92.17/76.16/66.94). CONFOUND: P32 ran before the per-worker FoV RNG fix and
+this run after it; P36 (a2g 0.5, post fix) was within 0.6 of P32 on every column, so
+the fix alone costs little. A large gap is the backbone. Read all four columns.'
+    ;;
+roundP41)
+    echo "Round P41 - P39 with rnc_tau_rank1=1.0 (RINCE tau_1 1.0 > tau_2 0.5), nothing else changed [80 ep]"
+    echo "  control roundP39 _20261110-013000 81.73 (post RNG fix, same code path)"
+    launch roundP41-p39-tau1gt2 \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_EXCLUDE_TIES=true \
+        SINGEO_RNC_TAU_RANK1=1.0 \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P41. roundP39 with rnc_tau_rank1 1.0 and nothing else changed; rnc_tau stays
+0.5 and now acts as tau_2. RINCE per-rank temperatures with tau_1 > tau_2: the term of
+each row closest reference (the full view, and both members of a tie) runs at 1.0, the
+partial view term at 0.5. Rank 1 now asks softly for full view above partial view and
+negative; rank 2 asks, as before, for partial view above the hardest negative. With
+ties excluded a tied row has no rank 2 term, so both members run at tau_1.
+
+WHY. P39 made the loss RINCE, and RINCE sets a temperature per rank. The a2g force
+probe on P32 found that in a tile-anchored row tau_1 > tau_2 turns the net force on
+the test crop-tile pair into a pull for every tile (1.0 over 0.5: net +0.46, no tile
+pushed, about 4 percent of the InfoNCE pull on that pair), while the RINCE default
+tau_1 < tau_2 pushes it down for 98 percent of tiles. 1.0 sits on the old rnc_tau
+plateau (0.5 and 1.0 tied). Risks: in crop-anchored rows the wedge is held less firmly
+behind the full tile, nearer the hard-positive treatment that cost 1.81 (P3 to P9),
+and the RnC pull on the panorama-tile pair weakens.
+
+READING. Control roundP39 _20261110-013000 81.73 (FoV 360/180/90/70 =
+94.70/91.34/74.92/65.96, FoV 0 96.67), same code path, both post RNG fix: a clean one
+variable pair (unseeded, so run to run spread applies). Expect a small effect; read
+FoV 90 and 70. P32 (ties kept, 82.58) remains the best and this run does not test ties.'
+    ;;
+roundP42)
+    echo "Round P42 - RINCE alone, no InfoNCE: 4 cross-domain rows, all in-batch negatives, tau_1 0.15 > tau_2 0.1 [80 ep]"
+    echo "  controls roundP32 82.58 (InfoNCE + RINCE-uni, one negative; pre RNG fix), roundP36 82.20 (post fix), roundP28 79.69 (InfoNCE only)"
+    launch roundP42-rince-only \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_INFONCE_WEIGHT=0.0 \
+        SINGEO_RNC_WEIGHT=1.0 \
+        SINGEO_RNC_LOSS_FORM=rince SINGEO_RINCE_VARIANT=out \
+        SINGEO_RNC_TAU=0.1 SINGEO_RNC_TAU_RANK1=0.15 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_RNC_HARDEST_NEGATIVE=false \
+        SINGEO_NEGATIVE_TIERING=none \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P42. RINCE as the only loss: infonce_weight 0, rnc_loss_form rince
+(singeo.loss.RINCE, Hoffmann et al. 2022). Four cross-domain rows, groups g2a and a2g:
+q1 and q2 anchors rank r1 above r2 above every other location in the batch, r1 and r2
+anchors rank q1 above q2 above every other location. Positives are ranked by circle
+overlap, the 30 in-batch negatives (other locations, full and masked views) sit
+unranked in every denominator with no term of their own, mean over anchors (MaskGeo
+Eq. 11). Ties (a crop inside the sector, FoV 360 against the tile) are RINCE-out: each
+tied positive gets its own term against the negatives, they never compete.
+Temperatures tau_1 0.15 for the rank 1 term (full view above masked view and
+negatives), tau_2 0.1 for the rank 2 term (masked view above negatives): the full view
+is held only softly above the masked one while the masked view is contrasted hard
+against negatives. The InfoNCE terms are still computed (gate settings as P32) but
+weighted 0, so the logit scale gets no gradient.
+
+WHY. InfoNCE is the one-rank case of RINCE: the eight directional cross-domain InfoNCE
+terms (loss1, loss4, loss5, loss6, both ways) are exactly the rank terms of these four
+rows, so one RINCE loss can replace InfoNCE plus the auxiliary ranking term. The old
+RnC-only runs (round5b 10.28, round7b 13.95) were all-pairs RnC whose 30 negatives per
+row each carried a term ranking negatives among themselves; RINCE has none. On P32
+features with 30 negatives, tau_1 0.15 / tau_2 0.1 pulls the test crop to its tile in
+every tile-anchored row (net +5.1, no tile pushed) and leaves the crop-anchored pull on
+s(q2, r1) at 4.10 against 3.56 at 0.1.
+
+READING. Not one variable: the recipe test is whether RINCE alone matches InfoNCE plus
+RINCE. Controls P32 _20261028-234233 82.58 (pre RNG fix) and P36 82.20 (post fix);
+P28 79.69 is InfoNCE alone. Lost against P32: the same-domain InfoNCE terms q1-q2 and
+r1-r2, the overlap gate, label smoothing and the learned logit scale. Risks: a semi
+positive with zero overlap late in training (a crop outside a 180 deg wedge) is now a
+hard positive against all negatives, the signal the gate exists to soften; and tau is
+fixed rather than learned. Read the first epochs for collapse (round5b failed early).'
+    ;;
+roundP43)
+    echo "Round P43 - P42 with the same-domain RINCE groups g2g and a2a at 0.5: RINCE alone, no InfoNCE [80 ep]"
+    echo "  controls roundP32 82.58 (InfoNCE + RINCE-uni, one negative; pre RNG fix), roundP36 82.20 (post fix), roundP28 79.69 (InfoNCE only)"
+    launch roundP43-rince-only-samedomain \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_INFONCE_WEIGHT=0.0 \
+        SINGEO_RNC_WEIGHT=1.0 \
+        SINGEO_RNC_LOSS_FORM=rince SINGEO_RINCE_VARIANT=out \
+        SINGEO_RNC_TAU=0.1 SINGEO_RNC_TAU_RANK1=0.15 \
+        SINGEO_RNC_POSITIVES_ONLY=false SINGEO_RNC_HARDEST_NEGATIVE=false \
+        SINGEO_NEGATIVE_TIERING=none \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.5, 1.0, 0.5)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P43. roundP42 with the same-domain RINCE groups switched on at weight 0.5:
+group weights (g2a, g2g, a2g, a2a) = (1, 0.5, 1, 0.5). P42 was stopped by hand during e5
+for this. RINCE is still the only loss (infonce_weight 0, rnc_loss_form rince, RINCE-out
+ties, all in-batch negatives, tau_1 0.15 / tau_2 0.1). Cross-domain rows as P42: q1 and
+q2 anchors rank r1 above r2 above the 30 aerial negatives, r1 and r2 anchors rank q1
+above q2 above the 30 ground negatives. New same-domain rows: with the self pair dropped
+each anchor has one positive, its own other view (q1 with q2, q2 with q1, r1 with r2, r2
+with r1), against the 30 other views of the same domain. With one positive there is
+nothing to rank, so g2g and a2a are plain InfoNCE terms at tau_1 0.15 (the single
+positive is rank 1).
+
+WHY. P42 dropped the same-domain InfoNCE terms q1-q2 and r1-r2 along with InfoNCE, and
+with them the SinGeo rotated-tile supervision (r1 against its rotated wedge). These two
+groups restore them inside RINCE. 0.5 matches the SinGeo hand-set weight of loss2 and
+loss3 against 1.0 for q1-r1.
+
+READING. Control roundP42 _20261112-113416 at its only eval, e4: FoV 360/270/180/90/70 =
+47.83/35.40/19.63/6.84/4.54, FoV 0 48.91 (P32 at e4: 60.37/49.28/30.97/10.87/6.96). Compare
+at matching epochs. Final targets P32 82.58 (pre RNG fix), P36 82.20 (post fix), P28
+79.69 (InfoNCE alone). Watch FoV 360 for the cost seen when same-domain RnC groups were on
+(P23 to P32: aligned panorama +1.25 with them off), though those used one negative, not 30.'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"
