@@ -37,6 +37,17 @@ def evaluate(config,
     return r1
 
 
+def extra_fovs_due(epoch, every, last_epoch):
+    """Whether the eval at `epoch` also scores the extra FoVs (`eval_fov_extra`).
+
+    `every` None scores them at every eval. Otherwise they run at epochs divisible
+    by `every` and at `last_epoch`, so the final eval always carries every column.
+    """
+    if every is None:
+        return True
+    return epoch % every == 0 or epoch == last_epoch
+
+
 def evaluate_fovs(config,
                   model,
                   reference_dataloader,

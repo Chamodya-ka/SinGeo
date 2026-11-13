@@ -141,6 +141,14 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
   an override). Always name the timestamp. P13/P14 use the continuous one as control.
   On CVUSA continuous beats quarter by **+0.67**; on CVACT the same change is worth
   **−0.06**, i.e. nothing (C1 52.50 vs C3 52.44, both final).
+- **Two `roundP41` recipes exist, on different machines.** Plain "roundP41" means
+  **server B's** `roundP41-p39-tau1gt2_20261111-165807` (P39 + `rnc_tau_rank1=1.0`,
+  **82.55**). Server C (A40, hpc-clint01) has its own `roundP41 _20261109-103729`
+  (P32 with the gate off and the SinGeo tuple, **83.31**): call it **A40 P41**. Its
+  no-RnC twin **A40 P42** (82.66) likewise is not server B's roundP42 (RINCE alone).
+  `roundP41-p39-tau1gt2-cvgl01_20261114-025037` is a replicate of server B's P41 on
+  hpc-cvgl01 (A40-48Q), not a third recipe. Name the server and timestamp for any
+  run that did not come from server B.
 - **Two evaluation protocols.** `fov_pad=True` and the unpadded/bordered paths feed
   different tensors; **never mix them in one column**. round4a scores 82.01 padded and
   64.78 unpadded — the same weights.
@@ -174,6 +182,10 @@ total   = infonce_weight · InfoNCE + rnc_weight · (g2a + g2g + a2g + a2a)
   `RnC(exclude_ties)` over all pairs equals RINCE-out ÷ 2B (tests/test_rince.py). With
   `infonce_weight=0` it is the whole loss: roundP42 (cross-domain only, stopped e5) and
   roundP43 (+ same-domain groups at 0.5).
+- `eval_extra_every_n_epoch` (2026-11-14, **VIGOR trainer only**, default `None`) scores
+  `eval_fov_extra` only at multiples of it and at the last epoch; FoV 90 and the train-set
+  similarity pass still run every eval, so training is unchanged. Eval was ~9 h of a ~32 h
+  VIGOR run. Use 12 workers on VIGOR: 14 and 16 load slower (`EXPERIMENTS.md`, timing probe).
 - Circular conv padding fails below ~64 input columns (about FoV 30).
 - **ViT backbones** (`SINGEO_MODEL=vit_*`, roundP40) go through the same shared `TimmModel_SinGeo`, built with timm `dynamic_img_size` + `dynamic_img_pad` so the 140×768 ground view fits (140 is padded to 144). Conv-only tools (`conv_padding_mode`, `aerial_mask_mode`) do not apply to them.
 - Input collages are captured **before** collation, so a `fov_pad_batch_max` run's collage

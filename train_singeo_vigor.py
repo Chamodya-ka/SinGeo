@@ -42,7 +42,7 @@ from singeo.loss import InfoNCE, RankNContrast
 from singeo.distances import GeoNeighbourRanks, RnCDistanceBuilder
 from singeo.model import PADDING_MODES, TimmModel_SinGeo, set_conv_padding_mode
 from singeo.visualize import RnCSampleVisualizer
-from singeo.evaluate.vigor import evaluate_fovs, calc_sim
+from singeo.evaluate.vigor import evaluate_fovs, calc_sim, extra_fovs_due
 from singeo.transforms import get_dynamic_rotation_angle
 
 
@@ -564,6 +564,14 @@ class Configuration:
     # range the curriculum now trains on rather than at one point on it.
     # Set to () to report only `fov`.
     eval_fov_extra: tuple = (360.0, 270, 180.0, 70.0)
+    # Score the eval_fov_extra FoVs only at epochs divisible by this and at the
+    # last epoch; None scores them at every eval. Speed only: `fov` (the
+    # checkpoint metric) and the train-set similarity pass still run every
+    # eval_every_n_epoch, so training and checkpoint choice are unchanged. Must be
+    # a multiple of eval_every_n_epoch. Each extra loader skipped draws one fewer
+    # DataLoader base seed from the global torch RNG, so a fixed-seed run is not
+    # bit-identical to one scoring every eval (seed=None runs are unaffected).
+    eval_extra_every_n_epoch: Optional[int] = None
     random_fov: bool=False
 
     # Keep every ground view at the panorama's full width, filling the azimuths
@@ -837,6 +845,13 @@ def apply_env_overrides(cfg):
     return applied
 
 
+def describe_extra_schedule(cfg):
+    """Suffix for the eval FoV line: when the extra FoVs are scored."""
+    if cfg.eval_extra_every_n_epoch is None or not cfg.eval_fov_extra:
+        return ""
+    return ", extras every {} epochs and at e{}".format(cfg.eval_extra_every_n_epoch, cfg.epochs)
+
+
 def write_run_info(path, cfg, run_name, note, overrides):
     """Write `info.txt` describing what this run is and what it tests.
 
@@ -1060,8 +1075,9 @@ def write_run_info(path, cfg, run_name, note, overrides):
                  "label_smoothing", "prob_rotate", "prob_flip",
                  "crop_dropout_strength", "grad_checkpointing", "seed"):
         lines.append("  {:24s} {}".format(name, getattr(cfg, name)))
-    lines.append("  {:24s} {} (checkpoint metric) + extra {}".format(
-        "eval fov", cfg.fov, tuple(cfg.eval_fov_extra) or "none"))
+    lines.append("  {:24s} {} (checkpoint metric) + extra {}{}".format(
+        "eval fov", cfg.fov, tuple(cfg.eval_fov_extra) or "none",
+        describe_extra_schedule(cfg)))
     lines.append("")
 
     lines.append("ENVIRONMENT OVERRIDES")
@@ -1631,8 +1647,14 @@ if __name__ == '__main__':
             "fov_sampling='loguniform' needs use_rnc=True (the per-sample draw lives in "
             "VigorDatasetTrainSinGeo, which only crops when return_meta is on). "
             "Set fov_sampling='deterministic' for a no-RNC run.")
-    print("Eval FoV: {} (checkpoint metric) + extra {}".format(
-        config.fov, tuple(config.eval_fov_extra) or "none"))
+    every_extra = config.eval_extra_every_n_epoch
+    if every_extra is not None and (isinstance(every_extra, bool) or not isinstance(every_extra, int)
+                                    or every_extra <= 0 or every_extra % config.eval_every_n_epoch):
+        raise ValueError(
+            "eval_extra_every_n_epoch={!r} must be a positive multiple of eval_every_n_epoch={}, "
+            "or None to score the extra FoVs at every eval".format(every_extra, config.eval_every_n_epoch))
+    print("Eval FoV: {} (checkpoint metric) + extra {}{}".format(
+        config.fov, tuple(config.eval_fov_extra) or "none", describe_extra_schedule(config)))
 
     if config.mixed_precision:
         scaler = GradScaler(init_scale=2.**10)
@@ -1989,7 +2011,11 @@ if __name__ == '__main__':
             # One gallery encode for every FoV. The checkpoint FoV is scored
             # first; each extra prints its 'Extra eval with FoV' line as on CVUSA.
             loaders = {"main": query_dataloader_test}
-            loaders.update(query_dataloaders_extra)
+            if extra_fovs_due(epoch, config.eval_extra_every_n_epoch, config.epochs):
+                loaders.update(query_dataloaders_extra)
+            elif query_dataloaders_extra:
+                print("Extra FoVs {} not scored this eval (eval_extra_every_n_epoch={})".format(
+                    tuple(query_dataloaders_extra), config.eval_extra_every_n_epoch))
             scores = evaluate_fovs(config=config,
                                    model=model,
                                    reference_dataloader=reference_dataloader_test,

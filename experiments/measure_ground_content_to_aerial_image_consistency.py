@@ -33,6 +33,12 @@ One or a few locations, each with a figure (`--heading 90` to choose the bearing
 A run folder stands for its weights_end.pth. Per checkpoint it writes, into
 experiments/figures/<run>_<weights>_sector_heat/, a summary .txt, a per-crop .csv
 and `--examples` example figures (one row per FoV).
+
+`--pad PX` replaces each run's own protocol with a fixed PX-column blank border on
+each side of the crop (0 = bare crop), so several checkpoints are scored on the same
+input layout. The blank keeps the run's mask_fill. The ground-on-scene share then
+counts heat on that border. The file tag gains `_pad<PX>`, and the summary names
+both the layout fed and the run's own protocol.
 """
 
 import argparse
@@ -83,7 +89,44 @@ def parse_args(argv):
                    help="gallery descriptors, shared with the LowFoVGradCAM probes")
     p.add_argument("--out-dir", default=None,
                    help="default experiments/figures/<run>_<weights>_sector_heat/")
-    return p.parse_args(argv)
+    p.add_argument("--pad", type=int, default=None, metavar="PX",
+                   help="feed every checkpoint the crop with PX blank columns on each side "
+                        "(0 = bare crop) instead of the protocol its run evaluates with")
+    args = p.parse_args(argv)
+    if args.pad is not None and args.pad < 0:
+        p.error("--pad must be >= 0")
+    return args
+
+
+# --------------------------------------------------------------------------- #
+# Ground protocol                                                             #
+# --------------------------------------------------------------------------- #
+
+def protocol_name(run):
+    """The ground input layout this run is fed, in words."""
+    if run.protocol == "border":
+        return "{} px border".format(run.cfg["fov_border_px"])
+    return {"pad": "full-width padding", "unpadded": "bare crop"}.get(run.protocol, run.protocol)
+
+
+def force_pad(run, px):
+    """Feed this run's crops with a fixed `px` column border on each side (0 = bare crop).
+
+    Goes through the border protocol, so `pc.ground_views` and `scene_offset` build the
+    tensor and the scene columns from it. Call it after the gallery is loaded: the
+    gallery is the tiles, which the ground protocol never touches.
+    """
+    run.native_protocol = protocol_name(run)
+    run.cfg = dict(run.cfg, fov_pad=False, fov_border_px=int(px))
+    run.protocol = "border" if px > 0 else "unpadded"
+
+
+def fed_description(run):
+    """What the run's crops are fed, plus its own protocol when --pad replaced it."""
+    native = getattr(run, "native_protocol", None)
+    if native is None:
+        return protocol_name(run)
+    return "{} via --pad, evaluates {}".format(protocol_name(run), native)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +246,7 @@ def write_summary(path, run, args, df):
     lines = [
         "Aerial Grad-CAM heat inside the ground crop's visible sector",
         pc.describe(run),
+        "ground input: {}".format(fed_description(run)),
         "locations {} (seed {}), {} stage {}, whole north-up tile, sector from its centre".format(
             df["index"].nunique(), args.seed, pc.CAM_NAMES[args.cam], args.layer),
         "",
@@ -271,9 +315,9 @@ def plot_example(path, ex, run, args):
             v["share"], v["area"], v["rank"]), fontsize=8.5, color=pc.INK_2)
         pc.bare(ax)
 
-    fig.suptitle("{}  {} · location {:07d} · {} stage {}".format(
-        run.run_name, run.weights_name, ex["query_id"], pc.CAM_NAMES[args.cam], args.layer),
-        fontsize=10, color=pc.INK)
+    fig.suptitle("{}  {} · location {:07d} · {} stage {} · {}".format(
+        run.run_name, run.weights_name, ex["query_id"], pc.CAM_NAMES[args.cam], args.layer,
+        fed_description(run)), fontsize=10, color=pc.INK)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -297,22 +341,29 @@ def main(argv=None):
             print("note: {} data; the sector still radiates from the tile centre".format(
                 run.spec["name"]))
         gallery, labels = pc.load_gallery(run, args.cache_dir, 64, args.workers)
+        if args.pad is not None:
+            force_pad(run, args.pad)
+            print("--pad {}: fed {} instead of {}".format(
+                args.pad, protocol_name(run), run.native_protocol))
         df, examples = evaluate(run, args, gallery, labels)
 
         out_dir = args.out_dir or os.path.join(HERE, "figures", "{}_{}_sector_heat".format(
             run.run_name, run.weights_name))
         os.makedirs(out_dir, exist_ok=True)
+        pad_tag = "" if args.pad is None else "_pad{}".format(args.pad)
         if args.index:
             # A handful of locations: list every crop instead of population statistics.
-            tag = "idx{}_{}_{}_L{}".format("-".join(str(i) for i in args.index),
-                                           "h{:g}".format(args.heading) if args.heading is not None
-                                           else "seed{}".format(args.seed), args.cam, args.layer)
+            tag = "idx{}_{}_{}_L{}{}".format("-".join(str(i) for i in args.index),
+                                             "h{:g}".format(args.heading) if args.heading is not None
+                                             else "seed{}".format(args.seed), args.cam, args.layer,
+                                             pad_tag)
             df.to_csv(os.path.join(out_dir, "per_crop_{}.csv".format(tag)), index=False)
             print(df[["index", "query_id", "fov", "heading", "aerial_sector_share",
                       "sector_area_share", "rank", "ground_scene_share"]].to_string(
                 index=False, float_format=lambda x: "{:.3f}".format(x)))
         else:
-            tag = "n{}_seed{}_{}_L{}".format(df["index"].nunique(), args.seed, args.cam, args.layer)
+            tag = "n{}_seed{}_{}_L{}{}".format(df["index"].nunique(), args.seed, args.cam,
+                                               args.layer, pad_tag)
             df.to_csv(os.path.join(out_dir, "per_crop_{}.csv".format(tag)), index=False)
             print(write_summary(os.path.join(out_dir, "summary_{}.txt".format(tag)), run, args, df))
         for ex in examples:
@@ -324,7 +375,8 @@ def main(argv=None):
         del run
         torch.cuda.empty_cache()
 
-    print("mean aerial heat share inside the sector")
+    print("mean aerial heat share inside the sector" + (
+        "" if args.pad is None else ", every run fed a {} px border (--pad)".format(args.pad)))
     print("  {:<46} ".format("checkpoint") + "  ".join("{:>6g}".format(f) for f in args.fovs))
     for name, means in table:
         print("  {:<46} ".format(name[:46]) + "  ".join("{:6.3f}".format(means[f]) for f in args.fovs))

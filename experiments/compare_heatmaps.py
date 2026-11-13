@@ -18,7 +18,13 @@ share on the scene columns and the crop's gallery rank.
     PY=/home/71/25021871/data/chamodya/venv/bin/python
     $PY experiments/compare_heatmaps.py <singeo_ckpt> <p32_ckpt> --labels SinGeo P32 --num 4
 
-One figure per location in experiments/figures/compare_<labels>_seed<S>/ (or --out-dir).
+`--pad PX` overrides every run's own protocol: each checkpoint gets the crop with PX
+blank columns on each side (the border protocol at PX; 0 = bare crop), so all of them
+see the same layout. The blank uses each run's own mask_fill, so the inputs are one
+tensor only when the runs share it. The suptitle still names each run's own protocol.
+
+One figure per location in experiments/figures/compare_<labels>_seed<S>/ (or --out-dir),
+with a _pad<PX> suffix under --pad.
 Its first column is the ground input as fed, without a map (once per row when every
 checkpoint got the same tensor, otherwise once per checkpoint). Beside each figure, a
 folder of the same name holds every sub-image as its own PNG at the tensor's
@@ -44,7 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "LowFoVGradCAM"))
 import probe_common as pc  # noqa: E402
 from consistency_eval import batch_cam, descriptors, pick_locations, trunk  # noqa: E402
 from measure_ground_content_to_aerial_image_consistency import (  # noqa: E402
-    column_share, crop_views, sector_share)
+    column_share, crop_views, fed_description, force_pad, protocol_name, sector_share)
 
 
 def parse_args(argv):
@@ -71,7 +77,13 @@ def parse_args(argv):
                         "over light gray); 1 = no fade, 0 = blank")
     p.add_argument("--no-panels", action="store_true",
                    help="skip the per-image PNGs, write the composite figures only")
-    return p.parse_args(argv)
+    p.add_argument("--pad", type=int, default=None, metavar="PX",
+                   help="feed every checkpoint the crop with PX blank columns on each side "
+                        "(0 = bare crop) instead of the protocol its run evaluates with")
+    args = p.parse_args(argv)
+    if args.pad is not None and args.pad < 0:
+        p.error("--pad must be >= 0")
+    return args
 
 
 def explain(run, gallery, gt_pos, ref_of, index, heading, args):
@@ -107,10 +119,9 @@ def shared_input(results, fovs):
                for r in results[1:] for f in fovs)
 
 
-def protocol_name(run):
-    if run.protocol == "border":
-        return "{} px border".format(run.cfg["fov_border_px"])
-    return {"pad": "full-width padding", "unpadded": "bare crop"}.get(run.protocol, run.protocol)
+def run_title(label, run):
+    """Suptitle entry: what the run was fed, and its own protocol when --pad replaced it."""
+    return "{} ({}, {})".format(label, fed_description(run), run.weights_name)
 
 
 def plot_location(path, results, labels, runs, heading, index, args):
@@ -171,8 +182,7 @@ def plot_location(path, results, labels, runs, heading, index, args):
             pc.bare(ax)
 
     fig.suptitle("{} stage {} · ".format(pc.CAM_NAMES[args.cam], args.layer) + "  vs  ".join(
-        "{} ({}, {})".format(label, protocol_name(run), run.weights_name)
-        for label, run in zip(labels, runs)), fontsize=10, color=pc.INK)
+        run_title(label, run) for label, run in zip(labels, runs)), fontsize=10, color=pc.INK)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -243,6 +253,10 @@ def main(argv=None):
         run = pc.load_run(checkpoint, args.device)
         print("{}: {}".format(labels[len(runs)], pc.describe(run)))
         galleries.append(pc.load_gallery(run, args.cache_dir, 64, args.workers))
+        if args.pad is not None:
+            force_pad(run, args.pad)
+            print("  --pad {}: fed {} instead of {}".format(
+                args.pad, protocol_name(run), run.native_protocol))
         runs.append(run)
     n_total = len(runs[0].queries)
     if any(len(r.queries) != n_total or r.spec["name"] != runs[0].spec["name"] for r in runs):
@@ -256,8 +270,8 @@ def main(argv=None):
             n_total, size=args.num, replace=False))
     ref_of = {int(label): i for i, label in enumerate(runs[0].references.label)}
 
-    out_dir = args.out_dir or os.path.join(HERE, "figures", "compare_{}_seed{}".format(
-        "_".join(labels), args.seed))
+    out_dir = args.out_dir or os.path.join(HERE, "figures", "compare_{}_seed{}{}".format(
+        "_".join(labels), args.seed, "" if args.pad is None else "_pad{}".format(args.pad)))
     os.makedirs(out_dir, exist_ok=True)
     print("\n  index  location  FoV   " + "   ".join(
         "{:>8} share / on crop / rank".format(label) for label in labels))
