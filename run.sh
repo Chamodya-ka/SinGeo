@@ -66,6 +66,9 @@
 #   roundP41  P39 with rnc_tau_rank1 1.0: RINCE per-rank temperatures, tau_1 1.0 > tau_2 0.5, one variable
 #   roundP42  RINCE alone (no InfoNCE): 4 cross-domain rows, all negatives, RINCE-out ties, tau_1 0.15 > tau_2 0.1
 #   roundP43  P42 with same-domain RINCE groups g2g, a2a at 0.5
+#   roundP44  P41 with the SinGeo InfoNCE term weights (1, .5, .5, .25, .25, .25) on top of the gate
+#   roundP45  P41 with the gate off and the SinGeo term weights: the original SinGeo InfoNCE
+#   roundP46  P45 with rnc_weight 0: the SinGeo InfoNCE alone on our masking and rotation
 #
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
@@ -2313,6 +2316,148 @@ READING. Control roundP42 _20261112-113416 at its only eval, e4: FoV 360/270/180
 at matching epochs. Final targets P32 82.58 (pre RNG fix), P36 82.20 (post fix), P28
 79.69 (InfoNCE alone). Watch FoV 360 for the cost seen when same-domain RnC groups were on
 (P23 to P32: aligned panorama +1.25 with them off), though those used one negative, not 30.'
+    ;;
+roundP44)
+    echo "Round P44 - P41 with the SinGeo InfoNCE term weights (1, .5, .5, .25, .25, .25) on top of the per-sample gate [80 ep]"
+    echo "  control roundP41 _20261111-165807 82.55 (flat weights, same code path)"
+    launch roundP44-p41-singeo-terms \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_EXCLUDE_TIES=true \
+        SINGEO_RNC_TAU_RANK1=1.0 \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=true \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.5, 0.25, 0.25, 0.25)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P44. roundP41 with infonce_term_weights set to the SinGeo hand-set tuple
+(1, 0.5, 0.5, 0.25, 0.25, 0.25) instead of flat (1, 1, 1, 1, 1, 1), nothing else changed.
+The per-sample circle gate stays on with gate-scaled terms: each row of each InfoNCE term
+is multiplied by its own overlap and divided by B, and the term is then multiplied by its
+SinGeo weight. Term i therefore counts at t_i times its mean gate, so the hand-set
+hierarchy and the view geometry apply together (the trainer warns about this at startup;
+intended here).
+
+WHY. Test whether the SinGeo between-term hierarchy is still needed on top of the
+geometric gate in the current best recipe. Earlier evidence: P10a to P10b (hierarchy
+dropped, gate on, weighted mean) -0.17; P12(cont) to P14 (gate replaces hierarchy,
+border) -0.98; P23 to P30 (cross terms halved on top of the gate, padded) -0.44.
+
+CONFOUND, by construction. The tuple sums to 2.75, not 6, so it also shrinks the total
+InfoNCE mass. From the per-term averages in the P41 log: with this tuple the gated
+InfoNCE is 46 pct of the flat one at e1 and 59 pct at e80, and loss1 (q1-r1) takes 42
+pct of it at e1 and 61 pct at e80, against 19 and 36 pct under flat weights. rnc_weight
+stays 0.25, so the weighted RnC to InfoNCE share should be about 2x the P41 one,
+roughly 0.09 at e1 and 0.25 at e80 against 0.043 and 0.148 (check the RNC share line).
+The nearest dose evidence is P33 (P32 at rnc_weight 0.4, 80.47, -2.11, mixed with the
+RNG fix). A clean split of hierarchy from RnC dose needs a twin at rnc_weight about 0.13.
+
+READING. Control roundP41 _20261111-165807 82.55 (FoV 360/270/180/90/70 =
+95.35/95.10/92.05/75.72/67.09, FoV 0 96.74), same code path, both post RNG fix,
+unseeded, so run to run spread applies (about 0.3 at FoV 360). Read all four columns and
+the RNC share and InfoNCE epoch averages lines in log.txt.'
+    ;;
+roundP45)
+    echo "Round P45 - P41 with the overlap gate OFF and the SinGeo InfoNCE term weights (1, .5, .5, .25, .25, .25) [80 ep]"
+    echo "  control roundP41 _20261111-165807 82.55 (gate on, gate-scaled, flat); sibling roundP44 (gate on + SinGeo weights)"
+    launch roundP45-p41-nogate-singeo-terms \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_EXCLUDE_TIES=true \
+        SINGEO_RNC_TAU_RANK1=1.0 \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATED_INFONCE=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=false \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.5, 0.25, 0.25, 0.25)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P45. roundP41 with the InfoNCE overlap gate switched off and the SinGeo hand-set
+term weights (1, 0.5, 0.5, 0.25, 0.25, 0.25): the original SinGeo InfoNCE, six plain
+unweighted terms combined by the fixed tuple, inside the P41 recipe. Three fields change,
+one decision: overlap_gated_infonce false, infonce_gate_scales_terms false (it refuses to
+run without the gate) and the tuple. overlap_gate_measure stays circle but is inert with
+the gate off; the RnC ranking does not read it, so RnC is unchanged (ties, tau_1 1.0,
+tau_2 0.5, positives plus hardest negative, groups (1, 0, 1, 0)).
+
+WHY. The gate scores a crop against a full view at FoV/360, so under gate-scaled terms a
+70 deg crop counts 0.19 of a 360 deg crop in q1-q2 and r1-q2, while the tuple weights
+every FoV alike. P12(cont) to P14 (tuple to gate-set flat weights) lost 0.98, all of it
+at FoV 90 (-1.78) and 70 (-1.85). This run asks whether the tuple without the gate beats
+the gate on the current best recipe.
+
+CONFOUNDS. (1) RnC share: the ungated tuple sums to 2.75 x the mean raw loss. From P41
+per-term losses this is about 46 pct of P41 InfoNCE at e1 and about the same at e80, so
+the RnC share starts about 2x P41 (0.043) and converges to it (0.148) late. (2) loss6:
+without the gate a crop and a wedge with no shared azimuth are a hard positive at 0.25
+(SinGeo does the same; round1a gate on 76.29 vs round1b gate off 75.91 on server A).
+
+READING. Control roundP41 _20261111-165807 82.55 (FoV 360/270/180/90/70 =
+95.35/95.10/92.05/75.72/67.09, FoV 0 96.74). Sibling roundP44 (gate on plus the tuple):
+P41 to P44 is the tuple on top of the gate, P44 to P45 is the gate given the tuple. With
+the gate off, the InfoNCE epoch averages line in log.txt is the raw per-term loss.'
+    ;;
+roundP46)
+    echo "Round P46 - P45 with rnc_weight 0: the SinGeo InfoNCE alone (tuple, no gate, no RnC) on our masking [80 ep]"
+    echo "  controls roundP45 _20261113-082909 (same + RnC 0.25), roundP28 79.69 (gate on, flat, no RnC; pre RNG fix)"
+    launch roundP46-p45-nornc \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.0 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_RNC_EXCLUDE_TIES=true \
+        SINGEO_RNC_TAU_RANK1=1.0 \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATED_INFONCE=false \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=false \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.5, 0.25, 0.25, 0.25)' \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P46. roundP45 with rnc_weight 0 and nothing else changed: the SinGeo objective
+alone, six plain InfoNCE terms combined by the hand-set tuple (1, 0.5, 0.5, 0.25, 0.25,
+0.25), no overlap gate, no RnC, applied to our masking and rotation: padded per-sample
+Gaussian FoV crops (mean 360 to 90 over the first 30 pct, std 40, clipped at 70), the
+aerial wedge (sector 360 to 180 with heading drift up to 180 deg) and continuous tile
+rotation. RnC is disabled by weight, not by use_rnc, so the wedge and the recorded arcs
+stay; the RnC fields (tau, tau_1, ties, groups) are kept but inert at weight 0.
+
+WHY. Shows how the SinGeo loss handles both masks and the rotation on its own. The wedge
+reaches the loss only as a hard positive, in r1-r2 (0.5), r2-q1 (0.25) and r2-q2 (0.25),
+including crop and wedge pairs that share no azimuth.
+
+READING. P45 to P46 is what RnC adds under the SinGeo InfoNCE. roundP28 _20261026-114557
+79.69 (FoV 360/180/90/70 = 92.40/90.93/72.91/62.51) is the gate-on, flat-weight version of
+this run: P41 differs from P23 only in RnC fields, which are inert at weight 0, but P28
+ran before the per-worker FoV RNG fix. Border-protocol reference: P9 (tuple, wedge, no
+RnC) 78.80 against P3 (no wedge) 80.61, the wedge as a hard positive cost 1.81. With the
+gate and RnC off, the InfoNCE epoch averages line in log.txt is the raw per-term loss.'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"
