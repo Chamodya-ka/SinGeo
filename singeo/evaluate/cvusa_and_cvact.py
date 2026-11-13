@@ -221,128 +221,78 @@ def calc_sim_vit(config,
 
 
 def calculate_scores(query_features, reference_features, query_labels, reference_labels, step_size=1000, ranks=[1,5,10]):
+    """R@k by counting, per query, the references that score strictly above its
+    positive. Works one chunk of `step_size` queries at a time on the features'
+    device and never builds the full Q x R matrix: on the CVUSA train split that
+    matrix is 35,532^2 fp32 = 5 GB of host RAM, ~10 GB while it was concatenated,
+    which the OOM killer stopped on a 15 GB host (roundP38, 2026-11-08). Results
+    are identical to the row-by-row loop it replaces (same products, same `>`)."""
 
     topk = copy.deepcopy(ranks)
     Q = len(query_features)
     R = len(reference_features)
-    
-    steps = Q // step_size + 1
-    
-    
-    query_labels_np = query_labels.cpu().numpy()
-    reference_labels_np = reference_labels.cpu().numpy()
-    
+
+    # Column of each query's positive; a dict, as before, so a duplicated
+    # reference label resolves to its last occurrence exactly as it used to.
     ref2index = dict()
-    for i, idx in enumerate(reference_labels_np):
+    for i, idx in enumerate(reference_labels.cpu().numpy()):
         ref2index[idx] = i
-    
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
-    
+    gt_index = torch.tensor([ref2index[l] for l in query_labels.cpu().numpy()],
+                            dtype=torch.long, device=query_features.device)
+
+    rankings = []
+    for start in range(0, Q, step_size):
+        sim = query_features[start:start + step_size] @ reference_features.T
+        gt_sim = sim.gather(1, gt_index[start:start + step_size, None])
+        # number of references with a higher similarity than the gt
+        rankings.append((sim > gt_sim).sum(1))
+        del sim
+    ranking = torch.cat(rankings).cpu().numpy()
 
     topk.append(R//100)
-    
-    results = np.zeros([len(topk)])
-    
-    
-    bar = tqdm(range(Q))
-    
-    for i in bar:
-        
-        # similiarity value of gt reference
-        gt_sim = similarity[i, ref2index[query_labels_np[i]]]
-        
-        # number of references with higher similiarity as gt
-        higher_sim = similarity[i,:] > gt_sim
-        
-        
-        ranking = higher_sim.sum()
-        for j, k in enumerate(topk):
-            if ranking < k:
-                results[j] += 1.
-                        
-        
+
+    results = np.array([(ranking < k).sum() for k in topk], dtype=np.float64)
     results = results/ Q * 100.
- 
-    
-    bar.close()
-    
-    # wait to close pbar
-    time.sleep(0.1)
-    
+
     string = []
     for i in range(len(topk)-1):
-        
+
         string.append('Recall@{}: {:.4f}'.format(topk[i], results[i]))
-        
-    string.append('Recall@top1: {:.4f}'.format(results[-1]))            
-        
-    print(' - '.join(string)) 
+
+    string.append('Recall@top1: {:.4f}'.format(results[-1]))
+
+    print(' - '.join(string))
 
     return results[0]
-    
+
 
 def calculate_nearest(query_features, reference_features, query_labels, reference_labels, neighbour_range=64, step_size=1000):
+    """Top `neighbour_range` references per query, its own positive dropped.
+    Chunked like calculate_scores, so only `step_size` rows of similarities exist
+    at once. The top-k of a row does not depend on other rows, so the lists match
+    the full-matrix version; only the order among exactly tied scores could
+    differ, as top-k now runs on the GPU instead of the CPU."""
 
-
-    Q = len(query_features)
-    
-    steps = Q // step_size + 1
-    
-    similarity = []
-    
-    for i in range(steps):
-        
-        start = step_size * i
-        
-        end = start + step_size
-          
-        sim_tmp = query_features[start:end] @ reference_features.T
-        
-        similarity.append(sim_tmp.cpu())
-     
-    # matrix Q x R
-    similarity = torch.cat(similarity, dim=0)
-
-    topk_scores, topk_ids = torch.topk(similarity, k=neighbour_range+1, dim=1)
-
-    topk_references = []
-    
-    for i in range(len(topk_ids)):
-        topk_references.append(reference_labels[topk_ids[i,:]])
-    
-    topk_references = torch.stack(topk_references, dim=0)
-
-     
-    # mask for ids without gt hits
-    mask = topk_references != query_labels.unsqueeze(1)
-    
-    
-    topk_references = topk_references.cpu().numpy()
-    mask = mask.cpu().numpy()
-    
-
-    # dict that only stores ids where similiarity higher than the lowes gt hit score
     nearest_dict = dict()
-    
-    for i in range(len(topk_references)):
-        
-        nearest = topk_references[i][mask[i]][:neighbour_range]
-    
-        nearest_dict[query_labels[i].item()] = list(nearest)
-    
+
+    for start in range(0, len(query_features), step_size):
+
+        sim = query_features[start:start + step_size] @ reference_features.T
+        _, topk_ids = torch.topk(sim, k=neighbour_range+1, dim=1)
+        del sim
+
+        topk_references = reference_labels[topk_ids.to(reference_labels.device)]
+        labels = query_labels[start:start + step_size]
+
+        # mask for ids without gt hits
+        mask = topk_references != labels.unsqueeze(1).to(topk_references.device)
+
+        topk_references = topk_references.cpu().numpy()
+        mask = mask.cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        # dict that only stores ids where similiarity higher than the lowes gt hit score
+        for i in range(len(topk_references)):
+            nearest_dict[labels[i].item()] = list(topk_references[i][mask[i]][:neighbour_range])
 
     return nearest_dict

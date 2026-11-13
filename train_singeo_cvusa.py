@@ -55,11 +55,8 @@ class Configuration:
     sim_sample: bool = True        # use similarity sampling
     neighbour_select: int = 64     # max selection size from pool
     neighbour_range: int = 128     # pool size for selection
-    # Pre-computed GPS neighbours (calc_distance_cvusa.py). Kept inside the repo at
-    # data/CVUSA/CVPR_subset/, resolved against this file so the run does not depend
-    # on the working directory it was launched from.
-    gps_dict_path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      "data", "CVUSA", "CVPR_subset", "gps_dict.pkl")
+    # Pre-computed GPS neighbours (calc_distance_cvusa.py), written beside the data.
+    gps_dict_path: str = "/home/c/cpehesar/CVPR_subset/gps_dict.pkl"
     
     
     # Eval
@@ -287,7 +284,7 @@ class Configuration:
 
     # Embeddings CSV for negative_tiering="embed". Restricted to the ids in the
     # training split at load time.
-    sat_embedding_csv: str = "/home/71/25021871/data/chamodya/CVPR_subset/satellite_embeddings_2024.csv"
+    sat_embedding_csv: str = "/home/c/cpehesar/CVPR_subset/satellite_embeddings_2024.csv"
 
     # Where "geo" tiering gets its separations from:
     #   "coords" - haversine computed on demand from the raw (lat, lon) table
@@ -298,7 +295,7 @@ class Configuration:
     #              ties at 1.0 -- which, under similarity sampling, is ~99.7% of
     #              the pairs in a batch. Kept only for comparison.
     rnc_geo_source: str = "coords"    # "coords" | "ranks"
-    gps_coords_csv: str = "/home/71/25021871/data/chamodya/CVPR_subset/all.csv"
+    gps_coords_csv: str = "/home/c/cpehesar/CVPR_subset/all.csv"
 
     # Separation at which negatives reach the maximum distance label; pairs
     # beyond it tie at 1.0. RNC reads only the *ordering* within a row, so the
@@ -511,15 +508,14 @@ class Configuration:
     poly_power: float = 1.5
     
     # Dataset
-    data_folder = "/home/71/25021871/data/chamodya/CVPR_subset"
+    data_folder = "/home/c/cpehesar/CVPR_subset"
     
     # Augment Images
     prob_rotate: float = 0.75          # rotates the sat image and ground images simultaneously
     prob_flip: float = 0.5             # flipping the sat image and ground images simultaneously
     
-    # Savepath for model checkpoints. On /data (2 TB, ~1.6 TB free), not the
-    # 193 GB root filesystem -- `data/data` is a symlink to `/data`.
-    model_path: str = "/home/71/25021871/data/chamodya/Singeo_data"
+    # Savepath for model checkpoints.
+    model_path: str = "/home/c/cpehesar/Singeo_data"
     
     # Eval before training
     zero_shot: bool = False

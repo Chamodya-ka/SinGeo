@@ -66,21 +66,23 @@
 #   roundP41  P39 with rnc_tau_rank1 1.0: RINCE per-rank temperatures, tau_1 1.0 > tau_2 0.5, one variable
 #   roundP42  RINCE alone (no InfoNCE): 4 cross-domain rows, all negatives, RINCE-out ties, tau_1 0.15 > tau_2 0.1
 #   roundP43  P42 with same-domain RINCE groups g2g, a2a at 0.5
+#   roundP44  [A40 hpc-clint02] A40 P41 with the circle overlap gate on: SinGeo tuple + gate + RnC 0.25
+#             (A40 rounds P38-P42 are in `git stash@{0}`; their numbers clash with the server B rounds above)
 #
+# GPU=<id> ./run.sh <round> pins a run to one card, e.g. `GPU=1 ./run.sh roundP44`.
 # Config comes from SINGEO_* environment overrides read by train_singeo_cvusa.py;
 # the script snapshots itself and echoes every override into its own log, so a
 # run stays reconstructible from its output directory alone.
 
 set -euo pipefail
 
-REPO="/home/71/25021871/SinGeo"
-PY="/home/71/25021871/data/chamodya/venv/bin/python"
-OUT="/home/71/25021871/data/chamodya/Singeo_data"
-# Console logs live on /data, not in the repo: the repo sits on the root
-# filesystem, which is shared and runs near full. A failed tqdm write there
-# deadlocked roundP14 at epoch 44 on 2026-10-15. log.txt in the checkpoint
-# directory stays the authoritative record either way.
-LOGS="/home/71/25021871/data/chamodya/Singeo_data/run_logs"
+REPO="/home/c/cpehesar/SinGeo"
+PY="$REPO/venv/bin/python"
+OUT="/home/c/cpehesar/Singeo_data"
+# Console logs live beside the checkpoints, not in the repo. A failed tqdm write
+# on a full filesystem deadlocked roundP14 at epoch 44 on 2026-10-15. log.txt in
+# the checkpoint directory stays the authoritative record either way.
+LOGS="$OUT/run_logs"
 
 cd "$REPO"
 mkdir -p "$LOGS"
@@ -100,9 +102,12 @@ launch() {
 
     # `screen -L -Logfile` captures the console (tqdm bars included); the
     # training script keeps its own clean log.txt under the output directory.
+    # GPU=<id> pins the run to one card (this server has two 24 GB A40s, one
+    # run per card); unset, CUDA_VISIBLE_DEVICES is left as it is.
     screen -dmS "$name" -L -Logfile "$LOGS/${name}.console" \
-        env "$@" SINGEO_RUN_NAME="$name" "$PY" train_singeo_cvusa.py
-    echo "   started '$name'  ->  $LOGS/${name}.console"
+        env ${GPU:+CUDA_VISIBLE_DEVICES=$GPU} "$@" SINGEO_RUN_NAME="$name" \
+        "$PY" train_singeo_cvusa.py
+    echo "   started '$name'${GPU:+ on GPU $GPU}  ->  $LOGS/${name}.console"
 }
 
 
@@ -2313,6 +2318,63 @@ READING. Control roundP42 _20261112-113416 at its only eval, e4: FoV 360/270/180
 at matching epochs. Final targets P32 82.58 (pre RNG fix), P36 82.20 (post fix), P28
 79.69 (InfoNCE alone). Watch FoV 360 for the cost seen when same-domain RnC groups were on
 (P23 to P32: aligned panorama +1.25 with them off), though those used one negative, not 30.'
+    ;;
+roundP44)
+    echo "Round P44 [A40] - A40 P41 with the circle overlap gate on: SinGeo tuple + gate + RnC 0.25 [80 ep]"
+    echo "  control A40 roundP41 _20261109-103729 83.31 (no gate); A40 roundP42 _20261111-172755 82.66 (no gate, no RnC)"
+    launch roundP44-a40p41-gate \
+        SINGEO_SEED=None \
+        SINGEO_FOV_PAD=true SINGEO_FOV_BORDER_PX=0 \
+        SINGEO_FOV_SAMPLING=gaussian \
+        SINGEO_FOV_GAUSSIAN_STD=40.0 \
+        SINGEO_FOV_GAUSSIAN_RAMP_FRAC=0.3 \
+        SINGEO_FOV_CURRICULUM_END=90.0 \
+        SINGEO_FOV_GAUSSIAN_CLIP_LO=70.0 \
+        SINGEO_RNC_WEIGHT=0.25 SINGEO_RNC_TAU=0.5 \
+        SINGEO_RNC_POSITIVES_ONLY=true SINGEO_RNC_HARDEST_NEGATIVE=true \
+        SINGEO_RNC_GROUP_WEIGHTS='(1.0, 0.0, 1.0, 0.0)' \
+        SINGEO_AERIAL_ROTATION=continuous SINGEO_AERIAL_CIRCULAR_MASK=false \
+        SINGEO_OVERLAP_GATED_INFONCE=true \
+        SINGEO_OVERLAP_GATE_MEASURE=circle \
+        SINGEO_INFONCE_GATE_SCALES_TERMS=false \
+        SINGEO_INFONCE_TERM_WEIGHTS='(1.0, 0.5, 0.5, 0.25, 0.25, 0.25)' \
+        SINGEO_INFONCE_HOLD_LOSS1_SHARE=false \
+        SINGEO_DSS_FOV_FROM_MEASURED=true \
+        SINGEO_EVAL_FOV_EXTRA='(360.0, 270, 180.0, 70.0, 0.0)' \
+        SINGEO_NUM_WORKERS=4 \
+        SINGEO_RUN_NOTE='P44 (A40 server hpc-clint02). A40 roundP41 with the InfoNCE overlap gate switched
+back on, overlap_gated_infonce true, and nothing else changed: SinGeo hand-set term
+weights 1, 0.5, 0.5, 0.25, 0.25, 0.25, circle gate, RnC on g2a and a2g at 0.25. With the
+A40 runs this completes three corners of gate x RnC on the hand-set loss: A40 P42 (no
+gate, no RnC), A40 P41 (no gate, RnC), this run (gate, RnC). The A40 rounds P38 to P42
+are not the server B rounds of the same names.
+
+HOW THE GATE ACTS HERE. infonce_gate_scales_terms stays false, so each term is a
+gate-weighted MEAN: the tuple alone sets the between-term balance, as in P41, and the
+gate only reweights pairs inside a term. Under circle (inter over 360): loss1 q1-r1 is 1
+for every pair, unchanged. loss3 r1-r2 and loss5 r2-q1 are sector over 360 for every
+pair of a batch, so the weight cancels and they are unchanged. loss2 q1-q2 and loss4
+r1-q2 weight each pair by fov over 360, so under per-sample FoV wide crops count more
+than narrow ones. loss6 r2-q2 weights each pair by the azimuth crop and wedge share: a
+pair sharing none stops being a positive and stays a negative in the other rows. The
+held loss1 share stays off; it needs gate-scaled terms.
+
+WHY. A40 P42 to P41 puts RnC at +0.65 on the ungated hand-set loss; every earlier RnC
+gain was measured with a gate on. This asks what the gate adds once the hierarchy is
+hand set and RnC ranks the wedge. Unlike A40 roundP40 (gate-scaled terms plus held
+share, stopped at e26) the InfoNCE mass stays at the P41 level, so the gate does not
+move the RnC share against InfoNCE.
+
+RISK. loss4 r1-q2 is the evaluation pair, and circle weights its narrow crops down: a
+FoV 70 crop counts 70/130 = 0.54 of a FoV 130 crop in the same batch. The containment
+gate leaves loss4 alone and gates loss6 only; that is the follow up if FoV 90 and 70 drop.
+
+READING. Control A40 roundP41 _20261109-103729 83.31 (FoV 360/180/90/70 =
+94.72/92.38/77.31/68.83; FoV 0 97.28), one variable, same server and stack. A40 roundP42
+_20261111-172755 82.66 (93.30/92.63/76.94/67.78; FoV 0 97.88) is the no gate, no RnC
+corner. Code is HEAD 2297ad4 (server B RINCE and rnc_loss_ratio code, inert at these
+defaults) against 8967b97 for P41 and P42. Ablation baseline roundP37 _20261107-173606
+81.54 (H100 server).'
     ;;
 roundP30)
     echo "Round P30 - P23 with the two cross-domain terms halved (gate x role) [80 ep]"
